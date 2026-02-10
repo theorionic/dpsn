@@ -33,6 +33,7 @@ class DPSNRConfig:
     generation_steps: Optional[int] = None
     generation_max_tokens: int = 20
     generation_prompts: Optional[list[str]] = None
+    learning_rate: float = 3e-4
 
     @classmethod
     def from_yaml(cls, path: str) -> "DPSNRConfig":

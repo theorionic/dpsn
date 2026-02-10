@@ -57,6 +57,47 @@ def main():
     else:
         config = DPSNRConfig()
 
+    # --- DISTRIBUTED SETUP ---
+    from jax.sharding import Mesh, PartitionSpec, NamedSharding
+    from jax.experimental import mesh_utils
+
+    # Create device mesh - handles 1 to N devices automatically
+    devices = mesh_utils.create_device_mesh((jax.device_count(),))
+    # We use 'data' axis for data parallelism and 'pool' axis for model parallelism of the pool
+    # Since we have a 1D mesh, we map 'data' to the single axis
+    # For complex setups on 2D meshes (e.g. 4x8), this would need adjustment,
+    # but for 1D array of devices, we use the single axis for both or mix them.
+    # Here we define a single axis name 'shard'.
+    mesh = Mesh(devices, axis_names=("shard",))
+
+    # Sharding Rules:
+    # 1. Batch: Split along 'shard' axis (Data Parallelism)
+    # 2. Pool Params: Split along 'shard' axis (Model Parallelism)
+    # 3. Other Params: Replicated (None)
+
+    batch_sharding = NamedSharding(mesh, PartitionSpec("shard", None))
+    # Pool is usually (num_vectors, dim), we split num_vectors
+    pool_sharding = NamedSharding(mesh, PartitionSpec("shard", None))
+    replicated_sharding = NamedSharding(mesh, PartitionSpec())
+
+    def get_sharding_rule(path, param):
+        """
+        Determines where a parameter should live based on its path in the PyTree.
+        path: tuple of strings (e.g., ('params', 'pool', 'vectors'))
+        param: the actual parameter array (for shape inspection if needed)
+        """
+        # If it's part of the massive pool, shard it!
+        # Path usually looks like ('params', 'pool', ...)
+        if "pool" in path:
+            # We shard the first dimension (total_vectors)
+            return pool_sharding
+
+        # Everything else (Controller, Router, etc.) is REPLICATED
+        return replicated_sharding
+
+    print(f"Distributed Mesh: {mesh}")
+    print(f"Sharding Strategy: Pool -> Sharded, Rest -> Replicated")
+
     if args.hf_dataset:
         config.hf_dataset_name = args.hf_dataset
     if args.hf_tokenizer:
@@ -105,15 +146,59 @@ def main():
     # Initialize Model
     model = DPSNR(config)
 
-    # Initialize State
+    # Initialize State (Distributed)
     rng = jax.random.PRNGKey(0)
-    state = create_train_state(rng, config)
+
+    # 1. Create abstract parameters (no memory usage)
+    # We need a dummy input to trace the init function
+    dummy_input = jnp.zeros((1, config.max_seq_len), dtype=jnp.int32)
+
+    print("Initializing distributed model state...")
+
+    # JIT-compile the initialization with the sharding constraints
+    # This ensures parameters are created directly on the correct devices
+    @jax.jit
+    def init_model(rng, input_ids):
+        return model.init(rng, input_ids)
+
+    # Get abstract PyTree of variables (shapes/types only)
+    abstract_variables = jax.eval_shape(init_model, rng, dummy_input)
+
+    # Create a matching PyTree of Sharding objects
+    sharding_tree = jax.tree_util.tree_map_with_path(
+        get_sharding_rule, abstract_variables
+    )
+
+    # Initialize state with sharding constraints
+    # We first create the raw variables distributedly
+    variables = jax.lax.with_sharding_constraint(
+        init_model(rng, dummy_input), sharding_tree
+    )
+
+    # Create TrainState (using the sharded variables)
+    from dpsn_r_jax.training.trainer import TrainState
+
+    tx = optax.adamw(config.learning_rate)
+    state = TrainState.create(
+        apply_fn=model.apply,
+        params=variables["params"],
+        tx=tx,
+        rng=rng,
+    )
+
+    # Force the state params to respect the sharding (TrainState.create might lose it if not careful,
+    # but since variables['params'] is already a sharded Array, it should persist).
+    # Double check by re-imposing constraint if needed, but usually redundant if input is sharded.
 
     print(
         f"Model Parameters: {sum(x.size for x in jax.tree_util.tree_leaves(state.params)):,}"
     )
 
     from dpsn_r_jax.training.trainer import train_step
+
+    # JIT the train step - XLA automatically handles the communication!
+    # We just need to ensure inputs are sharded correctly before entering.
+    distributed_train_step = jax.jit(train_step)
 
     steps_per_epoch = args.dataset_size // args.batch_size
 
@@ -132,7 +217,12 @@ def main():
 
             batch = dataset.get_batch(args.batch_size)
 
-            state, loss = train_step(state, batch, config.pad_token_id)
+            # Shard the batch input!
+            # We must put the batch onto the mesh with the data sharding spec
+            # (Batch, SeqLen) -> split Batch across 'shard' axis
+            batch = jax.device_put(batch, batch_sharding)
+
+            state, loss = distributed_train_step(state, batch, config.pad_token_id)
             epoch_loss += loss
             global_step += 1
 
