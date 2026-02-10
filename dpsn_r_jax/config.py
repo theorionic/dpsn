@@ -29,6 +29,22 @@ class DPSNRConfig:
     hf_tokenizer_name: Optional[str] = None
     streaming: bool = True
     pad_token_id: int = 0
+    max_steps: Optional[int] = None
+    generation_steps: Optional[int] = None
+    generation_max_tokens: int = 20
+    generation_prompts: Optional[list[str]] = None
+
+    @classmethod
+    def from_yaml(cls, path: str) -> "DPSNRConfig":
+        import yaml
+
+        with open(path, "r") as f:
+            config_dict = yaml.safe_load(f)
+
+        valid_keys = {f for f in cls.__dataclass_fields__}
+        filtered_config = {k: v for k, v in config_dict.items() if k in valid_keys}
+
+        return cls(**filtered_config)
 
 
 def get_tiny_config():

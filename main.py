@@ -15,6 +15,9 @@ def main():
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--dataset_size", type=int, default=500)
+    parser.add_argument(
+        "--config", type=str, default=None, help="Path to YAML config file"
+    )
     parser.add_argument("--tiny", action="store_true")
     parser.add_argument(
         "--hf_dataset", type=str, default=None, help="HuggingFace dataset name"
@@ -28,28 +31,59 @@ def main():
     parser.add_argument(
         "--hf_tokenizer", type=str, default=None, help="HuggingFace tokenizer name"
     )
+    parser.add_argument(
+        "--max_steps", type=int, default=None, help="Maximum number of training steps"
+    )
+    parser.add_argument(
+        "--generation_steps",
+        type=int,
+        default=None,
+        help="Generate output every N steps",
+    )
+    parser.add_argument(
+        "--generation_max_tokens", type=int, default=20, help="Max tokens to generate"
+    )
     args = parser.parse_args()
 
     print(f"Training on {jax.devices()[0].platform.upper()}")
 
     # Config
-    if args.tiny:
+    if args.config:
+        print(f"Loading config from {args.config}")
+        config = DPSNRConfig.from_yaml(args.config)
+    elif args.tiny:
         print("Using TINY config for testing...")
         config = get_tiny_config()
     else:
         config = DPSNRConfig()
 
-    config.hf_dataset_name = args.hf_dataset
-    config.hf_tokenizer_name = args.hf_tokenizer
+    if args.hf_dataset:
+        config.hf_dataset_name = args.hf_dataset
+    if args.hf_tokenizer:
+        config.hf_tokenizer_name = args.hf_tokenizer
 
-    tokenizer = get_tokenizer(args.hf_tokenizer)
+    if (
+        args.max_steps is None
+        and hasattr(config, "max_steps")
+        and config.max_steps is not None
+    ):
+        print(f"Using max_steps from config: {config.max_steps}")
+        args.max_steps = config.max_steps
 
-    if hasattr(tokenizer, "vocab_size"):
-        config.vocab_size = tokenizer.vocab_size
-        config.pad_token_id = tokenizer.pad_token_id or 0
-        print(
-            f"Updated vocab size to {config.vocab_size}, pad_token_id to {config.pad_token_id}"
-        )
+    if args.generation_steps is not None:
+        config.generation_steps = args.generation_steps
+    config.generation_max_tokens = args.generation_max_tokens
+
+    tokenizer_name = config.hf_tokenizer_name or "numeric"
+    tokenizer = get_tokenizer(tokenizer_name)
+
+    if config.hf_tokenizer_name and config.hf_tokenizer_name.lower() != "numeric":
+        if hasattr(tokenizer, "vocab_size"):
+            config.vocab_size = tokenizer.vocab_size
+            config.pad_token_id = getattr(tokenizer, "pad_token_id", 0) or 0
+            print(
+                f"Updated vocab size to {config.vocab_size}, pad_token_id to {config.pad_token_id} from pretrained tokenizer"
+            )
 
     if args.hf_dataset:
         print(
@@ -83,17 +117,57 @@ def main():
 
     steps_per_epoch = args.dataset_size // args.batch_size
 
+    global_step = 0
+
+    # Define test samples for generation
+    test_samples = ["Sort: 5 2 8 1 ->", "Sort: 10 3 7 ->", "Sort: 1 1 1 ->"]
+
     for epoch in range(args.epochs):
         epoch_loss = 0
 
         for step in range(steps_per_epoch):
+            if args.max_steps and global_step >= args.max_steps:
+                print(f"Reached max_steps ({args.max_steps}). Stopping training.")
+                break
+
             batch = dataset.get_batch(args.batch_size)
 
             state, loss = train_step(state, batch, config.pad_token_id)
             epoch_loss += loss
+            global_step += 1
 
             if step % 10 == 0:
-                print(f"Epoch {epoch + 1} | Step {step} | Loss: {loss:.4f}")
+                print(
+                    f"Epoch {epoch + 1} | Step {step} | Global Step {global_step} | Loss: {loss:.4f}"
+                )
+
+            # Periodic Generation
+            if (
+                config.generation_steps
+                and global_step > 0
+                and global_step % config.generation_steps == 0
+            ):
+                print(f"\n--- Generation at step {global_step} ---")
+                prompts_to_use = (
+                    config.generation_prompts
+                    if config.generation_prompts
+                    else (["The quick brown fox"] if args.hf_dataset else test_samples)
+                )
+
+                # Limit to 1 sample to save time if not explicit list
+                if not config.generation_prompts:
+                    prompts_to_use = prompts_to_use[:1]
+
+                for prompt in prompts_to_use:
+                    print(f"Input: {prompt}")
+                    output = generate(
+                        state, prompt, tokenizer, max_len=config.generation_max_tokens
+                    )
+                    print(f"Output: {output}")
+                print("---------------------------------------")
+
+        if args.max_steps and global_step >= args.max_steps:
+            break
 
         print(
             f"Epoch {epoch + 1} Complete | Avg Loss: {epoch_loss / steps_per_epoch:.4f}"
@@ -101,7 +175,6 @@ def main():
 
     # Generation Test
     print("\nVerifying model generation...")
-    from dpsn_r_jax.utils.generation import generate
 
     if args.hf_dataset:
         prompt = "The quick brown fox"
