@@ -7,7 +7,7 @@ import orbax.checkpoint
 from flax.training import orbax_utils
 import jax.numpy as jnp
 import optax
-from dpsn_r_jax.config import DPSNRConfig, get_tiny_config
+from dpsn_r_jax.config import DPSNRConfig, get_model_config
 from dpsn_r_jax.models.dpsnr import DPSNR
 from dpsn_r_jax.data.dataset import HFStreamingDataset, SyntheticReasoningDataset
 from dpsn_r_jax.data.tokenizer import get_tokenizer
@@ -19,7 +19,16 @@ def main():
     parser.add_argument(
         "--tiny", action="store_true", help="Use tiny config for testing"
     )
-    parser.add_argument("--epochs", type=int, default=1, help="Number of epochs")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="base",
+        choices=["tiny", "base", "large", "xl"],
+        help="Model configuration size",
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=1, help="Number of training epochs"
+    )
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
     parser.add_argument("--dataset_size", type=int, default=500, help="Dataset size")
     parser.add_argument(
@@ -58,8 +67,11 @@ def main():
     args = parser.parse_args()
 
     if args.tiny:
-        print("Using TINY config for testing...")
-        config = get_tiny_config()
+        print("Using TINY config (via flag)...")
+        config = get_model_config("tiny")
+    elif args.config:
+        print(f"Using {args.config.upper()} config...")
+        config = get_model_config(args.config)
     else:
         config = DPSNRConfig()
 
