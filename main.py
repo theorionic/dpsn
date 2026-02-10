@@ -1,65 +1,67 @@
 import argparse
+import os
 import jax
+from jax.sharding import Mesh, PartitionSpec, NamedSharding
+from jax.experimental import mesh_utils
+import orbax.checkpoint
+from flax.training import orbax_utils
 import jax.numpy as jnp
 import optax
-from dpsn_r_jax.models.dpsnr import DPSNR
-from dpsn_r_jax.data.dataset import SyntheticReasoningDataset, HFStreamingDataset
-from dpsn_r_jax.data.tokenizer import get_tokenizer
-from dpsn_r_jax.training.trainer import create_train_state
 from dpsn_r_jax.config import DPSNRConfig, get_tiny_config
+from dpsn_r_jax.models.dpsnr import DPSNR
+from dpsn_r_jax.data.dataset import HFStreamingDataset, SyntheticReasoningDataset
+from dpsn_r_jax.data.tokenizer import get_tokenizer
 from dpsn_r_jax.utils.generation import generate
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--dataset_size", type=int, default=500)
+    parser = argparse.ArgumentParser(description="Train DPSNR Model")
     parser.add_argument(
-        "--config", type=str, default=None, help="Path to YAML config file"
+        "--tiny", action="store_true", help="Use tiny config for testing"
     )
-    parser.add_argument("--tiny", action="store_true")
+    parser.add_argument("--epochs", type=int, default=1, help="Number of epochs")
+    parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
+    parser.add_argument("--dataset_size", type=int, default=500, help="Dataset size")
+    parser.add_argument(
+        "--max_steps", type=int, default=None, help="Max training steps"
+    )
     parser.add_argument(
         "--hf_dataset", type=str, default=None, help="HuggingFace dataset name"
     )
+    parser.add_argument("--hf_subset", type=str, default=None, help="Dataset subset")
     parser.add_argument(
-        "--hf_subset",
-        type=str,
-        default=None,
-        help="HuggingFace dataset configuration/subset",
+        "--hf_tokenizer", type=str, default=None, help="HuggingFace tokenizer"
     )
     parser.add_argument(
-        "--hf_tokenizer", type=str, default=None, help="HuggingFace tokenizer name"
-    )
-    parser.add_argument(
-        "--max_steps", type=int, default=None, help="Maximum number of training steps"
-    )
-    parser.add_argument(
-        "--generation_steps",
-        type=int,
-        default=None,
-        help="Generate output every N steps",
+        "--generation_steps", type=int, default=None, help="Generate text every N steps"
     )
     parser.add_argument(
         "--generation_max_tokens", type=int, default=20, help="Max tokens to generate"
     )
+    # Checkpoint args
+    parser.add_argument(
+        "--checkpoint_dir", type=str, default=None, help="Directory to save checkpoints"
+    )
+    parser.add_argument(
+        "--save_interval", type=int, default=1000, help="Save checkpoint every N steps"
+    )
+    parser.add_argument(
+        "--resume", action="store_true", help="Resume from latest checkpoint"
+    )
+    parser.add_argument(
+        "--custom_prompts",
+        nargs="+",
+        default=None,
+        help="Custom prompts for generation",
+    )
+
     args = parser.parse_args()
 
-    print(f"Training on {jax.devices()[0].platform.upper()}")
-
-    # Config
-    if args.config:
-        print(f"Loading config from {args.config}")
-        config = DPSNRConfig.from_yaml(args.config)
-    elif args.tiny:
+    if args.tiny:
         print("Using TINY config for testing...")
         config = get_tiny_config()
     else:
         config = DPSNRConfig()
-
-    # --- DISTRIBUTED SETUP ---
-    from jax.sharding import Mesh, PartitionSpec, NamedSharding
-    from jax.experimental import mesh_utils
 
     # Create device mesh - handles 1 to N devices automatically
     devices = mesh_utils.create_device_mesh((jax.device_count(),))
@@ -169,6 +171,15 @@ def main():
         get_sharding_rule, abstract_variables
     )
 
+    # --- CHECKPOINT SETUP ---
+    checkpoint_manager = None
+    if args.checkpoint_dir:
+        abs_checkpoint_dir = os.path.abspath(args.checkpoint_dir)
+        options = orbax.checkpoint.CheckpointManagerOptions(max_to_keep=2, create=True)
+        checkpoint_manager = orbax.checkpoint.CheckpointManager(
+            abs_checkpoint_dir, orbax.checkpoint.PyTreeCheckpointer(), options
+        )
+
     # Initialize state with sharding constraints
     # We first create the raw variables distributedly
     variables = jax.lax.with_sharding_constraint(
@@ -186,9 +197,19 @@ def main():
         rng=rng,
     )
 
-    # Force the state params to respect the sharding (TrainState.create might lose it if not careful,
-    # but since variables['params'] is already a sharded Array, it should persist).
-    # Double check by re-imposing constraint if needed, but usually redundant if input is sharded.
+    # RESTORE CHECKPOINT IF REQUESTED
+    if args.resume and checkpoint_manager:
+        latest_step = checkpoint_manager.latest_step()
+        if latest_step is not None:
+            print(f"Resuming from checkpoint step {latest_step}...")
+            # We must pass the target 'state' so Orbax knows the sharding layout
+            state = checkpoint_manager.restore(latest_step, items=state)
+            global_step = latest_step
+        else:
+            print("No checkpoint found to resume from. Starting from scratch.")
+            global_step = 0
+    else:
+        global_step = 0
 
     print(
         f"Model Parameters: {sum(x.size for x in jax.tree_util.tree_leaves(state.params)):,}"
@@ -201,8 +222,6 @@ def main():
     distributed_train_step = jax.jit(train_step)
 
     steps_per_epoch = args.dataset_size // args.batch_size
-
-    global_step = 0
 
     # Define test samples for generation
     test_samples = ["Sort: 5 2 8 1 ->", "Sort: 10 3 7 ->", "Sort: 1 1 1 ->"]
@@ -226,6 +245,16 @@ def main():
             epoch_loss += loss
             global_step += 1
 
+            # Save Checkpoint
+            if (
+                checkpoint_manager
+                and args.save_interval
+                and global_step > 0
+                and global_step % args.save_interval == 0
+            ):
+                print(f"Saving checkpoint at step {global_step}...")
+                checkpoint_manager.save(global_step, state)
+
             if step % 10 == 0:
                 print(
                     f"Epoch {epoch + 1} | Step {step} | Global Step {global_step} | Loss: {loss:.4f}"
@@ -238,15 +267,18 @@ def main():
                 and global_step % config.generation_steps == 0
             ):
                 print(f"\n--- Generation at step {global_step} ---")
-                prompts_to_use = (
-                    config.generation_prompts
-                    if config.generation_prompts
-                    else (["The quick brown fox"] if args.hf_dataset else test_samples)
-                )
 
-                # Limit to 1 sample to save time if not explicit list
-                if not config.generation_prompts:
-                    prompts_to_use = prompts_to_use[:1]
+                if args.custom_prompts:
+                    prompts_to_use = args.custom_prompts
+                elif config.generation_prompts:
+                    prompts_to_use = config.generation_prompts
+                elif args.hf_dataset:
+                    prompts_to_use = ["The quick brown fox", "Once upon a time"]
+                else:
+                    prompts_to_use = test_samples
+
+                if not args.custom_prompts and not config.generation_prompts:
+                    prompts_to_use = prompts_to_use[:3]
 
                 for prompt in prompts_to_use:
                     print(f"Input: {prompt}")
@@ -262,6 +294,14 @@ def main():
         print(
             f"Epoch {epoch + 1} Complete | Avg Loss: {epoch_loss / steps_per_epoch:.4f}"
         )
+
+        # Save checkpoint at end of epoch
+        # Save checkpoint at end of epoch
+        if checkpoint_manager:
+            print(
+                f"Saving checkpoint at end of epoch {epoch + 1} (step {global_step})..."
+            )
+            checkpoint_manager.save(global_step, state)
 
     # Generation Test
     print("\nVerifying model generation...")
