@@ -39,6 +39,9 @@ def main():
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
     parser.add_argument("--dataset_size", type=int, default=500, help="Dataset size")
     parser.add_argument(
+        "--num_workers", type=int, default=4, help="Number of data loader workers"
+    )
+    parser.add_argument(
         "--max_steps", type=int, default=None, help="Max training steps"
     )
     parser.add_argument(
@@ -123,6 +126,8 @@ def main():
         config.hf_dataset_name = args.hf_dataset
     if args.hf_tokenizer:
         config.hf_tokenizer_name = args.hf_tokenizer
+
+    config.num_workers = args.num_workers
 
     if (
         args.max_steps is None

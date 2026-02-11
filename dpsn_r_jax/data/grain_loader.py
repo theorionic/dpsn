@@ -6,6 +6,7 @@ except (ImportError, RuntimeError):
     GRAIN_AVAILABLE = False
 
 import numpy as np
+import sys
 from typing import Optional, Any
 
 
@@ -53,6 +54,10 @@ def get_grain_loader(config: Any) -> Optional[Any]:
             ),
         ]
 
+        worker_count = getattr(config, "num_workers", 4)
+        if sys.platform == "darwin":
+            worker_count = 0
+
         loader = grain.DataLoader(
             data_source=source,
             operations=operations,
@@ -62,7 +67,8 @@ def get_grain_loader(config: Any) -> Optional[Any]:
                 shuffle=True,
                 num_epochs=getattr(config, "epochs", 1),
             ),
-            worker_count=0,
+            worker_count=worker_count,
+            worker_buffer_size=500,
         )
 
         return loader
