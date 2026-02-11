@@ -17,16 +17,16 @@ This project introduces the **Dynamic Parameter Selection Network with Reasoning
 
 The **DPSNR** architecture is a modular, hierarchical system designed for high-compute efficiency and reasoning depth. It consists of three core components:
 
-1.  **TinyController**: A lightweight, high-speed Transformer-based core (7B–14B range) that manages the sequence state and initiates parameter retrieval. It acts as the "Logic" engine, processing inputs and deciding which knowledge segments are required.
-2.  **Hierarchical Massive Pool (Knowledge Base)**: A decoupled parameter repository containing 100B+ parameters, organized into shards. Unlike a standard MoE, this pool is sharded across TPU HBM and retrieved dynamically via high-bandwidth interconnects.
-3.  **Adaptive Compute Controller (Reasoning Loop)**: A dynamic computation engine that uses `jax.lax.scan` patterns to implement a multi-step reasoning loop. It allows the model to "think" for variable durations per token, increasing depth for complex queries without penalizing simple ones.
+1.  **TinyController**: A lightweight, high-speed Transformer-based core (7B–14B range). It acts as the "CEO (Logic)" of the system, managing the sequence state and orchestrating reasoning trajectories.
+2.  **Learned Indexer (Archivist)**: A new decoupled addressing model that replaces traditional routing with a learned projection into the parameter space. It treats the Massive Pool as a searchable vector space, achieving O(1) access to specialized knowledge segments and removing the "memorization pressure" from the TinyController.
+3.  **Hierarchical Massive Pool (Library)**: A decoupled parameter repository (100B+ parameters). Unlike a standard MoE, this "Knowledge Library" is sharded across TPU HBM and retrieved dynamically via high-bandwidth interconnects based on the Indexer's addressing.
 
 **Specifications:**
 - **Total Effective Parameters**: ~120 billion.
 - **Controller Size**: 7 billion.
-- **Pool Organization**: Hierarchical sharding with cross-replica retrieval.
-- **Reasoning Depth**: Dynamically adjustable per-token (up to 16 reasoning steps).
-- **Interconnect Requirement**: Relies on TPU mesh networking for near-zero latency parameter swapping between the Controller and the Massive Pool.
+- **Addressing Model**: Learned Indexer for O(1) sparse retrieval.
+- **Reasoning Depth**: Dynamically adjustable per-token (up to 16 reasoning steps) via the Adaptive Compute Controller.
+- **Efficiency**: Highlights O(1) access patterns and significantly reduced GPU/TPU memory pressure by offloading knowledge storage to a specialized pool.
 
 Full architecture code in JAX/Flax is already developed and modularized, ready for pod-scale training.
 
