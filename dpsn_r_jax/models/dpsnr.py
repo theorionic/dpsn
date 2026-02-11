@@ -43,6 +43,8 @@ class DPSNR(nn.Module):
         halt_prob = jnp.zeros((B, T, 1))
         halted_mask = jnp.zeros((B, T, 1))
 
+        indices_list = []
+
         # Python loop unrolling (efficient for small max_loops on TPU)
         i = 0
         for i in range(self.config.max_reasoning_loops):
@@ -52,7 +54,8 @@ class DPSNR(nn.Module):
             pooled_state = jnp.mean(state_hidden, axis=1)
             mu, sigma = self.indexer(pooled_state)
 
-            retrieved = self.pool(mu, sigma)
+            retrieved, start_indices = self.pool(mu, sigma)
+            indices_list.append(start_indices)
 
             retrieved_expanded = jnp.expand_dims(retrieved, 1).repeat(T, axis=1)
 
@@ -79,4 +82,5 @@ class DPSNR(nn.Module):
         # 3. Decode
         logits = self.controller.decode(state_hidden)
 
-        return logits, i + 1
+        all_indices = jnp.stack(indices_list, axis=1)
+        return logits, (i + 1, all_indices)

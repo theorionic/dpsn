@@ -59,7 +59,7 @@ class CoordinateMassivePool(nn.Module):
 
         aggregated = jnp.einsum("bw,bwd->bd", weights, selected)
 
-        return aggregated
+        return aggregated, start_indices
 
     def organize_memory(self):
         mean_vec = jnp.mean(self.params_storage, axis=0)
