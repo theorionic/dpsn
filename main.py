@@ -16,6 +16,7 @@ from dpsn_r_jax.data.dataset import (
     BackgroundGenerator,
 )
 from dpsn_r_jax.data.tokenizer import get_tokenizer
+from dpsn_r_jax.data.grain_loader import get_grain_loader
 from dpsn_r_jax.utils.generation import generate
 from dpsn_r_jax.utils.metrics import calculate_flops
 
@@ -138,15 +139,25 @@ def main():
     tokenizer_name = config.hf_tokenizer_name or "numeric"
     tokenizer = get_tokenizer(tokenizer_name)
 
-    if config.hf_tokenizer_name and config.hf_tokenizer_name.lower() != "numeric":
-        if hasattr(tokenizer, "vocab_size"):
-            config.vocab_size = tokenizer.vocab_size
-            config.pad_token_id = getattr(tokenizer, "pad_token_id", 0) or 0
-            print(
-                f"Updated vocab size to {config.vocab_size}, pad_token_id to {config.pad_token_id} from pretrained tokenizer"
-            )
+    grain_loader = get_grain_loader(args)
+    if grain_loader:
+        print("Using Google Grain data loader.")
 
-    if args.hf_dataset:
+        class GrainWrapper:
+            def __init__(self, loader):
+                self.loader = loader
+                self.iterator = iter(loader)
+
+            def get_batch(self, batch_size=None):
+                try:
+                    batch = next(self.iterator)
+                except StopIteration:
+                    self.iterator = iter(self.loader)
+                    batch = next(self.iterator)
+                return batch["input_ids"]
+
+        dataset = GrainWrapper(grain_loader)
+    elif args.hf_dataset:
         print(
             f"Loading HF streaming dataset: {args.hf_dataset} (subset: {args.hf_subset})"
         )
