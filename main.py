@@ -264,9 +264,27 @@ def main():
     else:
         global_step = 0
 
-    print(
-        f"Model Parameters: {sum(x.size for x in jax.tree_util.tree_leaves(state.params)):,}"
-    )
+    def count_params(tree):
+        return sum(x.size for x in jax.tree_util.tree_leaves(tree))
+
+    p = state.params
+    breakdown = {
+        "TinyController (CEO)": count_params(p["controller"]),
+        "LearnedIndexer (Archivist)": count_params(p["indexer"]),
+        "CoordinateMassivePool (Library)": count_params(p["pool"]),
+        "ReasoningEngine": count_params(p["acc"])
+        + count_params(p["retrieval_integrator"]),
+    }
+    total_params = count_params(p)
+
+    print("\n" + "=" * 50)
+    print(f"{'Component':<35} | {'Parameters':>12}")
+    print("-" * 50)
+    for name, size in breakdown.items():
+        print(f"{name:<35} | {size:>12,}")
+    print("-" * 50)
+    print(f"{'Total Parameters':<35} | {total_params:>12,}")
+    print("=" * 50 + "\n")
 
     from dpsn_r_jax.training.trainer import train_step
 
