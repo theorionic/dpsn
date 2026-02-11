@@ -206,13 +206,32 @@ def main():
 
     # Create TrainState (using the sharded variables)
     from dpsn_r_jax.training.trainer import TrainState
+    from flax import traverse_util
+
+    params = variables["params"]
+    flat_params = traverse_util.flatten_dict(params)
+    pool_key = ("pool", "params_storage")
+    pool_params = flat_params[pool_key]
+    dense_flat_params = {k: v for k, v in flat_params.items() if k != pool_key}
+    dense_params = traverse_util.unflatten_dict(dense_flat_params)
 
     tx = optax.adamw(config.learning_rate)
-    state = TrainState.create(
+    opt_state = tx.init(dense_params)
+
+    pool_m = jnp.zeros_like(pool_params)
+    pool_v = jnp.zeros_like(pool_params)
+
+    state = TrainState(
+        step=0,
         apply_fn=model.apply,
-        params=variables["params"],
+        params=params,
         tx=tx,
+        opt_state=opt_state,
         rng=rng,
+        pool_m=pool_m,
+        pool_v=pool_v,
+        window_size=config.max_k,
+        learning_rate=config.learning_rate,
     )
 
     # RESTORE CHECKPOINT IF REQUESTED
