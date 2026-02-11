@@ -6,6 +6,7 @@ def generate(
     state,
     prompt,
     tokenizer,
+    rng=None,
     max_len=20,
     temperature=1.0,
     top_k=40,
@@ -47,8 +48,12 @@ def generate(
                 next_token_logits,
             )
 
-        # Greedy argmax on penalized/scaled logits
-        next_token = jnp.argmax(next_token_logits, axis=-1)
+        # Sampling
+        if temperature > 0 and rng is not None:
+            rng, sample_rng = jax.random.split(rng)
+            next_token = jax.random.categorical(sample_rng, next_token_logits)
+        else:
+            next_token = jnp.argmax(next_token_logits, axis=-1)
         next_token = jnp.reshape(next_token, (1,))
         generated = jnp.concatenate([generated, next_token[:, None]], axis=1)
 

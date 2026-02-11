@@ -9,7 +9,7 @@ from dpsn_r_jax.config import get_model_config
 from dpsn_r_jax.models.dpsnr import DPSNR
 from dpsn_r_jax.data.tokenizer import get_tokenizer
 from dpsn_r_jax.utils.generation import generate
-from dpsn_r_jax.training.trainer import TrainState
+from dpsn_r_jax.training.trainer import TrainState, create_train_state
 
 
 def load_model(config_name: str, checkpoint_dir: str, tokenizer_path: str):
@@ -30,18 +30,9 @@ def load_model(config_name: str, checkpoint_dir: str, tokenizer_path: str):
 
     model = DPSNR(config)
     rng = jax.random.PRNGKey(0)
-    dummy_input = jnp.zeros((1, config.max_seq_len), dtype=jnp.int32)
 
     print("Initializing model parameters...")
-    variables = model.init(rng, dummy_input)
-
-    tx = optax.adamw(config.learning_rate)
-    state = TrainState.create(
-        apply_fn=model.apply,
-        params=variables["params"],
-        tx=tx,
-        rng=rng,
-    )
+    state = create_train_state(rng, config)
 
     if checkpoint_dir:
         abs_checkpoint_dir = os.path.abspath(checkpoint_dir)
@@ -114,11 +105,16 @@ def main():
         args.config, args.checkpoint_dir, args.tokenizer
     )
 
+    rng = jax.random.PRNGKey(42)
+
     def run_inference(prompt: str):
+        nonlocal rng
+        rng, key = jax.random.split(rng)
         output = generate(
             state,
             prompt,
             tokenizer,
+            rng=key,
             max_len=args.max_tokens,
             temperature=args.temp,
             repetition_penalty=args.penalty,
