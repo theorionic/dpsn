@@ -16,7 +16,7 @@ def create_train_state(rng, config):
     dummy_input = jnp.ones((1, config.max_seq_len), dtype=jnp.int32)
     variables = model.init(rng, dummy_input)
 
-    tx = optax.adamw(learning_rate=5e-4)
+    tx = optax.adamw(learning_rate=config.learning_rate)
 
     return TrainState.create(
         apply_fn=model.apply, params=variables["params"], tx=tx, rng=rng

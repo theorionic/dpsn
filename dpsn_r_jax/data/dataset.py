@@ -1,4 +1,6 @@
 import random
+import threading
+import queue
 import numpy as np
 import jax.numpy as jnp
 from datasets import load_dataset
@@ -126,3 +128,32 @@ class SyntheticReasoningDataset:
             batch_ids.append(ids)
 
         return np.array(batch_ids)
+
+
+class BackgroundGenerator:
+    def __init__(self, dataset, batch_size, prefetch_size=5):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.queue = queue.Queue(maxsize=prefetch_size)
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
+
+    def _worker(self):
+        while not self.stop_event.is_set():
+            try:
+                batch = self.dataset.get_batch(self.batch_size)
+                self.queue.put(batch)
+            except Exception:
+                break
+
+    def get_batch(self, batch_size=None):
+        return self.queue.get()
+
+    def stop(self):
+        self.stop_event.set()
+        try:
+            while not self.queue.empty():
+                self.queue.get_nowait()
+        except queue.Empty:
+            pass

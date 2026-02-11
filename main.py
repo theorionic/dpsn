@@ -1,5 +1,6 @@
 import argparse
 import os
+import time
 import jax
 from jax.sharding import Mesh, PartitionSpec, NamedSharding
 from jax.experimental import mesh_utils
@@ -9,9 +10,14 @@ import jax.numpy as jnp
 import optax
 from dpsn_r_jax.config import DPSNRConfig, get_model_config
 from dpsn_r_jax.models.dpsnr import DPSNR
-from dpsn_r_jax.data.dataset import HFStreamingDataset, SyntheticReasoningDataset
+from dpsn_r_jax.data.dataset import (
+    HFStreamingDataset,
+    SyntheticReasoningDataset,
+    BackgroundGenerator,
+)
 from dpsn_r_jax.data.tokenizer import get_tokenizer
 from dpsn_r_jax.utils.generation import generate
+from dpsn_r_jax.utils.metrics import calculate_flops
 
 
 def main():
@@ -233,10 +239,13 @@ def main():
     # We just need to ensure inputs are sharded correctly before entering.
     distributed_train_step = jax.jit(train_step)
 
+    flops_per_step = calculate_flops(config, args.batch_size)
     steps_per_epoch = args.dataset_size // args.batch_size
 
     # Define test samples for generation
     test_samples = ["Sort: 5 2 8 1 ->", "Sort: 10 3 7 ->", "Sort: 1 1 1 ->"]
+
+    dataset = BackgroundGenerator(dataset, args.batch_size, prefetch_size=5)
 
     for epoch in range(args.epochs):
         epoch_loss = 0
@@ -253,7 +262,14 @@ def main():
             # (Batch, SeqLen) -> split Batch across 'shard' axis
             batch = jax.device_put(batch, batch_sharding)
 
+            start_time = time.time()
             state, loss = distributed_train_step(state, batch, config.pad_token_id)
+            loss.block_until_ready()
+            step_time = time.time() - start_time
+
+            tokens_per_sec = (args.batch_size * config.max_seq_len) / step_time
+            tflops = flops_per_step / step_time / 1e12
+
             epoch_loss += loss
             global_step += 1
 
@@ -269,7 +285,7 @@ def main():
 
             if step % 10 == 0:
                 print(
-                    f"Epoch {epoch + 1} | Step {step} | Global Step {global_step} | Loss: {loss:.4f}"
+                    f"Epoch {epoch + 1} | Step {step} | Global Step {global_step} | Loss: {loss:.4f} | TPS: {tokens_per_sec:.0f} | TFLOPS: {tflops:.4f}"
                 )
 
             # Periodic Generation
@@ -295,7 +311,12 @@ def main():
                 for prompt in prompts_to_use:
                     print(f"Input: {prompt}")
                     output = generate(
-                        state, prompt, tokenizer, max_len=config.generation_max_tokens
+                        state,
+                        prompt,
+                        tokenizer,
+                        max_len=config.generation_max_tokens,
+                        temperature=0.7,
+                        repetition_penalty=1.2,
                     )
                     print(f"Output: {output}")
                 print("---------------------------------------")
@@ -321,14 +342,18 @@ def main():
     if args.hf_dataset:
         prompt = "The quick brown fox"
         print(f"Input: {prompt}")
-        output = generate(state, prompt, tokenizer)
+        output = generate(
+            state, prompt, tokenizer, temperature=0.7, repetition_penalty=1.2
+        )
         print(f"Output: {output}")
     else:
         test_samples = ["Sort: 5 2 8 1 ->", "Sort: 10 3 7 ->", "Sort: 1 1 1 ->"]
 
         for prompt in test_samples:
             print(f"Input: {prompt}")
-            output = generate(state, prompt, tokenizer)
+            output = generate(
+                state, prompt, tokenizer, temperature=0.7, repetition_penalty=1.2
+            )
             print(f"Output: {output}")
             print("-" * 20)
 
