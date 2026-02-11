@@ -1,91 +1,68 @@
+import jax
 import jax.numpy as jnp
 import flax.linen as nn
 from jax import lax
 from dpsn_r_jax.config import PoolConfig
 
 
-class RetrievalRouter(nn.Module):
+class LearnedIndexer(nn.Module):
     hidden_dim: int
-    min_k: int = 128
-    max_k: int = 1024
 
     @nn.compact
-    def __call__(self, hidden):
-        # hidden: (B, T, D)
-        pooled = jnp.mean(hidden, axis=1)  # (B, D)
+    def __call__(self, query):
+        x = nn.Dense(self.hidden_dim)(query)
+        x = nn.gelu(x)
+        x = nn.Dense(self.hidden_dim // 2)(x)
+        x = nn.gelu(x)
 
-        # Complexity net
-        c = nn.Dense(self.hidden_dim // 4)(pooled)
-        c = nn.gelu(c)
-        c = nn.Dense(1)(c)
-        complexity = nn.sigmoid(c)  # (B, 1)
+        mu = nn.Dense(1)(x)
+        mu = nn.sigmoid(mu)
 
-        # Dynamic K calculation (keep as tracer)
-        # We take mean complexity for k calculation logic
-        mean_complexity = jnp.mean(complexity)
+        sigma = nn.Dense(1)(x)
+        sigma = nn.softplus(sigma)
 
-        # Scaled k between min and max
-        k = self.min_k + mean_complexity * (self.max_k - self.min_k)
-        k = k.astype(jnp.int32)
-
-        query = nn.Dense(self.hidden_dim)(pooled)
-
-        return query, k, complexity
+        return mu.squeeze(-1), sigma.squeeze(-1)
 
 
-class HierarchicalMassivePool(nn.Module):
+class CoordinateMassivePool(nn.Module):
     config: PoolConfig
-    # We remove num_clusters logic for this verification implementation
-    # and do a direct global search to ensure correctness on CPU with static shapes.
-    # In production, you would implement Hierarchical search with fixed max_candidates.
+    window_size: int
 
     def setup(self):
-        # The pool of vectors
-        self.params = self.param(
-            "params",
-            nn.initializers.normal(),
-            (self.config.total_vectors, self.config.hidden_dim),
-        )
-        self.keys = self.param(
-            "keys",
+        self.params_storage = self.param(
+            "params_storage",
             nn.initializers.normal(),
             (self.config.total_vectors, self.config.hidden_dim),
         )
 
-        self.router_proj = nn.Dense(self.config.hidden_dim)
+    def __call__(self, mu, sigma):
+        B = mu.shape[0]
+        Total = self.config.total_vectors
+        D = self.config.hidden_dim
+        W = self.window_size
 
-    def __call__(self, hidden, k_dynamic, max_k):
-        # hidden: (B, T, D)
-        B, T, D = hidden.shape
-        pooled = jnp.mean(hidden, axis=1)  # (B, D)
+        center_idx = mu * (Total - 1)
 
-        query = self.router_proj(pooled)  # (B, D)
+        start_indices = jnp.clip(center_idx - W // 2, 0, Total - W).astype(jnp.int32)
 
-        # Global Similarity Score
-        # (B, D) @ (D, Total) -> (B, Total)
-        scores = jnp.matmul(query, self.keys.T) / jnp.sqrt(D)
+        def slice_fn(start):
+            return lax.dynamic_slice(self.params_storage, (start, 0), (W, D))
 
-        # XLA FRIENDLY TOP-K:
-        # We always retrieve max_k items.
-        top_scores, top_indices = lax.top_k(scores, max_k)
+        selected = jax.vmap(slice_fn)(start_indices)
 
-        # Masking Logic for Dynamic K:
-        # Create a mask for valid items where index < k_dynamic
-        # k_dynamic is (1,) or scalar.
-        iota = jnp.arange(max_k)[None, :]  # (1, max_k)
-        mask = iota < k_dynamic
+        relative_indices = jnp.arange(W)[None, :] + start_indices[:, None]
 
-        # Mask scores with -inf so they have 0 probability in softmax
-        top_scores_masked = jnp.where(mask, top_scores, -1e9)
+        distances = relative_indices - center_idx[:, None]
 
-        weights = nn.softmax(top_scores_masked, axis=-1)  # (B, max_k)
+        weights = jnp.exp(-(distances**2) / (2 * (sigma[:, None] + 1e-6) ** 2))
+        weights = weights / (jnp.sum(weights, axis=-1, keepdims=True) + 1e-6)
 
-        # Gather params
-        # (B, max_k, D)
-        selected_params = self.params[top_indices]
-
-        # Aggregate
-        # (B, max_k) * (B, max_k, D) -> (B, D)
-        aggregated = jnp.einsum("bk,bkd->bd", weights, selected_params)
+        aggregated = jnp.einsum("bw,bwd->bd", weights, selected)
 
         return aggregated
+
+    def organize_memory(self):
+        mean_vec = jnp.mean(self.params_storage, axis=0)
+        sim = jnp.dot(self.params_storage, mean_vec)
+        indices = jnp.argsort(sim)
+        return self.params_storage[indices]
