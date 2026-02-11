@@ -20,22 +20,22 @@ class FlashCausalSelfAttention(nn.Module):
         k = k.reshape(x.shape[0], x.shape[1], self.num_heads, head_dim)
         v = v.reshape(x.shape[0], x.shape[1], self.num_heads, head_dim)
 
-        # Dot product attention: (batch, heads, seq_q, seq_k)
-        attn_weights = jnp.einsum("bqhd,bkhd->bhqk", q, k) / jnp.sqrt(head_dim)
+        dropout_rng = (
+            self.make_rng("dropout")
+            if not deterministic and self.dropout_rate > 0
+            else None
+        )
 
-        if mask is not None:
-            # mask shape (batch, 1, seq, seq)
-            attn_weights = attn_weights + mask
+        y = nn.dot_product_attention(
+            q,
+            k,
+            v,
+            bias=mask,
+            dropout_rate=self.dropout_rate,
+            deterministic=deterministic,
+            dropout_rng=dropout_rng,
+        )
 
-        attn_weights = nn.softmax(attn_weights, axis=-1)
-
-        if not deterministic:
-            attn_weights = nn.Dropout(self.dropout_rate)(
-                attn_weights, deterministic=deterministic
-            )
-
-        # (batch, seq, heads, dim)
-        y = jnp.einsum("bhqk,bkhd->bqhd", attn_weights, v)
         y = y.reshape(x.shape[0], x.shape[1], self.hidden_dim)
 
         y = nn.Dense(self.hidden_dim, use_bias=False)(y)

@@ -19,6 +19,7 @@ class DPSNRConfig:
     dropout: float = 0.1
     pool_total_vectors: int = 1000
     pool_hidden_dim: int = 64
+    librarian_hidden_dim: int = 32
     max_reasoning_loops: int = 4
     min_reasoning_loops: int = 1
     halt_threshold: float = 0.99
@@ -69,6 +70,7 @@ def get_model_config(name: str) -> DPSNRConfig:
             dropout=0.0,
             pool_total_vectors=100,
             pool_hidden_dim=32,
+            librarian_hidden_dim=16,
             max_reasoning_loops=2,
             min_reasoning_loops=1,
             halt_threshold=0.5,
