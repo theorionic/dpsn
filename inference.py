@@ -1,5 +1,9 @@
 import argparse
 import os
+
+# Fix RuntimeError: Already borrowed
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import jax
 import jax.numpy as jnp
 import orbax.checkpoint
