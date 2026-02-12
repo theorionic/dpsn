@@ -36,9 +36,14 @@ def load_model(config_name: str, checkpoint_dir: str, tokenizer_path: str):
     model = DPSNR(config)
     rng = jax.random.PRNGKey(0)
 
-    # Create dummy state on CPU for cross-device restoration
-    print("Initializing dummy state on CPU...")
-    with jax.default_device(jax.devices("cpu")[0]):
+    # Use CPU for initialization only if on CPU-only platform
+    platform = jax.devices()[0].platform
+    if platform == "cpu":
+        print("Initializing dummy state on CPU...")
+        with jax.default_device(jax.devices("cpu")[0]):
+            dummy_state = create_train_state(rng, config)
+    else:
+        print(f"Initializing state on {platform}...")
         dummy_state = create_train_state(rng, config)
 
     state = dummy_state
@@ -55,7 +60,6 @@ def load_model(config_name: str, checkpoint_dir: str, tokenizer_path: str):
                 print(
                     f"Restoring checkpoint from {abs_checkpoint_dir} at step {latest_step}..."
                 )
-                # Force resharding from TPU to CPU by passing dummy_state as items
                 state = checkpoint_manager.restore(latest_step, items=dummy_state)
             else:
                 # Fallback: Check if the user pointed directly to a step directory or the PyTree directory
@@ -72,7 +76,7 @@ def load_model(config_name: str, checkpoint_dir: str, tokenizer_path: str):
 
                 if target_path:
                     print(f"Restoring checkpoint directly from {target_path}...")
-                    state = checkpointer.restore(target_path, items=dummy_state)
+                    state = checkpointer.restore(target_path, item=dummy_state)
                 else:
                     print(
                         f"No checkpoint found in {abs_checkpoint_dir}. Using initialized parameters."
