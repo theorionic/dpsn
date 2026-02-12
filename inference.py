@@ -46,6 +46,10 @@ def load_model(config_name: str, checkpoint_dir: str, tokenizer_path: str):
         print(f"Initializing state on {platform}...")
         dummy_state = create_train_state(rng, config)
 
+    # Ensure all arrays in dummy_state are on CPU if that's what we want
+    if platform == "cpu":
+        dummy_state = jax.device_put(dummy_state, jax.devices("cpu")[0])
+
     state = dummy_state
 
     if checkpoint_dir:
@@ -56,11 +60,21 @@ def load_model(config_name: str, checkpoint_dir: str, tokenizer_path: str):
                 abs_checkpoint_dir, checkpointer
             )
             latest_step = checkpoint_manager.latest_step()
+
+            # Construct restore_args to force resharding to current devices
+            restore_args = orbax.checkpoint.checkpoint_utils.construct_restore_args(
+                dummy_state
+            )
+
             if latest_step is not None:
                 print(
                     f"Restoring checkpoint from {abs_checkpoint_dir} at step {latest_step}..."
                 )
-                state = checkpoint_manager.restore(latest_step, items=dummy_state)
+                state = checkpoint_manager.restore(
+                    latest_step,
+                    items=dummy_state,
+                    restore_kwargs={"restore_args": restore_args},
+                )
             else:
                 # Fallback: Check if the user pointed directly to a step directory or the PyTree directory
                 # Orbax CheckpointManager saves items under 'default' if not specified as a dict.
@@ -76,7 +90,9 @@ def load_model(config_name: str, checkpoint_dir: str, tokenizer_path: str):
 
                 if target_path:
                     print(f"Restoring checkpoint directly from {target_path}...")
-                    state = checkpointer.restore(target_path, item=dummy_state)
+                    state = checkpointer.restore(
+                        target_path, item=dummy_state, restore_args=restore_args
+                    )
                 else:
                     print(
                         f"No checkpoint found in {abs_checkpoint_dir}. Using initialized parameters."

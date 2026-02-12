@@ -48,17 +48,27 @@ def main():
     with jax.default_device(cpu_device):
         dummy_state = create_train_state(rng, config)
 
+    # Ensure all arrays in dummy_state are on CPU and replicated
+    dummy_state = jax.device_put(dummy_state, cpu_device)
+
     checkpointer = orbax.checkpoint.PyTreeCheckpointer()
     checkpoint_manager = orbax.checkpoint.CheckpointManager(
         abs_checkpoint_dir, checkpointer
     )
     latest_step = checkpoint_manager.latest_step()
 
+    # Construct restore_args to force resharding to CPU
+    restore_args = orbax.checkpoint.checkpoint_utils.construct_restore_args(dummy_state)
+
     if latest_step is not None:
         print(
             f"Restoring checkpoint from {abs_checkpoint_dir} at step {latest_step}..."
         )
-        state = checkpoint_manager.restore(latest_step, items=dummy_state)
+        state = checkpoint_manager.restore(
+            latest_step,
+            items=dummy_state,
+            restore_kwargs={"restore_args": restore_args},
+        )
     else:
         target_path = None
         if os.path.exists(os.path.join(abs_checkpoint_dir, "default")):
@@ -72,7 +82,9 @@ def main():
 
         if target_path:
             print(f"Restoring checkpoint directly from {target_path}...")
-            state = checkpointer.restore(target_path, item=dummy_state)
+            state = checkpointer.restore(
+                target_path, item=dummy_state, restore_args=restore_args
+            )
         else:
             print(f"Error: No checkpoint found in {abs_checkpoint_dir}.")
             return
