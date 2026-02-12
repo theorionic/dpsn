@@ -36,6 +36,7 @@ class DPSNRConfig:
     generation_prompts: Optional[list[str]] = None
     learning_rate: float = 3e-4
     num_workers: int = 4
+    gradient_checkpointing: bool = False
 
     @classmethod
     def from_yaml(cls, path: str) -> "DPSNRConfig":

@@ -73,6 +73,11 @@ def main():
         default=None,
         help="Custom prompts for generation",
     )
+    parser.add_argument(
+        "--gradient_checkpointing",
+        action="store_true",
+        help="Use gradient checkpointing to save memory",
+    )
 
     args = parser.parse_args()
 
@@ -84,6 +89,9 @@ def main():
         config = get_model_config(args.config)
     else:
         config = DPSNRConfig()
+
+    if args.gradient_checkpointing:
+        config.gradient_checkpointing = True
 
     # Create device mesh - handles 1 to N devices automatically
     devices = mesh_utils.create_device_mesh((jax.device_count(),))
