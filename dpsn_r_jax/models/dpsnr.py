@@ -54,12 +54,21 @@ class DPSNR(nn.Module):
         halt_prob = jnp.zeros((B, T, 1))
         halted_mask = jnp.zeros((B, T, 1))
 
+        # Initialize sub-modules before scan to avoid UnexpectedTracerError
+        # (JAX transformations like scan/jit do not allow parameter creation inside)
+        _ = self.indexer(jnp.zeros((B, D)))
+        _ = self.pool(jnp.zeros((B,)), jnp.zeros((B,)))
+        _ = self.retrieval_integrator(
+            jnp.zeros((B, T, D + self.config.controller_hidden_dim))
+        )
+        _ = self.acc(state_hidden, state_hidden, 0, halt_prob, halted_mask)
+
         # We use a functional scan for reasoning steps to support easy checkpointing
         def reasoning_step(carry, i):
             s_hidden, h_prob, h_mask = carry
             prev_s_hidden = s_hidden
 
-            pooled_state = jnp.mean(s_hidden, axis=1)
+            pooled_state = s_hidden[:, -1, :]
             mu, sigma = self.indexer(pooled_state)
 
             retrieved, start_indices = self.pool(mu, sigma)
@@ -98,6 +107,6 @@ class DPSNR(nn.Module):
         # 3. Decode
         logits = self.controller.decode(state_hidden)
 
-        # Transpose all_indices from (max_loops, B, K) to (B, max_loops, K)
-        all_indices = jnp.transpose(all_indices, (1, 0, 2))
+        # Transpose all_indices from (max_loops, B) to (B, max_loops)
+        all_indices = jnp.transpose(all_indices, (1, 0))
         return logits, (self.config.max_reasoning_loops, all_indices)
