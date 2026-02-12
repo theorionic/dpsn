@@ -267,8 +267,32 @@ def main():
             state = checkpoint_manager.restore(latest_step, items=state)
             global_step = latest_step
         else:
-            print("No checkpoint found to resume from. Starting from scratch.")
-            global_step = 0
+            # Fallback for direct directory path
+            abs_checkpoint_dir = os.path.abspath(args.checkpoint_dir)
+            target_path = None
+            if os.path.exists(os.path.join(abs_checkpoint_dir, "default")):
+                target_path = os.path.join(abs_checkpoint_dir, "default")
+            elif os.path.exists(os.path.join(abs_checkpoint_dir, "_METADATA")):
+                target_path = abs_checkpoint_dir
+
+            if target_path:
+                print(f"Resuming directly from checkpoint path: {target_path}")
+                state = orbax.checkpoint.PyTreeCheckpointer().restore(
+                    target_path, items=state
+                )
+                # Try to extract step from path if possible
+                try:
+                    step_str = os.path.basename(
+                        os.path.dirname(target_path)
+                        if target_path.endswith("default")
+                        else target_path
+                    )
+                    global_step = int(step_str)
+                except ValueError:
+                    global_step = 0
+            else:
+                print("No checkpoint found to resume from. Starting from scratch.")
+                global_step = 0
     else:
         global_step = 0
 

@@ -58,9 +58,25 @@ def load_model(config_name: str, checkpoint_dir: str, tokenizer_path: str):
                 # Force resharding from TPU to CPU by passing dummy_state as items
                 state = checkpoint_manager.restore(latest_step, items=dummy_state)
             else:
-                print(
-                    f"No checkpoint found in {abs_checkpoint_dir}. Using initialized parameters."
-                )
+                # Fallback: Check if the user pointed directly to a step directory or the PyTree directory
+                # Orbax CheckpointManager saves items under 'default' if not specified as a dict.
+                target_path = None
+                if os.path.exists(os.path.join(abs_checkpoint_dir, "default")):
+                    target_path = os.path.join(abs_checkpoint_dir, "default")
+                elif os.path.exists(os.path.join(abs_checkpoint_dir, "_METADATA")):
+                    target_path = abs_checkpoint_dir
+                elif os.path.exists(os.path.join(abs_checkpoint_dir, "checkpoint")):
+                    target_path = os.path.join(abs_checkpoint_dir, "checkpoint")
+                elif os.path.exists(os.path.join(abs_checkpoint_dir, "params")):
+                    target_path = os.path.join(abs_checkpoint_dir, "params")
+
+                if target_path:
+                    print(f"Restoring checkpoint directly from {target_path}...")
+                    state = checkpointer.restore(target_path, items=dummy_state)
+                else:
+                    print(
+                        f"No checkpoint found in {abs_checkpoint_dir}. Using initialized parameters."
+                    )
         else:
             print(
                 f"Checkpoint directory {abs_checkpoint_dir} does not exist. Using initialized parameters."
