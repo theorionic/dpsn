@@ -1,3 +1,4 @@
+import jax
 import jax.numpy as jnp
 import flax.linen as nn
 from dpsn_r_jax.config import DPSNRConfig, PoolConfig
@@ -10,7 +11,16 @@ class DPSNR(nn.Module):
     config: DPSNRConfig
 
     def setup(self):
-        self.controller = TinyController(self.config)
+        # Conditionally apply gradient checkpointing (rematerialization)
+        # to the heavy components of the model.
+        if self.config.gradient_checkpointing:
+            controller_cls = nn.remat(TinyController)
+            acc_cls = nn.remat(AdaptiveComputeController)
+        else:
+            controller_cls = TinyController
+            acc_cls = AdaptiveComputeController
+
+        self.controller = controller_cls(self.config)
         self.indexer = LearnedIndexer(self.config.controller_hidden_dim)
         self.pool = CoordinateMassivePool(
             PoolConfig(
@@ -18,7 +28,7 @@ class DPSNR(nn.Module):
             ),
             window_size=self.config.max_k,
         )
-        self.acc = AdaptiveComputeController(
+        self.acc = acc_cls(
             self.config.controller_hidden_dim,
             self.config.max_reasoning_loops,
             self.config.halt_threshold,
@@ -34,7 +44,8 @@ class DPSNR(nn.Module):
 
     def __call__(self, input_ids, deterministic=True):
         # 1. Encode
-        hidden = self.controller.encode(input_ids, deterministic=deterministic)
+        # Use __call__ to support rematerialization if enabled
+        hidden = self.controller(input_ids, deterministic=deterministic)
 
         # 2. Reasoning Loop
         state_hidden = hidden
@@ -43,44 +54,50 @@ class DPSNR(nn.Module):
         halt_prob = jnp.zeros((B, T, 1))
         halted_mask = jnp.zeros((B, T, 1))
 
-        indices_list = []
+        # We use a functional scan for reasoning steps to support easy checkpointing
+        def reasoning_step(carry, i):
+            s_hidden, h_prob, h_mask = carry
+            prev_s_hidden = s_hidden
 
-        # Python loop unrolling (efficient for small max_loops on TPU)
-        i = 0
-        for i in range(self.config.max_reasoning_loops):
-            # Save state before step to handle "already halted" samples
-            prev_state_hidden = state_hidden
-
-            pooled_state = jnp.mean(state_hidden, axis=1)
+            pooled_state = jnp.mean(s_hidden, axis=1)
             mu, sigma = self.indexer(pooled_state)
 
             retrieved, start_indices = self.pool(mu, sigma)
-            indices_list.append(start_indices)
 
             retrieved_expanded = jnp.expand_dims(retrieved, 1).repeat(T, axis=1)
 
-            combined = jnp.concatenate([state_hidden, retrieved_expanded], axis=-1)
+            combined = jnp.concatenate([s_hidden, retrieved_expanded], axis=-1)
             integrated = self.retrieval_integrator(combined)
 
-            # Step
-            new_state_hidden, halt_prob, new_halted_mask = self.acc(
-                state_hidden,
-                state_hidden + integrated,  # input to accumulation
+            # Step (ACC is already rematerialized if requested)
+            new_s_hidden, h_prob, new_h_mask = self.acc(
+                s_hidden,
+                s_hidden + integrated,  # input to accumulation
                 i,
-                halt_prob,
-                halted_mask,
+                h_prob,
+                h_mask,
             )
 
             # Mask format: (B, T, 1) -> Broadcast to (B, T, D)
-            update_mask = 1.0 - halted_mask
-            state_hidden = (
-                update_mask * new_state_hidden + halted_mask * prev_state_hidden
-            )
+            update_mask = 1.0 - h_mask
+            s_hidden = update_mask * new_s_hidden + h_mask * prev_s_hidden
 
-            halted_mask = new_halted_mask
+            return (s_hidden, h_prob, new_h_mask), start_indices
+
+        # Checkpoint the scan body if requested
+        if self.config.gradient_checkpointing:
+            reasoning_step = jax.checkpoint(reasoning_step)
+
+        init_carry = (state_hidden, halt_prob, halted_mask)
+        (state_hidden, halt_prob, halted_mask), all_indices = jax.lax.scan(
+            reasoning_step,
+            init_carry,
+            jnp.arange(self.config.max_reasoning_loops),
+        )
 
         # 3. Decode
         logits = self.controller.decode(state_hidden)
 
-        all_indices = jnp.stack(indices_list, axis=1)
-        return logits, (i + 1, all_indices)
+        # Transpose all_indices from (max_loops, B, K) to (B, max_loops, K)
+        all_indices = jnp.transpose(all_indices, (1, 0, 2))
+        return logits, (self.config.max_reasoning_loops, all_indices)
