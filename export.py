@@ -97,7 +97,7 @@ def main():
         abs_output_dir, orbax.checkpoint.PyTreeCheckpointer()
     )
 
-    output_manager.save(0, state, save_kwargs={"force": True})
+    output_manager.save(0, state)
     output_manager.wait_until_finished()
 
     print(f"\nSuccess! The exported model is now 'Universal / Unsharded'.")
