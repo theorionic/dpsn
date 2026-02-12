@@ -21,6 +21,16 @@ from dpsn_r_jax.utils.generation import generate
 from dpsn_r_jax.utils.metrics import calculate_flops
 
 
+def log_pool_utilization(state):
+    touched_mask = jnp.any(state.pool_v > 0, axis=-1)
+    num_touched = jnp.sum(touched_mask)
+    total_vectors = state.pool_v.shape[0]
+    percentage = (num_touched / total_vectors) * 100
+    print(
+        f"Pool Utilization: {percentage:.2f}% ({int(num_touched)} / {total_vectors} vectors touched)"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train DPSNR Model")
     parser.add_argument(
@@ -412,6 +422,7 @@ def main():
         print(
             f"Epoch {epoch + 1} Complete | Avg Loss: {epoch_loss / steps_per_epoch:.4f}"
         )
+        log_pool_utilization(state)
 
         # Save checkpoint at end of epoch
         # Save checkpoint at end of epoch
@@ -441,6 +452,8 @@ def main():
             )
             print(f"Output: {output}")
             print("-" * 20)
+
+    log_pool_utilization(state)
 
 
 if __name__ == "__main__":
