@@ -6,6 +6,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import jax
 import jax.numpy as jnp
+import orbax
 import orbax.checkpoint
 import optax
 from flax.training import orbax_utils
@@ -35,8 +36,12 @@ def load_model(config_name: str, checkpoint_dir: str, tokenizer_path: str):
     model = DPSNR(config)
     rng = jax.random.PRNGKey(0)
 
-    print("Initializing model parameters...")
-    state = create_train_state(rng, config)
+    # Create dummy state on CPU for cross-device restoration
+    print("Initializing dummy state on CPU...")
+    with jax.default_device(jax.devices("cpu")[0]):
+        dummy_state = create_train_state(rng, config)
+
+    state = dummy_state
 
     if checkpoint_dir:
         abs_checkpoint_dir = os.path.abspath(checkpoint_dir)
@@ -50,7 +55,8 @@ def load_model(config_name: str, checkpoint_dir: str, tokenizer_path: str):
                 print(
                     f"Restoring checkpoint from {abs_checkpoint_dir} at step {latest_step}..."
                 )
-                state = checkpoint_manager.restore(latest_step, items=state)
+                # Force resharding from TPU to CPU by passing dummy_state as items
+                state = checkpoint_manager.restore(latest_step, items=dummy_state)
             else:
                 print(
                     f"No checkpoint found in {abs_checkpoint_dir}. Using initialized parameters."
