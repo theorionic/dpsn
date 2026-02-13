@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+import time
 
 
 def generate(
@@ -12,7 +13,16 @@ def generate(
     top_k=40,
     repetition_penalty=1.2,
 ):
-    input_ids = tokenizer.encode(prompt, return_tensors="np")
+    for i in range(3):
+        try:
+            input_ids = tokenizer.encode(prompt, return_tensors="np")
+            break
+        except RuntimeError as e:
+            if "Already borrowed" in str(e) and i < 2:
+                time.sleep(0.1)
+                continue
+            raise e
+
     generated = jnp.array(input_ids)
 
     for _ in range(max_len):
