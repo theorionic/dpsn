@@ -10,10 +10,13 @@ import jax.numpy as jnp
 import optax
 
 try:
-    from torch.utils.tensorboard import SummaryWriter
+    from tensorboardX import SummaryWriter
 except ImportError:
+    print(
+        "For TensorBoard logging without PyTorch, install tensorboardX: pip install tensorboardX"
+    )
     try:
-        from tensorboardX import SummaryWriter
+        from torch.utils.tensorboard import SummaryWriter
     except ImportError:
 
         class SummaryWriter:
