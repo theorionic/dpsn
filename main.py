@@ -67,7 +67,8 @@ def main():
     parser.add_argument(
         "--hf_text_column",
         type=str,
-        default="text",
+        nargs="+",
+        default=["text"],
         help="Column name for text content",
     )
     parser.add_argument(

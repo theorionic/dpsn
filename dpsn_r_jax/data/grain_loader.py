@@ -50,10 +50,17 @@ class ConcatenatedSource:
 
 
 class HFStreamSource:
-    def __init__(self, path: str, name: Optional[str] = None, split: str = "train"):
+    def __init__(
+        self,
+        path: str,
+        name: Optional[str] = None,
+        split: str = "train",
+        text_column: Optional[str] = None,
+    ):
         self.path = path
         self.name = name
         self.split = split
+        self.text_column = text_column
         self._dataset = None
 
     @property
@@ -67,7 +74,10 @@ class HFStreamSource:
         return self._dataset
 
     def __iter__(self):
-        yield from self.dataset
+        for item in self.dataset:
+            if self.text_column and self.text_column in item:
+                item["text"] = item[self.text_column]
+            yield item
 
     def skip(self, n: int):
         if n > 0:
@@ -116,21 +126,15 @@ class HFStreamLoader:
         source: SequentialSource,
         transform: Any,
         batch_size: int,
-        text_column: Optional[str] = None,
     ):
         self.source = source
         self.transform = transform
         self.batch_size = batch_size
-        self.text_column = text_column
 
     def __iter__(self):
         batch = []
         for item in self.source:
-            # Use explicit text column if provided
-            if self.text_column and self.text_column in item:
-                item["text"] = item[self.text_column]
-
-            # Map common HF text fields to "text" as fallback
+            # Map common HF text fields to "text" as fallback if not already set by Source
             if "text" not in item:
                 for key in ["content", "body", "text_content"]:
                     if key in item:
@@ -237,16 +241,36 @@ def get_grain_loader(
             except Exception as e:
                 print(f"Failed to load resume state: {e}")
 
-        sources = [HFStreamSource(path) for path in hf_datasets]
+        # Prepare text columns
+        text_columns = getattr(config, "hf_text_column", ["text"])
+        if isinstance(text_columns, str):
+            text_columns = [text_columns]
+
+        # Broadcast text_columns if necessary
+        if len(text_columns) == 1 and len(hf_datasets) > 1:
+            text_columns = text_columns * len(hf_datasets)
+        elif len(text_columns) != len(hf_datasets):
+            print(
+                f"Warning: Number of text columns ({len(text_columns)}) "
+                f"does not match number of datasets ({len(hf_datasets)}). "
+                "Using default 'text' for remaining datasets."
+            )
+            text_columns = text_columns + ["text"] * (
+                len(hf_datasets) - len(text_columns)
+            )
+
+        sources = [
+            HFStreamSource(path, text_column=col)
+            for path, col in zip(hf_datasets, text_columns)
+        ]
         source = SequentialSource(
             sources, dataset_idx=dataset_idx, sample_idx=sample_idx
         )
 
         transform = TokenizeTransform(tokenizer, max_length=seq_len)
         batch_size = getattr(config, "batch_size", 8)
-        text_column = getattr(config, "hf_text_column", "text")
 
-        return HFStreamLoader(source, transform, batch_size, text_column=text_column)
+        return HFStreamLoader(source, transform, batch_size)
 
     if not GRAIN_AVAILABLE:
         return None
