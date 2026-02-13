@@ -8,6 +8,25 @@ import orbax.checkpoint
 from flax.training import orbax_utils
 import jax.numpy as jnp
 import optax
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    try:
+        from tensorboardX import SummaryWriter
+    except ImportError:
+
+        class SummaryWriter:
+            def __init__(self, log_dir=None):
+                pass
+
+            def add_scalar(self, tag, scalar_value, global_step=None, walltime=None):
+                pass
+
+            def close(self):
+                pass
+
+
 from dpsn_r_jax.config import DPSNRConfig, get_model_config
 from dpsn_r_jax.models.dpsnr import DPSNR
 from dpsn_r_jax.data.dataset import (
@@ -29,6 +48,7 @@ def log_pool_utilization(state):
     print(
         f"Pool Utilization: {percentage:.2f}% ({int(num_touched)} / {total_vectors} vectors touched)"
     )
+    return float(percentage)
 
 
 def main():
@@ -55,9 +75,22 @@ def main():
         "--max_steps", type=int, default=None, help="Max training steps"
     )
     parser.add_argument(
-        "--hf_dataset", type=str, default=None, help="HuggingFace dataset name"
+        "--hf_dataset", type=str, default=None, help="HuggingFace dataset name (legacy)"
+    )
+    parser.add_argument(
+        "--hf_datasets",
+        nargs="+",
+        default=None,
+        help="List of HuggingFace dataset paths to stream sequentially",
     )
     parser.add_argument("--hf_subset", type=str, default=None, help="Dataset subset")
+    parser.add_argument(
+        "--hf_text_column",
+        type=str,
+        nargs="+",
+        default=["text"],
+        help="Column name for text content",
+    )
     parser.add_argument(
         "--hf_tokenizer", type=str, default=None, help="HuggingFace tokenizer"
     )
@@ -67,6 +100,12 @@ def main():
         nargs="+",
         default=None,
         help="Path(s) to dataset files/directories",
+    )
+    parser.add_argument(
+        "--resume_data_path",
+        type=str,
+        default="grain_state.json",
+        help="Path to save/load data loader state",
     )
     parser.add_argument(
         "--generation_steps", type=int, default=None, help="Generate text every N steps"
@@ -102,6 +141,12 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Initialize TensorBoard writer
+    log_dir = None
+    if args.checkpoint_dir:
+        log_dir = os.path.join(args.checkpoint_dir, "runs")
+    writer = SummaryWriter(log_dir=log_dir)
 
     if args.tiny:
         print("Using TINY config (via flag)...")
@@ -352,7 +397,7 @@ def main():
     distributed_train_step = jax.jit(train_step)
 
     flops_per_step = calculate_flops(config, args.batch_size)
-    steps_per_epoch = args.dataset_size // args.batch_size
+    steps_per_epoch = max(1, args.dataset_size // args.batch_size)
 
     # Define test samples for generation
     test_samples = ["Sort: 5 2 8 1 ->", "Sort: 10 3 7 ->", "Sort: 1 1 1 ->"]
@@ -385,6 +430,13 @@ def main():
             epoch_loss += loss
             global_step += 1
 
+            # TensorBoard logging
+            writer.add_scalar("Loss/train", float(loss), global_step)
+            writer.add_scalar("Perf/TPS", tokens_per_sec, global_step)
+            writer.add_scalar("Perf/TFLOPS", tflops, global_step)
+            if hasattr(state, "learning_rate"):
+                writer.add_scalar("LR", state.learning_rate, global_step)
+
             # Save Checkpoint
             if (
                 checkpoint_manager
@@ -394,6 +446,12 @@ def main():
             ):
                 print(f"Saving checkpoint at step {global_step}...")
                 checkpoint_manager.save(global_step, state)
+                # Save data loader state if supported
+                if hasattr(grain_loader, "get_state"):
+                    import json
+
+                    with open(args.resume_data_path, "w") as f:
+                        json.dump(grain_loader.get_state(), f)
 
             if step % 10 == 0:
                 print(
@@ -439,15 +497,20 @@ def main():
         print(
             f"Epoch {epoch + 1} Complete | Avg Loss: {epoch_loss / steps_per_epoch:.4f}"
         )
-        log_pool_utilization(state)
+        pool_util = log_pool_utilization(state)
+        writer.add_scalar("Pool/Utilization", pool_util, global_step)
 
-        # Save checkpoint at end of epoch
         # Save checkpoint at end of epoch
         if checkpoint_manager:
             print(
                 f"Saving checkpoint at end of epoch {epoch + 1} (step {global_step})..."
             )
             checkpoint_manager.save(global_step, state)
+            if hasattr(grain_loader, "get_state"):
+                import json
+
+                with open(args.resume_data_path, "w") as f:
+                    json.dump(grain_loader.get_state(), f)
 
     # Generation Test
     print("\nVerifying model generation...")
@@ -470,7 +533,9 @@ def main():
             print(f"Output: {output}")
             print("-" * 20)
 
-    log_pool_utilization(state)
+    pool_util = log_pool_utilization(state)
+    writer.add_scalar("Pool/Utilization", pool_util, global_step)
+    writer.close()
 
 
 if __name__ == "__main__":
