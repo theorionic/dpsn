@@ -88,6 +88,11 @@ def main():
         action="store_true",
         help="Use gradient checkpointing to save memory",
     )
+    parser.add_argument(
+        "--resume_data",
+        action="store_true",
+        help="Resume data loader from the checkpointed step",
+    )
 
     args = parser.parse_args()
 
@@ -161,41 +166,6 @@ def main():
 
     tokenizer_name = config.hf_tokenizer_name or "numeric"
     tokenizer = get_tokenizer(tokenizer_name)
-
-    grain_loader = get_grain_loader(args)
-    if grain_loader:
-        print("Using Google Grain data loader.")
-
-        class GrainWrapper:
-            def __init__(self, loader):
-                self.loader = loader
-                self.iterator = iter(loader)
-
-            def get_batch(self, batch_size=None):
-                try:
-                    batch = next(self.iterator)
-                except StopIteration:
-                    self.iterator = iter(self.loader)
-                    batch = next(self.iterator)
-                return batch["input_ids"]
-
-        dataset = GrainWrapper(grain_loader)
-    elif args.hf_dataset:
-        print(
-            f"Loading HF streaming dataset: {args.hf_dataset} (subset: {args.hf_subset})"
-        )
-        dataset = HFStreamingDataset(
-            args.hf_dataset,
-            tokenizer,
-            subset=args.hf_subset,
-            seq_len=config.max_seq_len,
-            batch_size=args.batch_size,
-        )
-    else:
-        print("Generating synthetic sorting dataset...")
-        dataset = SyntheticReasoningDataset(
-            size=args.dataset_size, seq_len=config.max_seq_len
-        )
 
     # Initialize Model
     model = DPSNR(config)
@@ -305,6 +275,44 @@ def main():
                 global_step = 0
     else:
         global_step = 0
+
+    # Data Loader Initialization
+    loader_start_step = global_step if args.resume_data else 0
+    grain_loader = get_grain_loader(args, start_step=loader_start_step)
+
+    if grain_loader:
+        print(f"Using Google Grain data loader (start_step={loader_start_step}).")
+
+        class GrainWrapper:
+            def __init__(self, loader):
+                self.loader = loader
+                self.iterator = iter(loader)
+
+            def get_batch(self, batch_size=None):
+                try:
+                    batch = next(self.iterator)
+                except StopIteration:
+                    self.iterator = iter(self.loader)
+                    batch = next(self.iterator)
+                return batch["input_ids"]
+
+        dataset = GrainWrapper(grain_loader)
+    elif args.hf_dataset:
+        print(
+            f"Loading HF streaming dataset: {args.hf_dataset} (subset: {args.hf_subset})"
+        )
+        dataset = HFStreamingDataset(
+            args.hf_dataset,
+            tokenizer,
+            subset=args.hf_subset,
+            seq_len=config.max_seq_len,
+            batch_size=args.batch_size,
+        )
+    else:
+        print("Generating synthetic sorting dataset...")
+        dataset = SyntheticReasoningDataset(
+            size=args.dataset_size, seq_len=config.max_seq_len
+        )
 
     def count_params(tree):
         return sum(x.size for x in jax.tree_util.tree_leaves(tree))

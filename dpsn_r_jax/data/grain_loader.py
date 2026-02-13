@@ -40,18 +40,18 @@ class TokenizeTransform:
         return element
 
 
-def get_grain_loader(config: Any) -> Optional[Any]:
+def get_grain_loader(config: Any, start_step: int = 0) -> Optional[Any]:
     if not GRAIN_AVAILABLE:
         return None
 
     try:
         source = DummySource(size=getattr(config, "dataset_size", 1000))
+        batch_size = getattr(config, "batch_size", 8)
+        start_index = start_step * batch_size
 
         operations = [
             TokenizeTransform(max_length=getattr(config, "seq_len", 64)),
-            grain.Batch(
-                batch_size=getattr(config, "batch_size", 8), drop_remainder=True
-            ),
+            grain.Batch(batch_size=batch_size, drop_remainder=True),
         ]
 
         worker_count = getattr(config, "num_workers", 4)
@@ -69,6 +69,7 @@ def get_grain_loader(config: Any) -> Optional[Any]:
             ),
             worker_count=worker_count,
             worker_buffer_size=500,
+            read_options=grain.ReadOptions(start_index=start_index),
         )
 
         return loader
