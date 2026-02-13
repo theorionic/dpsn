@@ -111,15 +111,26 @@ class SequentialSource:
 
 
 class HFStreamLoader:
-    def __init__(self, source: SequentialSource, transform: Any, batch_size: int):
+    def __init__(
+        self,
+        source: SequentialSource,
+        transform: Any,
+        batch_size: int,
+        text_column: Optional[str] = None,
+    ):
         self.source = source
         self.transform = transform
         self.batch_size = batch_size
+        self.text_column = text_column
 
     def __iter__(self):
         batch = []
         for item in self.source:
-            # Map common HF text fields to "text"
+            # Use explicit text column if provided
+            if self.text_column and self.text_column in item:
+                item["text"] = item[self.text_column]
+
+            # Map common HF text fields to "text" as fallback
             if "text" not in item:
                 for key in ["content", "body", "text_content"]:
                     if key in item:
@@ -233,8 +244,9 @@ def get_grain_loader(
 
         transform = TokenizeTransform(tokenizer, max_length=seq_len)
         batch_size = getattr(config, "batch_size", 8)
+        text_column = getattr(config, "hf_text_column", "text")
 
-        return HFStreamLoader(source, transform, batch_size)
+        return HFStreamLoader(source, transform, batch_size, text_column=text_column)
 
     if not GRAIN_AVAILABLE:
         return None

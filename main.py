@@ -65,6 +65,12 @@ def main():
     )
     parser.add_argument("--hf_subset", type=str, default=None, help="Dataset subset")
     parser.add_argument(
+        "--hf_text_column",
+        type=str,
+        default="text",
+        help="Column name for text content",
+    )
+    parser.add_argument(
         "--hf_tokenizer", type=str, default=None, help="HuggingFace tokenizer"
     )
     parser.add_argument(
