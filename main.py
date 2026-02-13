@@ -55,7 +55,13 @@ def main():
         "--max_steps", type=int, default=None, help="Max training steps"
     )
     parser.add_argument(
-        "--hf_dataset", type=str, default=None, help="HuggingFace dataset name"
+        "--hf_dataset", type=str, default=None, help="HuggingFace dataset name (legacy)"
+    )
+    parser.add_argument(
+        "--hf_datasets",
+        nargs="+",
+        default=None,
+        help="List of HuggingFace dataset paths to stream sequentially",
     )
     parser.add_argument("--hf_subset", type=str, default=None, help="Dataset subset")
     parser.add_argument(
@@ -67,6 +73,12 @@ def main():
         nargs="+",
         default=None,
         help="Path(s) to dataset files/directories",
+    )
+    parser.add_argument(
+        "--resume_data_path",
+        type=str,
+        default="grain_state.json",
+        help="Path to save/load data loader state",
     )
     parser.add_argument(
         "--generation_steps", type=int, default=None, help="Generate text every N steps"
@@ -394,6 +406,12 @@ def main():
             ):
                 print(f"Saving checkpoint at step {global_step}...")
                 checkpoint_manager.save(global_step, state)
+                # Save data loader state if supported
+                if hasattr(grain_loader, "get_state"):
+                    import json
+
+                    with open(args.resume_data_path, "w") as f:
+                        json.dump(grain_loader.get_state(), f)
 
             if step % 10 == 0:
                 print(
@@ -442,12 +460,16 @@ def main():
         log_pool_utilization(state)
 
         # Save checkpoint at end of epoch
-        # Save checkpoint at end of epoch
         if checkpoint_manager:
             print(
                 f"Saving checkpoint at end of epoch {epoch + 1} (step {global_step})..."
             )
             checkpoint_manager.save(global_step, state)
+            if hasattr(grain_loader, "get_state"):
+                import json
+
+                with open(args.resume_data_path, "w") as f:
+                    json.dump(grain_loader.get_state(), f)
 
     # Generation Test
     print("\nVerifying model generation...")
