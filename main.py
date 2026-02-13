@@ -139,6 +139,12 @@ def main():
         action="store_true",
         help="Resume data loader from the checkpointed step",
     )
+    parser.add_argument(
+        "--skip_batches",
+        type=int,
+        default=0,
+        help="Manually skip N batches of data",
+    )
 
     args = parser.parse_args()
 
@@ -329,7 +335,12 @@ def main():
         global_step = 0
 
     # Data Loader Initialization
-    loader_start_step = global_step if args.resume_data else 0
+    if args.skip_batches > 0:
+        loader_start_step = args.skip_batches
+    elif args.resume_data:
+        loader_start_step = global_step
+    else:
+        loader_start_step = 0
     grain_loader = get_grain_loader(
         args.dataset_path, args, start_step=loader_start_step
     )
