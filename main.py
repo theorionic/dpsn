@@ -62,6 +62,13 @@ def main():
         "--hf_tokenizer", type=str, default=None, help="HuggingFace tokenizer"
     )
     parser.add_argument(
+        "--dataset_path",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Path(s) to dataset files/directories",
+    )
+    parser.add_argument(
         "--generation_steps", type=int, default=None, help="Generate text every N steps"
     )
     parser.add_argument(
@@ -278,7 +285,9 @@ def main():
 
     # Data Loader Initialization
     loader_start_step = global_step if args.resume_data else 0
-    grain_loader = get_grain_loader(args, start_step=loader_start_step)
+    grain_loader = get_grain_loader(
+        args.dataset_path, args, start_step=loader_start_step
+    )
 
     if grain_loader:
         print(f"Using Google Grain data loader (start_step={loader_start_step}).")
