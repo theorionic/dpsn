@@ -67,6 +67,9 @@ def main():
         help="Model configuration size",
     )
     parser.add_argument(
+        "--config_path", type=str, default=None, help="Path to YAML configuration file"
+    )
+    parser.add_argument(
         "--epochs", type=int, default=1, help="Number of training epochs"
     )
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
@@ -160,12 +163,26 @@ def main():
     if args.tiny:
         print("Using TINY config (via flag)...")
         config = get_model_config("tiny")
+    elif args.config_path:
+        print(f"Loading config from {args.config_path}...")
+        config = DPSNRConfig.from_yaml(args.config_path)
     elif args.config:
         print(f"Using {args.config.upper()} config...")
         config = get_model_config(args.config)
     else:
         config = DPSNRConfig()
 
+    # CLI args override YAML/Predefined config
+    if args.num_workers != 4:
+        config.num_workers = args.num_workers
+    if args.hf_dataset:
+        config.hf_dataset_name = args.hf_dataset
+    if args.hf_tokenizer:
+        config.hf_tokenizer_name = args.hf_tokenizer
+    if args.generation_steps is not None:
+        config.generation_steps = args.generation_steps
+    if args.generation_max_tokens != 20:
+        config.generation_max_tokens = args.generation_max_tokens
     if args.gradient_checkpointing:
         config.gradient_checkpointing = True
 
@@ -206,13 +223,6 @@ def main():
     print(f"Distributed Mesh: {mesh}")
     print(f"Sharding Strategy: Pool -> Sharded, Rest -> Replicated")
 
-    if args.hf_dataset:
-        config.hf_dataset_name = args.hf_dataset
-    if args.hf_tokenizer:
-        config.hf_tokenizer_name = args.hf_tokenizer
-
-    config.num_workers = args.num_workers
-
     if (
         args.max_steps is None
         and hasattr(config, "max_steps")
@@ -220,10 +230,6 @@ def main():
     ):
         print(f"Using max_steps from config: {config.max_steps}")
         args.max_steps = config.max_steps
-
-    if args.generation_steps is not None:
-        config.generation_steps = args.generation_steps
-    config.generation_max_tokens = args.generation_max_tokens
 
     tokenizer_name = config.hf_tokenizer_name or "numeric"
     tokenizer = get_tokenizer(tokenizer_name)
