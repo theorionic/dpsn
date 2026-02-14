@@ -1,0 +1,30 @@
+# DPSNR Configuration Template
+# Values are defaults from DPSNRConfig
+
+vocab_size: 24
+controller_hidden_dim: 64
+controller_num_layers: 2
+controller_num_heads: 2
+controller_ff_multiplier: 2.0
+max_seq_len: 64
+dropout: 0.1
+pool_total_vectors: 1000
+pool_hidden_dim: 64
+librarian_hidden_dim: 32
+max_reasoning_loops: 4
+min_reasoning_loops: 1
+halt_threshold: 0.99
+min_k: 4
+max_k: 32
+num_clusters_to_search: 4
+hf_dataset_name: null
+hf_tokenizer_name: null
+streaming: true
+pad_token_id: 0
+max_steps: null
+generation_steps: null
+generation_max_tokens: 20
+generation_prompts: null
+learning_rate: 0.0003
+num_workers: 4
+gradient_checkpointing: false
