@@ -42,7 +42,7 @@ class DPSNRConfig:
     max_k: int = 32
     num_clusters_to_search: int = 4
     hf_dataset_name: Optional[str] = None
-    hf_tokenizer_name: Optional[str] = "gpt2"
+    hf_tokenizer_name: Optional[str] = "EleutherAI/gpt-neo-125M"
     streaming: bool = True
     pad_token_id: int = 0
     max_steps: Optional[int] = None
@@ -451,6 +451,7 @@ def generate(
 
     generated = jnp.array(input_ids)
 
+    eos_id = tokenizer.eos_token_id
     print("Starting generation loop...")
     for step in range(max_len):
         logits, _ = state.apply_fn(
@@ -495,16 +496,17 @@ def generate(
         else:
             next_token = jnp.argmax(next_token_logits, axis=-1)
 
+        next_token_id = int(next_token.item())
+        if next_token_id == eos_id:
+            break
+
         next_token = jnp.reshape(next_token, (1,))
         generated = jnp.concatenate([generated, next_token[:, None]], axis=1)
 
-        token_id = next_token[0].item()
         # Stream print
-        word = tokenizer.decode([token_id])
+        word = tokenizer.decode([next_token_id])
         print(word, end="", flush=True)
 
-        if token_id == tokenizer.eos_token_id:
-            break
     print("\n")
 
     generated_list = generated[0].tolist()
@@ -586,11 +588,18 @@ def main():
         help="Path to checkpoint",
     )
     parser.add_argument(
-        "--tokenizer", type=str, default="gpt2", help="HuggingFace tokenizer name"
+        "--tokenizer",
+        type=str,
+        default="EleutherAI/gpt-neo-125M",
+        help="HuggingFace tokenizer name",
     )
     parser.add_argument(
         "--prompt", type=str, default="The future of AI is", help="Initial prompt"
     )
+    parser.add_argument(
+        "--temperature", type=float, default=0.0, help="Sampling temperature"
+    )
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--interactive", action="store_true", help="Interactive mode")
 
     args = parser.parse_args()
@@ -614,7 +623,7 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    rng = random.PRNGKey(42)
+    rng = random.PRNGKey(args.seed)
 
     # 6. Generate
     if args.interactive:
@@ -625,9 +634,21 @@ def main():
                 break
 
             rng, step_rng = random.split(rng)
-            generate(inference_state, prompt, tokenizer, rng=step_rng)
+            generate(
+                inference_state,
+                prompt,
+                tokenizer,
+                rng=step_rng,
+                temperature=args.temperature,
+            )
     else:
-        generate(inference_state, args.prompt, tokenizer, rng=rng)
+        generate(
+            inference_state,
+            args.prompt,
+            tokenizer,
+            rng=rng,
+            temperature=args.temperature,
+        )
 
 
 if __name__ == "__main__":
