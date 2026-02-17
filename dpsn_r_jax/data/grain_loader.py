@@ -75,8 +75,18 @@ class HFStreamSource:
 
     def __iter__(self):
         for item in self.dataset:
-            if self.text_column and self.text_column in item:
-                item["text"] = item[self.text_column]
+            if self.text_column:
+                if "{" in self.text_column and "}" in self.text_column:
+                    try:
+                        item["text"] = self.text_column.format(**item)
+                    except KeyError as e:
+                        print(
+                            f"Warning: KeyError while formatting text template. "
+                            f"Missing key: {e}. Available keys: {list(item.keys())}"
+                        )
+                        continue
+                elif self.text_column in item:
+                    item["text"] = item[self.text_column]
             yield item
 
     def skip(self, n: int):
