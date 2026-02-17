@@ -106,13 +106,14 @@ def train_step(state, batch, pad_token_id=0):
     m_slice = state.pool_m[safe_indices]
     v_slice = state.pool_v[safe_indices]
 
+    current_lr = state.learning_rate
     new_p_s, new_m_s, new_v_s = sparse_adam_update(
         p_slice,
         g_slice,
         m_slice,
         v_slice,
         state.step + 1,
-        lr=state.learning_rate,
+        lr=current_lr,
     )
 
     new_pool_params = pool_params.at[safe_indices].set(

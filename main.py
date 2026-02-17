@@ -54,6 +54,23 @@ def log_pool_utilization(state):
     return float(percentage)
 
 
+def sync_checkpoints(local_dir, remote_dest):
+    """Syncs local checkpoints to a remote destination using rclone."""
+    try:
+        from rclone_python import rclone
+
+        print(f"Syncing checkpoints to remote: {remote_dest}...")
+        rclone.sync(local_dir, remote_dest)
+        print("Checkpoint sync complete.")
+    except ImportError:
+        print(
+            "WARNING: rclone-python not installed. Skipping sync.\n"
+            "To enable remote checkpoints, install: pip install rclone-python"
+        )
+    except Exception as e:
+        print(f"ERROR: Failed to sync checkpoints: {e}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train DPSNR Model")
     parser.add_argument(
@@ -148,6 +165,24 @@ def main():
         default=0,
         help="Manually skip N batches of data",
     )
+    parser.add_argument(
+        "--learning_rate",
+        type=float,
+        default=None,
+        help="Override learning rate",
+    )
+    parser.add_argument(
+        "--warmup_steps",
+        type=int,
+        default=0,
+        help="Number of warmup steps for scheduler",
+    )
+    parser.add_argument(
+        "--rclone_remote",
+        type=str,
+        default=None,
+        help="Rclone remote destination (e.g., 'gdrive:dpsn_checkpoints')",
+    )
 
     args = parser.parse_args()
 
@@ -228,6 +263,9 @@ def main():
     tokenizer_name = config.hf_tokenizer_name or "numeric"
     tokenizer = get_tokenizer(tokenizer_name)
 
+    if args.learning_rate is not None:
+        config.learning_rate = args.learning_rate
+
     # Initialize Model
     model = DPSNR(config)
 
@@ -280,7 +318,24 @@ def main():
     dense_flat_params = {k: v for k, v in flat_params.items() if k != pool_key}
     dense_params = traverse_util.unflatten_dict(dense_flat_params)
 
-    tx = optax.adamw(config.learning_rate)
+    # Use learning rate schedule
+    total_steps = (
+        args.max_steps
+        if args.max_steps
+        else args.epochs * (args.dataset_size // args.batch_size)
+    )
+    if args.warmup_steps > 0:
+        lr_schedule = optax.warmup_cosine_decay_schedule(
+            init_value=0.0,
+            peak_value=config.learning_rate,
+            warmup_steps=args.warmup_steps,
+            decay_steps=total_steps,
+            end_value=0.1 * config.learning_rate,
+        )
+    else:
+        lr_schedule = config.learning_rate
+
+    tx = optax.adamw(lr_schedule)
     opt_state = tx.init(dense_params)
 
     pool_m = jnp.zeros_like(pool_params)
@@ -467,6 +522,9 @@ def main():
                     with open(args.resume_data_path, "w") as f:
                         json.dump(grain_loader.get_state(), f)
 
+                if args.rclone_remote:
+                    sync_checkpoints(args.checkpoint_dir, args.rclone_remote)
+
             if step % 10 == 0:
                 print(
                     f"Epoch {epoch + 1} | Step {step} | Global Step {global_step} | Loss: {loss:.4f} | TPS: {tokens_per_sec:.0f} | TFLOPS: {tflops:.4f}"
@@ -525,6 +583,9 @@ def main():
 
                 with open(args.resume_data_path, "w") as f:
                     json.dump(grain_loader.get_state(), f)
+
+            if args.rclone_remote:
+                sync_checkpoints(args.checkpoint_dir, args.rclone_remote)
 
     # Generation Test
     print("\nVerifying model generation...")
