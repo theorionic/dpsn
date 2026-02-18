@@ -359,8 +359,26 @@ def main():
         latest_step = checkpoint_manager.latest_step()
         if latest_step is not None:
             print(f"Resuming from checkpoint step {latest_step}...")
-            # We must pass the target 'state' so Orbax knows the sharding layout
-            state = checkpoint_manager.restore(latest_step, items=state)
+            try:
+                state = checkpoint_manager.restore(latest_step, items=state)
+            except ValueError as e:
+                if "tree structures do not match" in str(e):
+                    print("Warning: Optimizer state structure mismatch detected.")
+                    print(
+                        "Restoring model parameters only, optimizer state will be reinitialized."
+                    )
+                    restore_args = orbax.checkpoint.PyTreeRestoreArgs(
+                        item=state, partial_restore=True
+                    )
+                    restored = checkpoint_manager.restore(
+                        latest_step, args=restore_args
+                    )
+                    state = state.replace(
+                        step=restored.get("step", latest_step),
+                        params=restored.get("params", state.params),
+                    )
+                else:
+                    raise
             global_step = latest_step
         else:
             # Fallback for direct directory path
