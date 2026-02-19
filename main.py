@@ -370,27 +370,59 @@ def main():
                     # When there's a structure mismatch, we restore just the parameters
                     # and let the optimizer get recreated with the new structure
                     try:
-                        # Extract the parameters from the existing state to use as target structure
-                        param_target = state.params
+                        # Create a minimal restoration target with only the essential components
+                        restore_target = {"params": state.params, "step": state.step}
 
-                        # Create a simple dict structure that matches what we want to restore
-                        restore_target = {"params": param_target}
-
-                        # Restore only the parameters from the checkpoint
+                        # Try to restore with this minimal target
                         restored = checkpoint_manager.restore(
                             latest_step, items=restore_target
                         )
 
-                        # Update the state with the restored parameters
-                        if isinstance(restored, dict) and "params" in restored:
-                            state = state.replace(params=restored["params"])
+                        # Update only the restored components
+                        if isinstance(restored, dict):
+                            if "params" in restored:
+                                state = state.replace(params=restored["params"])
+                            if "step" in restored:
+                                state = state.replace(step=restored["step"])
+                        # Handle case where restored object has attributes
                         elif hasattr(restored, "params"):
-                            state = state.replace(params=restored.params)
+                            state = state.replace(params=getattr(restored, "params"))
+                            if hasattr(restored, "step"):
+                                state = state.replace(step=getattr(restored, "step"))
 
                     except Exception as partial_restore_error:
                         print(f"Partial restore also failed: {partial_restore_error}")
-                        print("Continuing with initialized weights.")
-                        # Continue with the initialized state when partial restore fails
+                        print("Attempting manual parameter restoration...")
+
+                        # Last resort approach - try to manually extract just the parameters
+                        try:
+                            # Try creating an even more minimal target with just parameters
+                            param_only_target = {"params": state.params}
+
+                            # Attempt restoration with this ultra-minimal target
+                            restored_params = checkpoint_manager.restore(
+                                latest_step, items=param_only_target
+                            )
+
+                            # Update the state with restored parameters
+                            if (
+                                isinstance(restored_params, dict)
+                                and "params" in restored_params
+                            ):
+                                state = state.replace(params=restored_params["params"])
+                            elif hasattr(restored_params, "params"):
+                                state = state.replace(
+                                    params=getattr(restored_params, "params")
+                                )
+
+                            print("Successfully restored model parameters only.")
+
+                        except Exception as manual_restore_error:
+                            print(
+                                f"Manual parameter restoration also failed: {manual_restore_error}"
+                            )
+                            print("Continuing with initialized weights.")
+                        # Continue with the initialized state when all restoration attempts fail
 
                 else:
                     raise
