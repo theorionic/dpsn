@@ -367,16 +367,22 @@ def main():
                     print(
                         "Restoring model parameters only, optimizer state will be reinitialized."
                     )
-                    restore_args = orbax.checkpoint.PyTreeRestoreArgs(
-                        item=state, partial_restore=True
+                    # Use the correct orbax API for partial restore in version 0.11.5
+                    # Use StandardRestore with strict=False to handle tree structure mismatches
+                    restore_args = orbax.checkpoint.args.StandardRestore(
+                        item=state,
+                        strict=False,
                     )
+
                     restored = checkpoint_manager.restore(
                         latest_step, args=restore_args
                     )
-                    state = state.replace(
-                        step=restored.get("step", latest_step),
-                        params=restored.get("params", state.params),
-                    )
+                    # Handle the restored state appropriately
+                    if hasattr(restored, "params"):
+                        state = state.replace(
+                            step=getattr(restored, "step", latest_step),
+                            params=restored.params,
+                        )
                 else:
                     raise
             global_step = latest_step
