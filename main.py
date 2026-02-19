@@ -367,22 +367,31 @@ def main():
                     print(
                         "Restoring model parameters only, optimizer state will be reinitialized."
                     )
-                    # Use the correct orbax API for partial restore in version 0.11.5
-                    # Use StandardRestore with strict=False to handle tree structure mismatches
-                    restore_args = orbax.checkpoint.args.StandardRestore(
-                        item=state,
-                        strict=False,
-                    )
+                    # When there's a structure mismatch, we restore just the parameters
+                    # and let the optimizer get recreated with the new structure
+                    try:
+                        # Extract the parameters from the existing state to use as target structure
+                        param_target = state.params
 
-                    restored = checkpoint_manager.restore(
-                        latest_step, args=restore_args
-                    )
-                    # Handle the restored state appropriately
-                    if hasattr(restored, "params"):
-                        state = state.replace(
-                            step=getattr(restored, "step", latest_step),
-                            params=restored.params,
+                        # Create a simple dict structure that matches what we want to restore
+                        restore_target = {"params": param_target}
+
+                        # Restore only the parameters from the checkpoint
+                        restored = checkpoint_manager.restore(
+                            latest_step, items=restore_target
                         )
+
+                        # Update the state with the restored parameters
+                        if isinstance(restored, dict) and "params" in restored:
+                            state = state.replace(params=restored["params"])
+                        elif hasattr(restored, "params"):
+                            state = state.replace(params=restored.params)
+
+                    except Exception as partial_restore_error:
+                        print(f"Partial restore also failed: {partial_restore_error}")
+                        print("Continuing with initialized weights.")
+                        # Continue with the initialized state when partial restore fails
+
                 else:
                     raise
             global_step = latest_step
