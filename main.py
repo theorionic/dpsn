@@ -148,6 +148,27 @@ def main():
         default=0,
         help="Manually skip N batches of data",
     )
+    parser.add_argument(
+        "--lr_scheduler_type",
+        type=str,
+        default="cosine",
+        choices=[
+            "linear",
+            "cosine",
+            "cosine_with_restarts",
+            "polynomial",
+            "constant",
+            "constant_with_warmup",
+            "inverse_sqrt",
+        ],
+        help="Learning rate scheduler type",
+    )
+    parser.add_argument(
+        "--warmup_steps",
+        type=int,
+        default=0,
+        help="Number of warmup steps for learning rate scheduler",
+    )
 
     args = parser.parse_args()
 
@@ -271,6 +292,7 @@ def main():
 
     # Create TrainState (using the sharded variables)
     from dpsn_r_jax.training.trainer import TrainState
+    from dpsn_r_jax.training.lr_schedules import get_scheduler
     from flax import traverse_util
 
     params = variables["params"]
@@ -280,7 +302,23 @@ def main():
     dense_flat_params = {k: v for k, v in flat_params.items() if k != pool_key}
     dense_params = traverse_util.unflatten_dict(dense_flat_params)
 
-    tx = optax.adamw(config.learning_rate)
+    # Calculate total training steps for LR schedule
+    steps_per_epoch_calc = max(1, args.dataset_size // args.batch_size)
+    total_steps = steps_per_epoch_calc * args.epochs
+    if args.max_steps:
+        total_steps = args.max_steps
+
+    # Create learning rate schedule
+    lr_schedule = get_scheduler(
+        scheduler_type=args.lr_scheduler_type,
+        learning_rate=config.learning_rate,
+        warmup_steps=args.warmup_steps,
+        total_steps=total_steps,
+    )
+
+    # Initialize optimizer with initial LR from schedule
+    init_lr = lr_schedule(0)
+    tx = optax.adamw(init_lr)
     opt_state = tx.init(dense_params)
 
     pool_m = jnp.zeros_like(pool_params)
@@ -296,7 +334,7 @@ def main():
         pool_m=pool_m,
         pool_v=pool_v,
         window_size=config.max_k,
-        learning_rate=config.learning_rate,
+        learning_rate_fn=lr_schedule,
     )
 
     # RESTORE CHECKPOINT IF REQUESTED
@@ -448,8 +486,8 @@ def main():
             writer.add_scalar("Loss/train", float(loss), global_step)
             writer.add_scalar("Perf/TPS", tokens_per_sec, global_step)
             writer.add_scalar("Perf/TFLOPS", tflops, global_step)
-            if hasattr(state, "learning_rate"):
-                writer.add_scalar("LR", state.learning_rate, global_step)
+            current_lr = state.learning_rate_fn(global_step)
+            writer.add_scalar("LR", current_lr, global_step)
 
             # Save Checkpoint
             if (
@@ -469,7 +507,7 @@ def main():
 
             if step % 10 == 0:
                 print(
-                    f"Epoch {epoch + 1} | Step {step} | Global Step {global_step} | Loss: {loss:.4f} | TPS: {tokens_per_sec:.0f} | TFLOPS: {tflops:.4f}"
+                    f"Epoch {epoch + 1} | Step {step} | Global Step {global_step} | Loss: {loss:.4f} | LR: {current_lr:.2e} | TPS: {tokens_per_sec:.0f} | TFLOPS: {tflops:.4f}"
                 )
 
             # Periodic Generation

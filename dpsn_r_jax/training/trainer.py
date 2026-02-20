@@ -4,7 +4,7 @@ from jax import random
 from flax.training import train_state
 from flax import struct, traverse_util
 import optax
-from typing import Any
+from typing import Any, Callable
 from dpsn_r_jax.models.dpsnr import DPSNR
 from dpsn_r_jax.training.sparse_adam import sparse_adam_update
 
@@ -14,10 +14,10 @@ class TrainState(train_state.TrainState):
     pool_m: jnp.ndarray
     pool_v: jnp.ndarray
     window_size: int = struct.field(pytree_node=False)
-    learning_rate: float = struct.field(pytree_node=False)
+    learning_rate_fn: Callable[[int], float] = struct.field(pytree_node=False)
 
 
-def create_train_state(rng, config):
+def create_train_state(rng, config, learning_rate_fn=None):
     model = DPSNR(config)
     dummy_input = jnp.ones((1, config.max_seq_len), dtype=jnp.int32)
     variables = model.init(rng, dummy_input)
@@ -30,11 +30,19 @@ def create_train_state(rng, config):
     dense_flat_params = {k: v for k, v in flat_params.items() if k != pool_key}
     dense_params = traverse_util.unflatten_dict(dense_flat_params)
 
-    tx = optax.adamw(learning_rate=config.learning_rate)
+    # Use initial LR from schedule function or fallback to config
+    init_lr = learning_rate_fn(0) if learning_rate_fn else config.learning_rate
+    tx = optax.adamw(learning_rate=init_lr)
     opt_state = tx.init(dense_params)
 
     pool_m = jnp.zeros_like(pool_params)
     pool_v = jnp.zeros_like(pool_params)
+
+    # If no schedule provided, create a constant schedule
+    if learning_rate_fn is None:
+        from dpsn_r_jax.training.lr_schedules import create_constant_schedule
+
+        learning_rate_fn = create_constant_schedule(config.learning_rate)
 
     return TrainState(
         step=0,
@@ -46,7 +54,7 @@ def create_train_state(rng, config):
         pool_m=pool_m,
         pool_v=pool_v,
         window_size=config.max_k,
-        learning_rate=config.learning_rate,
+        learning_rate_fn=learning_rate_fn,
     )
 
 
@@ -106,13 +114,14 @@ def train_step(state, batch, pad_token_id=0):
     m_slice = state.pool_m[safe_indices]
     v_slice = state.pool_v[safe_indices]
 
+    current_lr = state.learning_rate_fn(state.step + 1)
     new_p_s, new_m_s, new_v_s = sparse_adam_update(
         p_slice,
         g_slice,
         m_slice,
         v_slice,
         state.step + 1,
-        lr=state.learning_rate,
+        lr=current_lr,
     )
 
     new_pool_params = pool_params.at[safe_indices].set(
