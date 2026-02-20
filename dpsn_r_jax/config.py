@@ -1,11 +1,53 @@
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Optional, List
 
 
 @dataclass
 class PoolConfig:
     total_vectors: int
     hidden_dim: int
+
+
+@dataclass
+class FineTuningConfig:
+    """Configuration for fine-tuning DPSNR model."""
+
+    # Data paths
+    train_file: Optional[str] = None
+    validation_file: Optional[str] = None
+    template: str = "alpaca"
+    template_path: Optional[str] = None
+
+    # Training hyperparameters
+    learning_rate: float = 5e-5
+    weight_decay: float = 0.01
+    warmup_ratio: float = 0.03
+    warmup_steps: int = 0
+    num_train_epochs: int = 3
+    max_seq_length: int = 512
+    gradient_accumulation_steps: int = 1
+
+    # LR scheduler
+    lr_scheduler_type: str = "cosine"  # linear, cosine, constant, constant_with_warmup
+
+    # Model freezing
+    freeze_controller: bool = False
+    freeze_pool: bool = True
+    freeze_indexer: bool = False
+
+    # Checkpoint
+    load_pretrained: Optional[str] = None
+    resume_from_checkpoint: Optional[str] = None
+
+    # Evaluation
+    evaluation_strategy: str = "steps"  # no, steps, epoch
+    eval_steps: int = 500
+    save_steps: int = 500
+    save_total_limit: int = 3
+
+    # Logging
+    logging_steps: int = 10
+    report_to: str = "tensorboard"  # tensorboard, wandb, none
 
 
 @dataclass
@@ -37,6 +79,7 @@ class DPSNRConfig:
     learning_rate: float = 3e-4
     num_workers: int = 4
     gradient_checkpointing: bool = False
+    finetune: Optional[FineTuningConfig] = None
 
     @classmethod
     def from_yaml(cls, path: str) -> "DPSNRConfig":
