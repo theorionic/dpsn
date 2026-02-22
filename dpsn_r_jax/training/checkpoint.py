@@ -346,45 +346,35 @@ def _truncate_position_embeddings(
     Returns:
         Parameters with truncated position embeddings if needed.
     """
-    # Find position embedding paths (can be nested in modules)
-    def find_pos_embed_keys(d: dict, prefix: str = "") -> list:
-        keys = []
-        for k, v in d.items():
-            full_key = f"{prefix}/{k}" if prefix else k
-            if k == "pos_encoding" and isinstance(v, dict) and "embedding" in v:
-                keys.append((full_key + "/embedding", "pos_encoding", "embedding"))
-            elif isinstance(v, dict):
-                keys.extend(find_pos_embed_keys(v, full_key))
-        return keys
+    from flax import traverse_util
 
-    pos_embed_keys = find_pos_embed_keys(loaded_params)
+    # Flatten params to access by path tuple
+    loaded_flat = traverse_util.flatten_dict(loaded_params, sep="/")
+    target_flat = traverse_util.flatten_dict(target_params, sep="/")
 
-    for full_path, module_key, embed_key in pos_embed_keys:
-        try:
-            # Navigate to the embedding in loaded params
-            loaded_embed = loaded_params[module_key][embed_key]
-            target_embed = target_params[module_key][embed_key]
+    # Find all position embedding keys
+    for key in list(loaded_flat.keys()):
+        if "pos_encoding/embedding" in key:
+            if key in target_flat:
+                loaded_shape = loaded_flat[key].shape
+                target_shape = target_flat[key].shape
 
-            loaded_shape = loaded_embed.shape
-            target_shape = target_embed.shape
+                if loaded_shape != target_shape:
+                    if loaded_shape[0] > target_shape[0]:
+                        logging.info(
+                            f"Truncating {key} from {loaded_shape} to {target_shape}"
+                        )
+                        loaded_flat[key] = loaded_flat[key][: target_shape[0]]
+                    elif loaded_shape[0] < target_shape[0]:
+                        logging.warning(
+                            f"Cannot extend {key} from {loaded_shape} to {target_shape}. "
+                            f"Pretrained model has shorter max_seq_len."
+                        )
+            else:
+                logging.debug(f"Key {key} not found in target params, skipping")
 
-            if loaded_shape != target_shape:
-                # Only truncate if loaded is larger (can't extend)
-                if loaded_shape[0] > target_shape[0]:
-                    logging.info(
-                        f"Truncating {full_path} from {loaded_shape} to {target_shape}"
-                    )
-                    loaded_params[module_key][embed_key] = loaded_embed[: target_shape[0]]
-                elif loaded_shape[0] < target_shape[0]:
-                    logging.warning(
-                        f"Cannot extend {full_path} from {loaded_shape} to {target_shape}. "
-                        f"Pretrained model has shorter max_seq_len. Using as-is."
-                    )
-        except (KeyError, AttributeError) as e:
-            logging.debug(f"Could not process {full_path}: {e}")
-            continue
-
-    return loaded_params
+    # Unflatten back to nested dict
+    return traverse_util.unflatten_dict(loaded_flat, sep="/")
 
 
 def _extract_step_from_path(path: str, default_step: Optional[int]) -> int:
