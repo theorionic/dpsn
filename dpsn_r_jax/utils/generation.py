@@ -43,37 +43,6 @@ def _sample_token(
     return jax.random.categorical(rng, scaled_logits)
 
 
-def _create_step_fn(
-    state,
-    eos_token_id: int,
-    temperature: float,
-    top_k: int,
-    repetition_penalty: float,
-):
-    """Create a JIT-compiled step function with captured static args."""
-
-    @jax.jit
-    def step_fn(carry):
-        generated_ids, rng = carry
-
-        logits, _ = state.apply_fn(
-            {"params": state.params}, generated_ids, deterministic=True
-        )
-        next_logits = logits[0, -1, :]
-        next_logits = _apply_repetition_penalty(
-            next_logits, generated_ids[0], repetition_penalty
-        )
-        next_logits = _apply_top_k(next_logits, top_k)
-
-        rng, sample_rng = jax.random.split(rng)
-        new_token = _sample_token(next_logits, sample_rng, temperature)
-
-        new_generated = jnp.concatenate([generated_ids, new_token[None, None]], axis=1)
-        return (new_generated, rng), new_token, new_token == eos_token_id
-
-    return step_fn
-
-
 def generate_fast(
     state,
     prompt: str,
@@ -86,10 +55,26 @@ def generate_fast(
     verbose: bool = False,
 ) -> str:
     """
-    Fast generation with JIT-compiled step function.
+    Generation without separate JIT compilation of step function.
 
-    Uses a Python loop with JIT-compiled individual steps for optimal
-    performance while supporting early EOS termination.
+    During training, this avoids expensive recompilation by using the
+    model's apply_fn directly (which is already JIT-compatible through
+    the training step). The forward pass is efficient; only the Python
+    loop overhead is not JIT'd.
+
+    Args:
+        state: TrainState with model params and apply_fn
+        prompt: Input text prompt
+        tokenizer: Tokenizer with encode/decode methods
+        rng: JAX PRNGKey for sampling
+        max_len: Maximum tokens to generate
+        temperature: Sampling temperature
+        top_k: Top-k sampling cutoff
+        repetition_penalty: Repetition penalty factor
+        verbose: Print timing info
+
+    Returns:
+        Generated text string
     """
     if rng is None:
         rng = jax.random.PRNGKey(0)
@@ -109,16 +94,27 @@ def generate_fast(
     generated = jnp.array(input_ids)
     eos_token_id = tokenizer.eos_token_id
 
-    step_fn = _create_step_fn(
-        state, eos_token_id, temperature, top_k, repetition_penalty
-    )
-
     start_time = time.time()
-    carry = (generated, rng)
 
     for _ in range(max_len):
-        carry, new_token, hit_eos = step_fn(carry)
-        if hit_eos:
+        # Call model directly - no separate JIT, applies_fn handles efficiency
+        logits, _ = state.apply_fn(
+            {"params": state.params}, generated, deterministic=True
+        )
+
+        # Apply sampling logic
+        next_logits = logits[0, -1, :]
+        next_logits = _apply_repetition_penalty(
+            next_logits, generated[0], repetition_penalty
+        )
+        next_logits = _apply_top_k(next_logits, top_k)
+
+        rng, sample_rng = jax.random.split(rng)
+        new_token = _sample_token(next_logits, sample_rng, temperature)
+
+        generated = jnp.concatenate([generated, new_token[None, None]], axis=1)
+
+        if new_token == eos_token_id:
             break
 
     if verbose:
@@ -126,7 +122,7 @@ def generate_fast(
         elapsed = time.time() - start_time
         print(f"Generation time: {elapsed:.3f}s")
 
-    final_tokens = carry[0][0].tolist()
+    final_tokens = generated[0].tolist()
     return tokenizer.decode(final_tokens, skip_special_tokens=True)
 
 
@@ -140,6 +136,21 @@ def generate(
     top_k: int = 40,
     repetition_penalty: float = 1.2,
 ) -> str:
+    """Generate text from prompt using model state.
+
+    Args:
+        state: TrainState with model params and apply_fn
+        prompt: Input text prompt
+        tokenizer: Tokenizer with encode/decode methods
+        rng: JAX PRNGKey for sampling
+        max_len: Maximum tokens to generate
+        temperature: Sampling temperature
+        top_k: Top-k sampling cutoff
+        repetition_penalty: Repetition penalty factor
+
+    Returns:
+        Generated text string
+    """
     return generate_fast(
         state,
         prompt,
@@ -156,12 +167,23 @@ def generate(
 def warmup_generation(
     state,
     tokenizer,
-    max_len: int = 20,
+    max_len: int = 5,
     verbose: bool = True,
 ) -> float:
     """
-    Warm up the generation function by running a dummy generation.
-    Triggers JIT compilation so subsequent calls are fast.
+    Warm up generation by running a short generation.
+
+    This triggers any lazy initialization in the model's apply_fn
+    so subsequent generations are faster.
+
+    Args:
+        state: TrainState with model params
+        tokenizer: Tokenizer
+        max_len: Short generation length for warmup
+        verbose: Print timing info
+
+    Returns:
+        Time taken for warmup generation
     """
     dummy_prompt = "test"
     rng = jax.random.PRNGKey(42)
@@ -180,6 +202,6 @@ def warmup_generation(
     elapsed = time.time() - start
 
     if verbose:
-        print(f"Generation warmup (JIT compile): {elapsed:.2f}s")
+        print(f"Generation warmup: {elapsed:.2f}s")
 
     return elapsed
