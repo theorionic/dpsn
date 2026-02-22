@@ -1,15 +1,25 @@
+"""Fine-tuning trainer with loss masking, layer freezing, and TPU support."""
+
 import jax
 import jax.numpy as jnp
 from jax import random
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from flax.training import train_state
 from flax import struct, traverse_util
 import optax
 from typing import Any, Optional, Dict, Callable, Tuple
-import os
-import json
+import numpy as np
+
 from dpsn_r_jax.models.dpsnr import DPSNR
 from dpsn_r_jax.training.sparse_adam import sparse_adam_update
 from dpsn_r_jax.training.lr_schedules import get_scheduler
+from dpsn_r_jax.training.checkpoint import (
+    save_checkpoint as orbax_save_checkpoint,
+    load_checkpoint as orbax_load_checkpoint,
+    load_pretrained_checkpoint,
+    get_mesh,
+    get_sharding_spec,
+)
 
 IGNORE_INDEX = -100
 
@@ -51,22 +61,63 @@ def create_finetune_state(
     freeze_controller: bool = False,
     freeze_pool: bool = True,
     pretrained_path: Optional[str] = None,
+    mesh: Optional[Mesh] = None,
 ) -> FineTuneState:
+    """Create fine-tuning state with optional TPU sharding.
+
+    Args:
+        rng: JAX random key
+        config: DPSNRConfig
+        learning_rate_fn: Learning rate schedule function
+        freeze_controller: Whether to freeze controller params
+        freeze_pool: Whether to freeze pool params
+        pretrained_path: Path to pretrained checkpoint
+        mesh: Optional JAX mesh for TPU/multi-device sharding
+
+    Returns:
+        FineTuneState with properly sharded parameters
+    """
     model = DPSNR(config)
     dummy_input = jnp.ones((1, config.max_seq_len), dtype=jnp.int32)
-    variables = model.init(rng, dummy_input)
+
+    # Define sharding rules (same as main.py)
+    def get_sharding_rule(path, param):
+        """Determine where a parameter should live based on its path."""
+        if "pool" in path:
+            # Pool params are sharded across devices
+            return NamedSharding(mesh, PartitionSpec("shard", None))
+        # Everything else is replicated
+        return NamedSharding(mesh, PartitionSpec())
+
+    if mesh is not None and jax.device_count() > 1:
+        # TPU/Multi-device: Initialize with sharding constraints
+        print(f"Initializing with sharding on mesh: {mesh}")
+
+        @jax.jit
+        def init_model(rng, input_ids):
+            return model.init(rng, input_ids)
+
+        # Get abstract shapes
+        abstract_variables = jax.eval_shape(init_model, rng, dummy_input)
+
+        # Create sharding tree based on parameter paths
+        sharding_tree = jax.tree_util.tree_map_with_path(
+            get_sharding_rule, abstract_variables
+        )
+
+        # Initialize with sharding constraints
+        variables = jax.lax.with_sharding_constraint(
+            init_model(rng, dummy_input), sharding_tree
+        )
+    else:
+        # Single device: Standard initialization
+        variables = model.init(rng, dummy_input)
+
     params = variables["params"]
 
-    if pretrained_path and os.path.exists(pretrained_path):
-        print(f"Loading pretrained weights from {pretrained_path}")
-        with open(os.path.join(pretrained_path, "params.json"), "r") as f:
-            params_dict = json.load(f)
-        params = jax.tree_util.tree_map(jnp.array, params_dict)
-
-    flat_params = traverse_util.flatten_dict(params)
     pool_key = ("pool", "params_storage")
+    flat_params = traverse_util.flatten_dict(params)
     pool_params = flat_params[pool_key]
-
     dense_flat_params = {k: v for k, v in flat_params.items() if k != pool_key}
     dense_params = traverse_util.unflatten_dict(dense_flat_params)
 
@@ -87,7 +138,7 @@ def create_finetune_state(
     pool_m = jnp.zeros_like(pool_params)
     pool_v = jnp.zeros_like(pool_params)
 
-    return FineTuneState(
+    state = FineTuneState(
         step=0,
         apply_fn=model.apply,
         params=params,
@@ -99,6 +150,12 @@ def create_finetune_state(
         window_size=config.max_k,
         learning_rate_fn=learning_rate_fn,
     )
+
+    if pretrained_path:
+        print(f"Loading pretrained weights from {pretrained_path}")
+        state = load_pretrained_checkpoint(pretrained_path, state)
+
+    return state
 
 
 @jax.jit
@@ -238,41 +295,16 @@ def validation_step(
     return compute_loss_with_mask(logits, batch["labels"], pad_token_id)
 
 
-def save_checkpoint(state: FineTuneState, path: str, step: int):
-    os.makedirs(path, exist_ok=True)
-
-    params_dict = jax.tree_util.tree_map(lambda x: x.tolist(), state.params)
-    with open(os.path.join(path, f"params_step_{step}.json"), "w") as f:
-        json.dump(params_dict, f)
-
-    pool_m_dict = state.pool_m.tolist()
-    pool_v_dict = state.pool_v.tolist()
-
-    checkpoint = {
-        "step": step,
-        "pool_m": pool_m_dict,
-        "pool_v": pool_v_dict,
-    }
-    with open(os.path.join(path, f"checkpoint_{step}.json"), "w") as f:
-        json.dump(checkpoint, f)
-
-    print(f"Saved checkpoint at step {step} to {path}")
+def save_checkpoint(
+    state: FineTuneState, checkpoint_dir: str, step: int, max_to_keep: int = 3
+):
+    orbax_save_checkpoint(checkpoint_dir, state, step, max_to_keep=max_to_keep)
 
 
-def load_checkpoint(state: FineTuneState, path: str, step: int) -> FineTuneState:
-    with open(os.path.join(path, f"params_step_{step}.json"), "r") as f:
-        params_dict = json.load(f)
-    params = jax.tree_util.tree_map(jnp.array, params_dict)
-
-    with open(os.path.join(path, f"checkpoint_{step}.json"), "r") as f:
-        checkpoint = json.load(f)
-
-    pool_m = jnp.array(checkpoint["pool_m"])
-    pool_v = jnp.array(checkpoint["pool_v"])
-
-    return state.replace(
-        step=checkpoint["step"],
-        params=params,
-        pool_m=pool_m,
-        pool_v=pool_v,
-    )
+def load_checkpoint(
+    state: FineTuneState,
+    checkpoint_dir: str,
+    step: Optional[int] = None,
+) -> FineTuneState:
+    loaded_state, loaded_step = orbax_load_checkpoint(checkpoint_dir, state, step)
+    return loaded_state

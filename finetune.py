@@ -11,6 +11,7 @@ from typing import Optional
 import jax
 import jax.numpy as jnp
 from jax import random
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 try:
     from tensorboardX import SummaryWriter
@@ -40,8 +41,13 @@ from dpsn_r_jax.training.finetune_trainer import (
     create_finetune_state,
     finetune_step,
     validation_step,
+)
+from dpsn_r_jax.training.checkpoint import (
     save_checkpoint,
     load_checkpoint,
+    load_pretrained_checkpoint,
+    get_mesh,
+    get_latest_step,
 )
 from dpsn_r_jax.training.lr_schedules import get_scheduler
 from dpsn_r_jax.utils.generation import generate
@@ -54,8 +60,8 @@ def parse_args():
     parser.add_argument(
         "--train_file",
         type=str,
-        required=True,
-        help="Path to training data file (JSON or JSONL)",
+        default=None,
+        help="Path to training data file (JSON or JSONL). Required if --dataset_name not specified.",
     )
     parser.add_argument(
         "--validation_file",
@@ -64,25 +70,83 @@ def parse_args():
         help="Path to validation data file (JSON or JSONL)",
     )
     parser.add_argument(
+        "--dataset_name",
+        type=str,
+        default=None,
+        help="HuggingFace dataset name (e.g., 'tatsu-lab/alpaca', 'OpenAssistant/oasst1')",
+    )
+    parser.add_argument(
+        "--dataset_config",
+        type=str,
+        default=None,
+        help="HuggingFace dataset config/subset name",
+    )
+    parser.add_argument(
+        "--train_split",
+        type=str,
+        default="train",
+        help="HuggingFace dataset training split name",
+    )
+    parser.add_argument(
+        "--validation_split",
+        type=str,
+        default=None,
+        help="HuggingFace dataset validation split name (e.g., 'validation', 'test')",
+    )
+    parser.add_argument(
+        "--dataset_text_field",
+        type=str,
+        default=None,
+        help="Text field name for raw text datasets (e.g., 'text' for wikitext)",
+    )
+    parser.add_argument(
+        "--instruction_field",
+        type=str,
+        default="instruction",
+        help="Field name for instruction in dataset",
+    )
+    parser.add_argument(
+        "--output_field",
+        type=str,
+        default="output",
+        help="Field name for output/response in dataset",
+    )
+    parser.add_argument(
+        "--streaming",
+        action="store_true",
+        help="Use streaming mode for large HuggingFace datasets",
+    )
+    parser.add_argument(
         "--template",
         type=str,
         default="alpaca",
-        choices=[
-            "alpaca",
-            "alpaca_no_input",
-            "chatml",
-            "vicuna",
-            "llama",
-            "mistral",
-            "sharegpt",
-        ],
-        help="Prompt template to use",
+        help="Prompt template. Built-in: alpaca, chatml, vicuna, llama, mistral, sharegpt. Or custom: 'Q: {question}\\nA: {answer}'",
     )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     parser.add_argument(
         "--template_path",
         type=str,
         default=None,
         help="Path to custom template file (YAML or JSON)",
+    )
+    parser.add_argument(
+        "--tokenizer_name",
+        type=str,
+        default=None,
+        help="HuggingFace tokenizer name (e.g., 'gpt2', 'EleutherAI/gpt-neox-20b')",
     )
     parser.add_argument(
         "--max_seq_length",
@@ -268,6 +332,25 @@ def parse_args():
         help="Use tiny config for testing (overrides --config)",
     )
 
+    # TPU/Multi-device arguments
+    parser.add_argument(
+        "--use_tpu",
+        action="store_true",
+        help="Enable TPU/multi-device training with mesh sharding",
+    )
+    parser.add_argument(
+        "--mesh_shape",
+        type=str,
+        default=None,
+        help="Mesh shape as comma-separated integers (e.g., '2,4' for 2x4 mesh)",
+    )
+    parser.add_argument(
+        "--mesh_axis_names",
+        type=str,
+        default=None,
+        help="Mesh axis names as comma-separated strings (e.g., 'data,model')",
+    )
+
     return parser.parse_args()
 
 
@@ -280,6 +363,12 @@ def compute_perplexity(loss: float) -> float:
 def main():
     args = parse_args()
 
+    # Validate data source
+    if args.train_file is None and args.dataset_name is None:
+        raise ValueError("Either --train_file or --dataset_name must be specified")
+    if args.train_file is not None and args.dataset_name is not None:
+        raise ValueError("Specify either --train_file or --dataset_name, not both")
+
     # Handle flags
     if args.tiny:
         args.config = "tiny"
@@ -291,8 +380,15 @@ def main():
     print("=" * 60)
     print("DPSNR Fine-tuning Configuration")
     print("=" * 60)
-    print(f"Training file: {args.train_file}")
-    print(f"Validation file: {args.validation_file}")
+    if args.dataset_name:
+        print(f"Dataset: {args.dataset_name} (HuggingFace Hub)")
+        print(f"  Train split: {args.train_split}")
+        if args.validation_split:
+            print(f"  Validation split: {args.validation_split}")
+        print(f"  Streaming: {args.streaming}")
+    else:
+        print(f"Training file: {args.train_file}")
+        print(f"Validation file: {args.validation_file}")
     print(f"Template: {args.template}")
     print(f"Model config: {args.config}")
     print(f"Learning rate: {args.learning_rate}")
@@ -302,7 +398,27 @@ def main():
     print(f"Freeze controller: {args.freeze_controller}")
     print(f"Freeze pool: {args.freeze_pool}")
     print(f"Output directory: {args.output_dir}")
+    print(f"TPU/Multi-device: {args.use_tpu or len(jax.devices()) > 1}")
     print("=" * 60)
+
+    # Setup mesh for TPU/multi-device training
+    mesh = None
+    if args.use_tpu or len(jax.devices()) > 1:
+        mesh_shape = None
+        axis_names = None
+
+        if args.mesh_shape:
+            mesh_shape = tuple(int(x) for x in args.mesh_shape.split(","))
+        if args.mesh_axis_names:
+            axis_names = tuple(args.mesh_axis_names.split(","))
+
+        mesh = get_mesh(mesh_shape, axis_names)
+        if mesh:
+            print(f"Created mesh: {mesh.shape} with axes {mesh.axis_names}")
+
+    batch_sharding = None
+    if mesh is not None:
+        batch_sharding = NamedSharding(mesh, PartitionSpec("shard", None))
 
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
@@ -324,13 +440,19 @@ def main():
     config.max_seq_len = args.max_seq_length
     config.pad_token_id = 0
 
-    # Get tokenizer
-    tokenizer = get_tokenizer(
-        name_or_path=config.hf_tokenizer_name,
-        max_val=min(100, config.vocab_size - 4)
-        if not config.hf_tokenizer_name
-        else 100,
-    )
+    # Get tokenizer (CLI argument takes precedence over config)
+    tokenizer_name = args.tokenizer_name or config.hf_tokenizer_name
+    if tokenizer_name:
+        tokenizer = get_tokenizer(name_or_path=tokenizer_name)
+        config.vocab_size = tokenizer.vocab_size
+        print(
+            f"Using HuggingFace tokenizer: {tokenizer_name} (vocab_size={config.vocab_size})"
+        )
+    else:
+        tokenizer = get_tokenizer(
+            name_or_path=None, max_val=min(100, config.vocab_size - 4)
+        )
+        print(f"Using SimpleNumberTokenizer (vocab_size={config.vocab_size})")
 
     # Determine pad token ID
     if hasattr(tokenizer, "pad_token_id") and tokenizer.pad_token_id is not None:
@@ -340,20 +462,35 @@ def main():
 
     # Load dataset
     print("\nLoading training dataset...")
-    train_dataset = FineTuningDataset(
-        data_path=args.train_file,
-        tokenizer=tokenizer,
-        template=args.template,
-        template_path=args.template_path,
-        max_seq_length=args.max_seq_length,
-        pad_token_id=pad_token_id,
-    )
-
+    train_loader = None
+    eval_loader = None
+    train_dataset = None
     eval_dataset = None
-    if args.validation_file:
-        print("Loading validation dataset...")
-        eval_dataset = FineTuningDataset(
-            data_path=args.validation_file,
+    steps_per_epoch = 1000
+
+    if args.dataset_name:
+        from dpsn_r_jax.data.finetune_dataset import HFDatasetLoader
+
+        train_loader = HFDatasetLoader(
+            dataset_name=args.dataset_name,
+            tokenizer=tokenizer,
+            template=args.template,
+            template_path=args.template_path,
+            max_seq_length=args.max_seq_length,
+            pad_token_id=pad_token_id,
+            text_field=args.dataset_text_field,
+            train_split=args.train_split,
+            validation_split=args.validation_split,
+            streaming=args.streaming,
+            dataset_config=args.dataset_config,
+            instruction_field=args.instruction_field,
+            output_field=args.output_field,
+        )
+        eval_loader = train_loader if train_loader.has_validation else None
+        steps_per_epoch = 1000
+    else:
+        train_dataset = FineTuningDataset(
+            data_path=args.train_file,
             tokenizer=tokenizer,
             template=args.template,
             template_path=args.template_path,
@@ -361,8 +498,20 @@ def main():
             pad_token_id=pad_token_id,
         )
 
+        eval_dataset = None
+        if args.validation_file:
+            print("Loading validation dataset...")
+            eval_dataset = FineTuningDataset(
+                data_path=args.validation_file,
+                tokenizer=tokenizer,
+                template=args.template,
+                template_path=args.template_path,
+                max_seq_length=args.max_seq_length,
+                pad_token_id=pad_token_id,
+            )
+        steps_per_epoch = len(train_dataset) // args.batch_size
+
     # Calculate training steps
-    steps_per_epoch = len(train_dataset) // args.batch_size
     if args.max_steps:
         total_steps = args.max_steps
         num_epochs = (args.max_steps // steps_per_epoch) + 1
@@ -397,20 +546,18 @@ def main():
         freeze_controller=args.freeze_controller,
         freeze_pool=args.freeze_pool,
         pretrained_path=args.load_pretrained,
+        mesh=mesh,
     )
 
     # Resume from checkpoint if specified
     if args.resume_from_checkpoint:
         print(f"Resuming from checkpoint: {args.resume_from_checkpoint}")
-        checkpoint_steps = [
-            int(d.split("_")[-1])
-            for d in os.listdir(args.resume_from_checkpoint)
-            if d.startswith("checkpoint_")
-        ]
-        if checkpoint_steps:
-            latest_step = max(checkpoint_steps)
-            state = load_checkpoint(state, args.resume_from_checkpoint, latest_step)
-            print(f"Resumed from step {state.step}")
+        latest_step = get_latest_step(args.resume_from_checkpoint)
+        if latest_step is not None:
+            state, loaded_step = load_checkpoint(
+                args.resume_from_checkpoint, state, latest_step
+            )
+            print(f"Resumed from step {loaded_step}")
 
     # Setup logging
     log_dir = args.log_dir or os.path.join(args.output_dir, "logs")
@@ -434,12 +581,18 @@ def main():
                 break
 
             # Get batch
-            batch = train_dataset.get_batch(args.batch_size)
+            if train_loader is not None:
+                batch = train_loader.get_train_batch(args.batch_size)
+            else:
+                batch = train_dataset.get_batch(args.batch_size)
             batch_jax = {
                 "input_ids": jnp.array(batch["input_ids"]),
                 "labels": jnp.array(batch["labels"]),
                 "attention_mask": jnp.array(batch["attention_mask"]),
             }
+
+            if batch_sharding is not None:
+                batch_jax = jax.device_put(batch_jax, batch_sharding)
 
             # Training step
             state, loss = finetune_step(state, batch_jax, pad_token_id)
@@ -473,21 +626,37 @@ def main():
                         )
 
                 # Evaluation
+                has_eval = (eval_loader is not None and eval_loader.has_validation) or (
+                    eval_dataset is not None
+                )
                 if (
-                    eval_dataset
+                    has_eval
                     and args.evaluation_strategy == "steps"
                     and global_step % args.eval_steps == 0
                 ):
                     eval_loss = 0.0
-                    eval_steps_count = min(50, len(eval_dataset) // args.batch_size)
+                    eval_steps_count = 50
 
                     for _ in range(eval_steps_count):
-                        eval_batch = eval_dataset.get_batch(args.batch_size)
+                        if eval_loader is not None:
+                            eval_batch = eval_loader.get_validation_batch(
+                                args.batch_size
+                            )
+                            if eval_batch is None:
+                                break
+                        elif eval_dataset is not None:
+                            eval_batch = eval_dataset.get_batch(args.batch_size)
+                        else:
+                            break
                         eval_batch_jax = {
                             "input_ids": jnp.array(eval_batch["input_ids"]),
                             "labels": jnp.array(eval_batch["labels"]),
                             "attention_mask": jnp.array(eval_batch["attention_mask"]),
                         }
+                        if batch_sharding is not None:
+                            eval_batch_jax = jax.device_put(
+                                eval_batch_jax, batch_sharding
+                            )
                         eval_loss += float(
                             validation_step(state, eval_batch_jax, pad_token_id)
                         )
@@ -510,7 +679,7 @@ def main():
                     checkpoint_dir = os.path.join(
                         args.output_dir, f"checkpoint_{global_step}"
                     )
-                    save_checkpoint(state, checkpoint_dir, global_step)
+                    save_checkpoint(checkpoint_dir, state, int(global_step))
                     checkpoint_history.append(global_step)
 
                     # Remove old checkpoints
@@ -537,7 +706,7 @@ def main():
 
     # Save final checkpoint
     final_dir = os.path.join(args.output_dir, "final")
-    save_checkpoint(state, final_dir, global_step)
+    save_checkpoint(final_dir, state, int(global_step))
     print(f"\nTraining completed! Final checkpoint saved to {final_dir}")
 
     if writer:
