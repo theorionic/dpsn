@@ -320,11 +320,71 @@ def load_pretrained_checkpoint(
                 f"Failed to load pretrained checkpoint: {e2}"
             ) from e2
 
+    # Truncate position embeddings if needed (fine-tuning with shorter seq length)
+    params = _truncate_position_embeddings(params, target_state.params)
+
     # Create new state with loaded params but fresh optimizer
     state = target_state.replace(params=params)
 
     logging.info(f"Loaded pretrained params from step {step}")
     return state
+
+
+def _truncate_position_embeddings(
+    loaded_params: dict,
+    target_params: dict,
+) -> dict:
+    """Truncate position embeddings if checkpoint has longer max_seq_len.
+
+    When fine-tuning with a shorter max_seq_length than pretraining,
+    we need to slice the position embeddings to match the target shape.
+
+    Args:
+        loaded_params: Parameters loaded from checkpoint.
+        target_params: Target parameters (defines expected shapes).
+
+    Returns:
+        Parameters with truncated position embeddings if needed.
+    """
+    # Find position embedding paths (can be nested in modules)
+    def find_pos_embed_keys(d: dict, prefix: str = "") -> list:
+        keys = []
+        for k, v in d.items():
+            full_key = f"{prefix}/{k}" if prefix else k
+            if k == "pos_encoding" and isinstance(v, dict) and "embedding" in v:
+                keys.append((full_key + "/embedding", "pos_encoding", "embedding"))
+            elif isinstance(v, dict):
+                keys.extend(find_pos_embed_keys(v, full_key))
+        return keys
+
+    pos_embed_keys = find_pos_embed_keys(loaded_params)
+
+    for full_path, module_key, embed_key in pos_embed_keys:
+        try:
+            # Navigate to the embedding in loaded params
+            loaded_embed = loaded_params[module_key][embed_key]
+            target_embed = target_params[module_key][embed_key]
+
+            loaded_shape = loaded_embed.shape
+            target_shape = target_embed.shape
+
+            if loaded_shape != target_shape:
+                # Only truncate if loaded is larger (can't extend)
+                if loaded_shape[0] > target_shape[0]:
+                    logging.info(
+                        f"Truncating {full_path} from {loaded_shape} to {target_shape}"
+                    )
+                    loaded_params[module_key][embed_key] = loaded_embed[: target_shape[0]]
+                elif loaded_shape[0] < target_shape[0]:
+                    logging.warning(
+                        f"Cannot extend {full_path} from {loaded_shape} to {target_shape}. "
+                        f"Pretrained model has shorter max_seq_len. Using as-is."
+                    )
+        except (KeyError, AttributeError) as e:
+            logging.debug(f"Could not process {full_path}: {e}")
+            continue
+
+    return loaded_params
 
 
 def _extract_step_from_path(path: str, default_step: Optional[int]) -> int:
