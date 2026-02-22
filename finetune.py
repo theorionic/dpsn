@@ -398,12 +398,12 @@ def _run_generation(
     tokenizer,
     prompts: list,
     max_len: int,
+    max_seq_len: int,
     temperature: float,
     top_k: int,
     global_step: int,
     rng,
 ):
-    """Run generation on sample prompts during training."""
     from dpsn_r_jax.utils.generation import generate
 
     print(f"\n{'='*60}")
@@ -421,6 +421,7 @@ def _run_generation(
                 max_len=max_len,
                 temperature=temperature,
                 top_k=top_k,
+                max_seq_len=max_seq_len,
             )
             print(f"\n[Prompt {i+1}]: {prompt}")
             print(f"[Output]:  {output}")
@@ -758,6 +759,7 @@ def main():
                         tokenizer=tokenizer,
                         prompts=args.generation_prompts,
                         max_len=args.generation_max_len,
+                        max_seq_len=args.max_seq_length,
                         temperature=args.generation_temperature,
                         top_k=args.generation_top_k,
                         global_step=global_step,
