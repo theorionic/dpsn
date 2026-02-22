@@ -323,11 +323,54 @@ def load_pretrained_checkpoint(
     # Truncate position embeddings if needed (fine-tuning with shorter seq length)
     params = _truncate_position_embeddings(params, target_state.params)
 
+    # Reshard params to match target state's device placement
+    # This is needed when checkpoint was saved with different device ordering
+    params = _reshard_to_target(params, target_state.params)
+
     # Create new state with loaded params but fresh optimizer
     state = target_state.replace(params=params)
 
     logging.info(f"Loaded pretrained params from step {step}")
     return state
+
+
+def _reshard_to_target(
+    loaded_params: dict,
+    target_params: dict,
+) -> dict:
+    """Reshard loaded params to match target params' device placement.
+
+    When loading a checkpoint saved on a different device topology,
+    the loaded arrays may have different device ordering than the target.
+    This function moves data to match the target's sharding.
+
+    Args:
+        loaded_params: Parameters loaded from checkpoint.
+        target_params: Target parameters (defines device placement).
+
+    Returns:
+        Parameters resharded to match target device placement.
+    """
+    # Check if params are already on the right devices
+    def get_sharding(arr):
+        if hasattr(arr, 'sharding'):
+            return arr.sharding
+        return None
+
+    def reshard_array(loaded, target):
+        loaded_sharding = get_sharding(loaded)
+        target_sharding = get_sharding(target)
+
+        # If both have sharding info and differ, reshard
+        if loaded_sharding is not None and target_sharding is not None:
+            if loaded_sharding != target_sharding:
+                # Use jax.device_put to move to target devices
+                return jax.device_put(loaded, target_sharding)
+
+        return loaded
+
+    # Apply resharding recursively
+    return jax.tree_util.tree_map(reshard_array, loaded_params, target_params)
 
 
 def _truncate_position_embeddings(
