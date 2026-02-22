@@ -418,7 +418,9 @@ def main():
 
     batch_sharding = None
     if mesh is not None:
-        batch_sharding = NamedSharding(mesh, PartitionSpec("shard", None))
+        # Use the first mesh axis name for batch sharding
+        batch_axis = mesh.axis_names[0]
+        batch_sharding = NamedSharding(mesh, PartitionSpec(batch_axis, None))
 
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
