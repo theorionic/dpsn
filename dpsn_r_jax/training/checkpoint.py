@@ -178,14 +178,33 @@ def load_checkpoint(
             return state, step
 
     except Exception as e:
-        logging.debug(f"Orbax CheckpointManager failed: {e}")
+        logging.warning(f"Orbax CheckpointManager failed: {e}")
 
     # Try 2: Direct Orbax checkpoint path
+    # First, discover step directories if step not provided or not found
+    if step is None:
+        # Scan for step directories (directories named with integers)
+        try:
+            for item in os.listdir(abs_dir):
+                if item.isdigit():
+                    item_path = os.path.join(abs_dir, item)
+                    if os.path.isdir(item_path):
+                        # Check if it has Orbax checkpoint structure
+                        if os.path.exists(os.path.join(item_path, "default")):
+                            if step is None or int(item) > step:
+                                step = int(item)
+        except Exception:
+            pass
+
     potential_paths = []
     if step is not None:
+        # Primary path: step/default (Orbax format)
         potential_paths.append(os.path.join(abs_dir, str(step), "default"))
+        # Alternative: step directory itself
+        potential_paths.append(os.path.join(abs_dir, str(step)))
         potential_paths.append(os.path.join(abs_dir, f"checkpoint_{step}"))
 
+    # Also check for checkpoint at root level
     for subdir in ["default", "latest"]:
         potential_paths.append(os.path.join(abs_dir, subdir))
 
