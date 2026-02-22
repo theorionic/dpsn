@@ -292,6 +292,39 @@ def parse_args():
         help="Maximum number of checkpoints to keep",
     )
 
+    # Generation arguments
+    parser.add_argument(
+        "--generation_steps",
+        type=int,
+        default=0,
+        help="Generate sample outputs every N steps (0 = disabled)",
+    )
+    parser.add_argument(
+        "--generation_prompts",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Sample prompts for generation during training",
+    )
+    parser.add_argument(
+        "--generation_max_len",
+        type=int,
+        default=64,
+        help="Maximum generation length",
+    )
+    parser.add_argument(
+        "--generation_temperature",
+        type=float,
+        default=0.7,
+        help="Generation temperature",
+    )
+    parser.add_argument(
+        "--generation_top_k",
+        type=int,
+        default=40,
+        help="Top-k sampling for generation",
+    )
+
     # Logging arguments
     parser.add_argument(
         "--logging_steps",
@@ -358,6 +391,44 @@ def compute_perplexity(loss: float) -> float:
     import math
 
     return math.exp(loss) if loss < 10 else float("inf")
+
+
+def _run_generation(
+    state,
+    tokenizer,
+    prompts: list,
+    max_len: int,
+    temperature: float,
+    top_k: int,
+    global_step: int,
+    rng,
+):
+    """Run generation on sample prompts during training."""
+    from dpsn_r_jax.utils.generation import generate
+
+    print(f"\n{'='*60}")
+    print(f"Sample Generation (Step {global_step})")
+    print(f"{'='*60}")
+
+    for i, prompt in enumerate(prompts):
+        rng, gen_rng = random.split(rng)
+        try:
+            output = generate(
+                state,
+                prompt,
+                tokenizer,
+                rng=gen_rng,
+                max_len=max_len,
+                temperature=temperature,
+                top_k=top_k,
+            )
+            print(f"\n[Prompt {i+1}]: {prompt}")
+            print(f"[Output]:  {output}")
+        except Exception as e:
+            print(f"\n[Prompt {i+1}]: {prompt}")
+            print(f"[Error]:   {e}")
+
+    print(f"{'='*60}\n")
 
 
 def main():
@@ -675,6 +746,24 @@ def main():
                         writer.add_scalar(
                             "eval/perplexity", eval_perplexity, global_step
                         )
+
+                # Sample generation during training
+                if (
+                    args.generation_steps > 0
+                    and global_step % args.generation_steps == 0
+                    and args.generation_prompts
+                ):
+                    _run_generation(
+                        state=state,
+                        tokenizer=tokenizer,
+                        prompts=args.generation_prompts,
+                        max_len=args.generation_max_len,
+                        temperature=args.generation_temperature,
+                        top_k=args.generation_top_k,
+                        global_step=global_step,
+                        rng=rng,
+                    )
+                    rng, _ = random.split(rng)  # Update RNG for next generation
 
                 # Checkpoint saving
                 if global_step % args.save_steps == 0:
