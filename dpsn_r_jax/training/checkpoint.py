@@ -242,6 +242,9 @@ def load_pretrained_checkpoint(
     model parameters (not optimizer state), which is typical for transfer
     learning / fine-tuning scenarios.
 
+    Uses partial restore to handle structure mismatches between saved
+    checkpoint and target state (e.g., different optimizer state format).
+
     Args:
         pretrained_path: Path to pretrained checkpoint.
         target_state: Target state with correct model architecture and sharding.
@@ -249,15 +252,78 @@ def load_pretrained_checkpoint(
     Returns:
         Training state with pretrained parameters loaded.
     """
-    state, _ = load_checkpoint(pretrained_path, target_state)
+    abs_dir = os.path.abspath(pretrained_path)
 
-    # For fine-tuning, we typically want to reset optimizer state
-    # but keep the model parameters
-    if hasattr(target_state, "opt_state"):
-        # Keep the target's optimizer state (fresh start for fine-tuning)
-        state = state.replace(opt_state=target_state.opt_state)
+    if not os.path.exists(abs_dir):
+        raise FileNotFoundError(f"Checkpoint directory not found: {abs_dir}")
 
-    logging.info(f"Loaded pretrained weights from {pretrained_path}")
+    checkpointer = ocp.PyTreeCheckpointer()
+
+    # Discover step directory
+    step = None
+    try:
+        mgr = ocp.CheckpointManager(abs_dir, checkpointer)
+        step = mgr.latest_step()
+    except Exception:
+        pass
+
+    if step is None:
+        # Scan for step directories
+        try:
+            for item in os.listdir(abs_dir):
+                if item.isdigit():
+                    item_path = os.path.join(abs_dir, item)
+                    if os.path.isdir(item_path) and os.path.exists(
+                        os.path.join(item_path, "default")
+                    ):
+                        if step is None or int(item) > step:
+                            step = int(item)
+        except Exception:
+            pass
+
+    if step is None:
+        raise FileNotFoundError(f"No checkpoint step found in {abs_dir}")
+
+    # Build path to checkpoint
+    ckpt_path = os.path.join(abs_dir, str(step), "default")
+    if not os.path.exists(ckpt_path):
+        ckpt_path = os.path.join(abs_dir, str(step))
+
+    logging.info(f"Loading pretrained weights from {ckpt_path}")
+
+    # Create a partial target with only params for partial restore
+    # This handles structure mismatches (e.g., opt_state dict vs list)
+    params_target = {"params": target_state.params}
+
+    # Build restore args for partial restore
+    restore_args = ocp.checkpoint_utils.construct_restore_args(
+        params_target,
+        jax.tree_util.tree_map(lambda x: x.sharding, params_target),
+    )
+
+    try:
+        # Try partial restore - only loads params, ignores other state
+        restored = checkpointer.restore(
+            ckpt_path,
+            items=params_target,
+            restore_args=restore_args,
+        )
+        params = restored["params"]
+    except Exception as e:
+        logging.warning(f"Partial restore failed: {e}, trying full restore")
+        # Fallback: try full restore and extract params
+        try:
+            restored = checkpointer.restore(ckpt_path)
+            params = restored["params"]
+        except Exception as e2:
+            raise RuntimeError(
+                f"Failed to load pretrained checkpoint: {e2}"
+            ) from e2
+
+    # Create new state with loaded params but fresh optimizer
+    state = target_state.replace(params=params)
+
+    logging.info(f"Loaded pretrained params from step {step}")
     return state
 
 
