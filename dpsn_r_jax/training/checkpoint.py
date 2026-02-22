@@ -1,0 +1,355 @@
+"""Unified checkpoint handling with Orbax + TPU/multi-device support.
+
+This module provides a single source of truth for checkpoint operations,
+supporting both single-device and multi-device (TPU/GPU mesh) training.
+"""
+
+import os
+from typing import Any, Optional, Tuple, Union
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jax import sharding
+from flax.training import train_state
+import orbax.checkpoint as ocp
+from absl import logging
+
+
+def get_mesh(
+    mesh_shape: Optional[Tuple[int, ...]] = None,
+    axis_names: Optional[Tuple[str, ...]] = None,
+) -> Optional[jax.sharding.Mesh]:
+    """Create a mesh for multi-device training.
+
+    Args:
+        mesh_shape: Shape of the mesh. If None, creates 1D mesh with all devices.
+        axis_names: Names for each mesh axis. Defaults to ('data',).
+
+    Returns:
+        Mesh object if multiple devices, None otherwise.
+    """
+    devices = jax.devices()
+    num_devices = len(devices)
+
+    if num_devices == 1:
+        logging.info("Single device detected, no mesh created.")
+        return None
+
+    if mesh_shape is None:
+        mesh_shape = (num_devices,)
+
+    if axis_names is None:
+        axis_names = ("data",)
+
+    if len(mesh_shape) != len(axis_names):
+        raise ValueError(
+            f"mesh_shape length ({len(mesh_shape)}) must match "
+            f"axis_names length ({len(axis_names)})"
+        )
+
+    device_array = np.array(devices).reshape(mesh_shape)
+    mesh = jax.sharding.Mesh(device_array, axis_names)
+
+    logging.info(f"Created mesh with shape {mesh_shape} and axes {axis_names}")
+    return mesh
+
+
+def get_sharding_spec(
+    mesh: Optional[jax.sharding.Mesh],
+    spec: Optional[Union[sharding.PartitionSpec, Tuple[str, ...]]] = None,
+) -> Optional[jax.sharding.NamedSharding]:
+    """Get NamedSharding for a given mesh and partition spec.
+
+    Args:
+        mesh: Device mesh. If None, returns None (no sharding).
+        spec: Partition spec for sharding. If None, uses replicated sharding.
+
+    Returns:
+        NamedSharding object if mesh is provided, None otherwise.
+    """
+    if mesh is None:
+        return None
+
+    if spec is None:
+        spec = sharding.PartitionSpec()
+
+    if isinstance(spec, tuple):
+        spec = sharding.PartitionSpec(*spec)
+
+    return jax.sharding.NamedSharding(mesh, spec)
+
+
+def create_checkpoint_manager(
+    checkpoint_dir: str,
+    max_to_keep: int = 3,
+    create: bool = True,
+) -> ocp.CheckpointManager:
+    """Create an Orbax checkpoint manager.
+
+    Args:
+        checkpoint_dir: Directory to store checkpoints.
+        max_to_keep: Maximum number of checkpoints to keep.
+        create: Whether to create the directory if it doesn't exist.
+
+    Returns:
+        CheckpointManager instance.
+    """
+    abs_dir = os.path.abspath(checkpoint_dir)
+
+    if create:
+        os.makedirs(abs_dir, exist_ok=True)
+
+    options = ocp.CheckpointManagerOptions(
+        max_to_keep=max_to_keep,
+        create=create,
+    )
+
+    return ocp.CheckpointManager(abs_dir, ocp.PyTreeCheckpointer(), options)
+
+
+def save_checkpoint(
+    checkpoint_dir: str,
+    state: train_state.TrainState,
+    step: int,
+    max_to_keep: int = 3,
+) -> None:
+    """Save a training state checkpoint.
+
+    Args:
+        checkpoint_dir: Directory to save the checkpoint.
+        state: Training state to save.
+        step: Current training step.
+        max_to_keep: Maximum number of checkpoints to keep.
+    """
+    mgr = create_checkpoint_manager(checkpoint_dir, max_to_keep=max_to_keep)
+    mgr.save(step, state)
+    mgr.wait_until_finished()
+
+    logging.info(f"Saved checkpoint at step {step} to {checkpoint_dir}")
+
+
+def load_checkpoint(
+    checkpoint_dir: str,
+    target_state: Optional[train_state.TrainState] = None,
+    step: Optional[int] = None,
+) -> Tuple[train_state.TrainState, int]:
+    """Load a checkpoint from directory.
+
+    This function tries multiple checkpoint formats:
+    1. Orbax CheckpointManager (recommended for TPU)
+    2. Direct Orbax checkpoint path
+    3. Legacy JSON format (for backward compatibility)
+
+    Args:
+        checkpoint_dir: Directory containing the checkpoint.
+        target_state: Target state for sharding information. Required for
+            multi-device loading to determine correct shard placement.
+        step: Specific step to load. If None, loads the latest.
+
+    Returns:
+        Tuple of (loaded_state, step).
+
+    Raises:
+        FileNotFoundError: If no checkpoint is found.
+    """
+    abs_dir = os.path.abspath(checkpoint_dir)
+
+    if not os.path.exists(abs_dir):
+        raise FileNotFoundError(f"Checkpoint directory not found: {abs_dir}")
+
+    checkpointer = ocp.PyTreeCheckpointer()
+
+    # Try 1: Orbax CheckpointManager format
+    try:
+        mgr = ocp.CheckpointManager(abs_dir, checkpointer)
+
+        if step is None:
+            step = mgr.latest_step()
+
+        if step is not None:
+            if target_state is not None:
+                # Use target state for sharding information
+                state = mgr.restore(step, items=target_state)
+            else:
+                state = mgr.restore(step)
+
+            logging.info(f"Loaded checkpoint from step {step} (Orbax Manager)")
+            return state, step
+
+    except Exception as e:
+        logging.debug(f"Orbax CheckpointManager failed: {e}")
+
+    # Try 2: Direct Orbax checkpoint path
+    potential_paths = []
+    if step is not None:
+        potential_paths.append(os.path.join(abs_dir, str(step), "default"))
+        potential_paths.append(os.path.join(abs_dir, f"checkpoint_{step}"))
+
+    for subdir in ["default", "latest"]:
+        potential_paths.append(os.path.join(abs_dir, subdir))
+
+    for path in potential_paths:
+        if os.path.exists(path):
+            try:
+                if target_state is not None:
+                    state = checkpointer.restore(path, items=target_state)
+                else:
+                    state = checkpointer.restore(path)
+
+                loaded_step = _extract_step_from_path(path, step)
+                logging.info(f"Loaded checkpoint from {path} (Orbax Direct)")
+                return state, loaded_step
+
+            except Exception as e:
+                logging.debug(f"Direct path restore failed: {e}")
+
+    # Try 3: Legacy JSON format (backward compatibility)
+    state, loaded_step = _try_load_legacy_json(abs_dir, target_state, step)
+    if state is not None:
+        logging.info(f"Loaded checkpoint from step {loaded_step} (Legacy JSON)")
+        return state, loaded_step
+
+    raise FileNotFoundError(f"No valid checkpoint found in {abs_dir}")
+
+
+def load_pretrained_checkpoint(
+    pretrained_path: str,
+    target_state: train_state.TrainState,
+) -> train_state.TrainState:
+    """Load a pretrained checkpoint for fine-tuning.
+
+    This is a convenience wrapper around load_checkpoint that loads only
+    model parameters (not optimizer state), which is typical for transfer
+    learning / fine-tuning scenarios.
+
+    Args:
+        pretrained_path: Path to pretrained checkpoint.
+        target_state: Target state with correct model architecture and sharding.
+
+    Returns:
+        Training state with pretrained parameters loaded.
+    """
+    state, _ = load_checkpoint(pretrained_path, target_state)
+
+    # For fine-tuning, we typically want to reset optimizer state
+    # but keep the model parameters
+    if hasattr(target_state, "opt_state"):
+        # Keep the target's optimizer state (fresh start for fine-tuning)
+        state = state.replace(opt_state=target_state.opt_state)
+
+    logging.info(f"Loaded pretrained weights from {pretrained_path}")
+    return state
+
+
+def _extract_step_from_path(path: str, default_step: Optional[int]) -> int:
+    """Extract step number from checkpoint path."""
+    if default_step is not None:
+        return default_step
+
+    # Try to extract step from path
+    parts = path.split(os.sep)
+    for part in reversed(parts):
+        if part.isdigit():
+            return int(part)
+
+    return 0
+
+
+def _try_load_legacy_json(
+    checkpoint_dir: str,
+    target_state: Optional[train_state.TrainState],
+    step: Optional[int],
+) -> Tuple[Optional[train_state.TrainState], Optional[int]]:
+    """Try to load legacy JSON checkpoint format.
+
+    This provides backward compatibility with checkpoints saved in the
+    previous JSON-based format.
+    """
+    import json
+
+    # Look for params.json
+    params_file = os.path.join(checkpoint_dir, "params.json")
+    if os.path.exists(params_file):
+        try:
+            with open(params_file, "r") as f:
+                params_dict = json.load(f)
+
+            params = jax.tree_util.tree_map(jnp.array, params_dict)
+
+            if target_state is not None:
+                state = target_state.replace(params=params)
+            else:
+                raise ValueError("target_state required for legacy JSON loading")
+
+            loaded_step = step if step is not None else 0
+            return state, loaded_step
+
+        except Exception as e:
+            logging.debug(f"Legacy JSON loading failed: {e}")
+
+    # Look for step-specific files
+    if step is not None:
+        step_params = os.path.join(checkpoint_dir, f"params_step_{step}.json")
+        if os.path.exists(step_params):
+            try:
+                with open(step_params, "r") as f:
+                    params_dict = json.load(f)
+
+                params = jax.tree_util.tree_map(jnp.array, params_dict)
+
+                checkpoint_file = os.path.join(
+                    checkpoint_dir, f"checkpoint_{step}.json"
+                )
+                if os.path.exists(checkpoint_file) and target_state is not None:
+                    with open(checkpoint_file, "r") as f:
+                        ckpt_data = json.load(f)
+
+                    # Restore pool momenta if present
+                    if hasattr(target_state, "pool_m"):
+                        target_state = target_state.replace(
+                            params=params,
+                            pool_m=jnp.array(ckpt_data.get("pool_m", [])),
+                            pool_v=jnp.array(ckpt_data.get("pool_v", [])),
+                            step=ckpt_data.get("step", step),
+                        )
+                    else:
+                        target_state = target_state.replace(params=params)
+
+                return target_state, step
+
+            except Exception as e:
+                logging.debug(f"Step-specific JSON loading failed: {e}")
+
+    return None, None
+
+
+def get_latest_step(checkpoint_dir: str) -> Optional[int]:
+    """Get the latest checkpoint step without loading the checkpoint.
+
+    Args:
+        checkpoint_dir: Directory containing checkpoints.
+
+    Returns:
+        Latest step number, or None if no checkpoints found.
+    """
+    abs_dir = os.path.abspath(checkpoint_dir)
+
+    if not os.path.exists(abs_dir):
+        return None
+
+    try:
+        mgr = ocp.CheckpointManager(abs_dir, ocp.PyTreeCheckpointer())
+        return mgr.latest_step()
+    except Exception:
+        pass
+
+    # Fallback: scan directory for step numbers
+    max_step = None
+    for item in os.listdir(abs_dir):
+        if item.isdigit():
+            step = int(item)
+            if max_step is None or step > max_step:
+                max_step = step
+
+    return max_step
