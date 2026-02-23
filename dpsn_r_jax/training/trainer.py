@@ -60,6 +60,7 @@ def create_train_state(rng, config, learning_rate_fn=None):
 
 @jax.jit
 def train_step(state, batch, pad_token_id=0):
+    print("Compiling train_step for XLA...", flush=True)
     dropout_rng, new_rng = random.split(state.rng)
 
     def loss_fn(params):

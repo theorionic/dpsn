@@ -265,6 +265,7 @@ def main():
     # This ensures parameters are created directly on the correct devices
     @jax.jit
     def init_model(rng, input_ids):
+        print("Compiling init_model in main.py for XLA...", flush=True)
         return model.init(rng, input_ids)
 
     # Get abstract PyTree of variables (shapes/types only)

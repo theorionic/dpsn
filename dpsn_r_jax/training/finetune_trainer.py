@@ -103,6 +103,7 @@ def create_finetune_state(
 
         @jax.jit
         def init_model(rng, input_ids):
+            print("Compiling init_model for XLA...", flush=True)
             return model.init(rng, input_ids)
 
         # Get abstract shapes
@@ -168,6 +169,7 @@ def finetune_step(
     batch: Dict[str, jnp.ndarray],
     pad_token_id: int = 0,
 ) -> Tuple[FineTuneState, jnp.ndarray]:
+    print("Compiling finetune_step for XLA...", flush=True)
     dropout_rng, new_rng = random.split(state.rng)
 
     input_ids = batch["input_ids"]
@@ -272,6 +274,7 @@ def compute_loss_with_mask(
     labels: jnp.ndarray,
     pad_token_id: int = 0,
 ) -> jnp.ndarray:
+    print("Compiling compute_loss_with_mask for XLA...", flush=True)
     shift_logits = logits[:, :-1, :]
     shift_labels = labels[:, 1:]
 
@@ -290,6 +293,7 @@ def validation_step(
     batch: Dict[str, jnp.ndarray],
     pad_token_id: int = 0,
 ) -> jnp.ndarray:
+    print("Compiling validation_step for XLA...", flush=True)
     logits, _ = state.apply_fn(
         {"params": state.params},
         batch["input_ids"],

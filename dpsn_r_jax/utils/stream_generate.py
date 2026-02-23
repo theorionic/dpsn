@@ -28,6 +28,7 @@ def inference_step(
     Returns:
         The sampled next token ID.
     """
+    print("Compiling inference_step in stream_generate.py for XLA...", flush=True)
     logits, _ = state.apply_fn({"params": state.params}, input_ids, deterministic=True)
     logits = logits[0, -1, :]
 

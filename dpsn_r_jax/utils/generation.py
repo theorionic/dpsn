@@ -89,6 +89,7 @@ def _get_forward_fn(state, batch_size: int, seq_len: int):
 
         @jax.jit
         def forward_fn(params, input_ids):
+            print("Compiling generation forward_fn for XLA...", flush=True)
             _log_compilation(f"Forward pass JIT executing for shape {input_ids.shape}")
             logits, aux = state.apply_fn(
                 {"params": params}, input_ids, deterministic=True
