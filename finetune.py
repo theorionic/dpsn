@@ -13,6 +13,11 @@ import jax.numpy as jnp
 from jax import random
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
+import builtins
+import functools
+# Force print to always flush by default to avoid buffering issues with 'tee'
+builtins.print = functools.partial(print, flush=True)
+
 try:
     from tensorboardX import SummaryWriter
 except ImportError:
