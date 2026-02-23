@@ -76,9 +76,7 @@ def _get_forward_fn(state, batch_size: int, seq_len: int):
     """
     global _CACHED_FORWARD_FN, _CACHE_KEY
 
-    # Use state identity + shape as cache key
-    state_id = id(state)
-    cache_key = (state_id, batch_size, seq_len)
+    cache_key = (batch_size, seq_len)
 
     if cache_key != _CACHE_KEY:
         _log_compilation(f"New cache key: batch_size={batch_size}, seq_len={seq_len}")
@@ -87,11 +85,14 @@ def _get_forward_fn(state, batch_size: int, seq_len: int):
     if cache_key not in _CACHED_FORWARD_FN:
         _log_compilation(f"Compiling forward pass for shape ({batch_size}, {seq_len})")
 
+        # Bind apply_fn directly to the closure to prevent recompilations
+        # caused by the `state` object being recreated dynamically by optax
+        apply_fn = state.apply_fn
         @jax.jit
         def forward_fn(params, input_ids):
             print("Compiling generation forward_fn for XLA...", flush=True)
             _log_compilation(f"Forward pass JIT executing for shape {input_ids.shape}")
-            logits, aux = state.apply_fn(
+            logits, aux = apply_fn(
                 {"params": params}, input_ids, deterministic=True
             )
             return logits, aux
@@ -268,7 +269,7 @@ def generate_fast(
 
     # Decode only the generated tokens (not the prompt)
     final_len = prompt_len + num_generated
-    final_tokens = token_buffer[0, :final_len].tolist()
+    final_tokens = token_buffer[0, prompt_len:final_len].tolist()
     return tokenizer.decode(final_tokens, skip_special_tokens=True)
 
 
