@@ -10,3 +10,4 @@ wheels/
 .venv
 checkpoints_*/
 debug_*/
+xla_log.txt
