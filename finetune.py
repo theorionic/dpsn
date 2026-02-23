@@ -50,7 +50,7 @@ from dpsn_r_jax.training.checkpoint import (
     get_latest_step,
 )
 from dpsn_r_jax.training.lr_schedules import get_scheduler
-from dpsn_r_jax.utils.generation import generate
+from dpsn_r_jax.utils.generation import generate, clear_generation_cache
 
 
 def parse_args():
@@ -777,7 +777,8 @@ def main():
                         rng=rng,
                     )
                     rng, _ = random.split(rng)  # Update RNG for next generation
-
+                    clear_generation_cache()  # Free XLA memory to avoid OOM in backward pass
+                    
                 # Checkpoint saving
                 if global_step % args.save_steps == 0:
                     checkpoint_dir = os.path.join(

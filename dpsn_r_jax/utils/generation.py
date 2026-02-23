@@ -104,6 +104,15 @@ def _get_forward_fn(state, batch_size: int, seq_len: int):
 
     return _CACHED_FORWARD_FN[cache_key]
 
+def clear_generation_cache():
+    """Clear compiled generation functions from XLA device memory to avoid OOM."""
+    global _CACHED_FORWARD_FN, _CACHE_KEY
+    for cache_key, fn in _CACHED_FORWARD_FN.items():
+        if hasattr(fn, "clear_cache"):
+            fn.clear_cache()
+    _CACHED_FORWARD_FN.clear()
+    _CACHE_KEY = None
+
 
 def generate_fast(
     state,

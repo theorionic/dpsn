@@ -39,7 +39,7 @@ from dpsn_r_jax.data.dataset import (
 )
 from dpsn_r_jax.data.tokenizer import get_tokenizer
 from dpsn_r_jax.data.grain_loader import get_grain_loader
-from dpsn_r_jax.utils.generation import generate
+from dpsn_r_jax.utils.generation import generate, clear_generation_cache
 from dpsn_r_jax.utils.metrics import calculate_flops
 
 
@@ -542,6 +542,7 @@ def main():
                         repetition_penalty=1.2,
                     )
                     print(f"Output: {output}")
+                clear_generation_cache()  # Free XLA memory to avoid OOM in backward pass
                 print("---------------------------------------")
 
         if args.max_steps and global_step >= args.max_steps:
