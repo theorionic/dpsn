@@ -345,26 +345,26 @@ def load_pretrained_checkpoint(
     """
     params = load_pretrained_params(pretrained_path, target_state.params)
     return target_state.replace(params=params)
-        try:
-            restored = checkpointer.restore(ckpt_path)
-            params = restored["params"]
-        except Exception as e2:
-            raise RuntimeError(
-                f"Failed to load pretrained checkpoint: {e2}"
-            ) from e2
 
-    # Truncate position embeddings if needed (fine-tuning with shorter seq length)
-    params = _truncate_position_embeddings(params, target_state.params)
 
-    # Reshard params to match target state's device placement
-    # This is needed when checkpoint was saved with different device ordering
-    params = _reshard_to_target(params, target_state.params)
 
-    # Create new state with loaded params but fresh optimizer
-    state = target_state.replace(params=params)
 
-    logging.info(f"Loaded pretrained params from step {step}")
-    return state
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def _reshard_to_target(
