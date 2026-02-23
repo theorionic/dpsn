@@ -5,6 +5,7 @@ import jax.numpy as jnp
 import time
 from typing import Optional
 import os
+from functools import partial
 
 
 # Enable JAX compilation logging if requested
@@ -20,6 +21,13 @@ def _apply_repetition_penalty(
     generated_tokens: jnp.ndarray,
     penalty: float,
 ) -> jnp.ndarray:
+    """Apply repetition penalty to logits.
+
+    Args:
+        logits: [vocab_size] logits for next token
+        generated_tokens: 1D array of previously generated token IDs
+        penalty: Repetition penalty factor (>1 penalizes, <1 rewards)
+    """
     vocab_size = logits.shape[-1]
     token_mask = jnp.zeros((vocab_size,), dtype=jnp.bool_)
     token_mask = token_mask.at[generated_tokens].set(True)
@@ -33,6 +41,7 @@ def _apply_repetition_penalty(
 
 
 def _apply_top_k(logits: jnp.ndarray, top_k: int) -> jnp.ndarray:
+    """Apply top-k filtering to logits."""
     actual_k = min(top_k, logits.shape[-1])
     values, _ = jax.lax.top_k(logits, k=actual_k)
     min_value = values[-1]
@@ -48,12 +57,13 @@ def _sample_token(
     rng: jax.random.PRNGKey,
     temperature: float,
 ) -> jnp.ndarray:
+    """Sample a token from logits using temperature scaling."""
     safe_temp = jnp.maximum(temperature, 1e-8)
     scaled_logits = logits / safe_temp
     return jax.random.categorical(rng, scaled_logits)
 
 
-# Cached forward function - JIT'd once per (batch_shape, seq_len) combination
+# Cached forward function - JIT'd once per (state, batch_shape, seq_len) combination
 _CACHED_FORWARD_FN = {}
 _CACHE_KEY = None
 
@@ -106,11 +116,23 @@ def generate_fast(
     max_seq_len: int = 512,
     verbose: bool = False,
 ) -> str:
-    """Generate text with padded inputs for cached JIT compilation.
+    """Generate text with FIXED-SIZE buffers to eliminate XLA recompilation.
 
-    CRITICAL for TPU: We pad inputs to fixed max_seq_len so that the JIT-compiled
-    forward pass is reused (cached) instead of recompiling for each new sequence length.
-    Without this, every token generation step would trigger a new XLA compilation.
+    CRITICAL for TPU: This implementation uses FIXED-SIZE arrays throughout to
+    ensure JAX compiles each function ONCE and reuses the cached compilation.
+
+    PROBLEM ANALYZED FROM XLA LOGS:
+    - 246 scatter compilations in one generation (11,000+ lines of output)
+    - Root cause: dynamic tensor shapes changing each generation step
+      1. input_ids grows: [1,40] -> [1,41] -> [1,42] -> ...
+      2. generated_tokens grows: [1] -> [2] -> [3] -> ...
+      3. Every scatter/set operation triggers recompilation for new shape
+
+    SOLUTION:
+    - Pre-allocate token_buffer to max_seq_len (fixed shape)
+    - Pre-allocate generated_tokens_buffer to max_len (fixed shape)
+    - Update buffers in-place with fixed indices
+    - Forward function sees same (1, max_seq_len) shape every step
 
     Args:
         state: TrainState with model params and apply_fn
@@ -156,7 +178,28 @@ def generate_fast(
         prompt_len = max_seq_len
 
     start_time = time.time()
-    generated_tokens = []
+
+    # ============================================================
+    # FIXED-SIZE BUFFERS - KEY TO AVOIDING RECOMPILATION
+    # ============================================================
+    #
+    # OLD CODE (causes 246+ recompilations):
+    #   input_ids = jnp.concatenate([input_ids, new_token...])  # grows!
+    #   jnp.array(generated_tokens)  # grows!
+    #   padded_input.at[:, :input_ids.shape[1]]  # dynamic slice!
+    #
+    # NEW CODE (compiles once):
+    #   token_buffer has FIXED shape (1, max_seq_len)
+    #   generated_tokens_buffer has FIXED shape (max_len,)
+    #   Updates use FIXED indices, not dynamic slices
+
+    # FIXED-SHAPE: token buffer pre-allocated to max_seq_len
+    token_buffer = jnp.zeros((1, max_seq_len), dtype=jnp.int32)
+    token_buffer = token_buffer.at[:, :prompt_len].set(input_ids)
+
+    # FIXED-SHAPE: buffer for repetition penalty tokens (max tokens to generate)
+    generated_tokens_buffer = jnp.zeros((max_len,), dtype=jnp.int32)
+    num_generated = 0  # Python int to track count (not in JAX computation graph)
 
     # Get JIT'd forward function for fixed shape (1, max_seq_len)
     forward_fn = _get_forward_fn(state, batch_size=1, seq_len=max_seq_len)
@@ -166,40 +209,46 @@ def generate_fast(
         if current_len >= max_seq_len:
             break
 
-        # Pad input to fixed max_seq_len for cache hit
-        padded_input = jnp.zeros((1, max_seq_len), dtype=jnp.int32)
-        padded_input = padded_input.at[:, : input_ids.shape[1]].set(input_ids)
-
-        # Create attention mask for actual length
-        # (some models may not need this, but DPSNR uses it)
-
+        # FIXED-SHAPE: token_buffer already has shape (1, max_seq_len)
+        # No dynamic slicing - forward_fn sees same shape every step
         _log_compilation(
-            f"Step {step}: calling forward_fn with shape {padded_input.shape}"
+            f"Step {step}: forward_fn with fixed shape {token_buffer.shape}"
         )
 
-        # Call cached JIT function
-        logits, _ = forward_fn(state.params, padded_input)
+        # Call cached JIT function (SAME SHAPE EVERY TIME)
+        logits, _ = forward_fn(state.params, token_buffer)
 
         # Get logits for last actual token (not padded position)
         next_logits = logits[0, current_len - 1, :]
 
-        # Apply sampling
-        if generated_tokens:
+        # Apply sampling with fixed-size repetition penalty buffer
+        if num_generated > 0:
+            # Use only the valid portion of the buffer (slicing on fixed array)
+            valid_tokens = generated_tokens_buffer[:num_generated]
             next_logits = _apply_repetition_penalty(
                 next_logits,
-                jnp.array(generated_tokens, dtype=jnp.int32),
+                valid_tokens,
                 repetition_penalty,
             )
         next_logits = _apply_top_k(next_logits, top_k)
 
         rng, sample_rng = jax.random.split(rng)
         new_token = _sample_token(next_logits, sample_rng, temperature)
-        generated_tokens.append(int(new_token))
 
-        # Append to input for next iteration
-        input_ids = jnp.concatenate([input_ids, new_token[None, None]], axis=1)
+        # Convert to Python int for control flow
+        new_token_int = int(new_token)
 
-        if new_token == eos_token_id:
+        # FIXED-SHAPE UPDATE: Update token_buffer at specific position
+        # (not concatenation which would change shape)
+        token_buffer = token_buffer.at[0, current_len].set(new_token_int)
+
+        # FIXED-SHAPE UPDATE: Update generated tokens buffer
+        generated_tokens_buffer = generated_tokens_buffer.at[num_generated].set(
+            new_token_int
+        )
+        num_generated += 1
+
+        if new_token_int == eos_token_id:
             break
 
     if verbose:
@@ -208,7 +257,8 @@ def generate_fast(
         print(f"Generation time: {elapsed:.3f}s (max_len={max_len})")
 
     # Decode only the generated tokens (not the prompt)
-    final_tokens = input_ids[0].tolist()
+    final_len = prompt_len + num_generated
+    final_tokens = token_buffer[0, :final_len].tolist()
     return tokenizer.decode(final_tokens, skip_special_tokens=True)
 
 
