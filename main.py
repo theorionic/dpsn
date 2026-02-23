@@ -485,6 +485,7 @@ def main():
 
             # TensorBoard logging
             writer.add_scalar("Loss/train", float(loss), global_step)
+            writer.add_scalar("PPL/train", float(jnp.exp(loss)), global_step)
             writer.add_scalar("Perf/TPS", tokens_per_sec, global_step)
             writer.add_scalar("Perf/TFLOPS", tflops, global_step)
             current_lr = state.learning_rate_fn(global_step)
@@ -507,8 +508,9 @@ def main():
                         json.dump(grain_loader.get_state(), f)
 
             if step % 10 == 0:
+                ppl = jnp.exp(loss)
                 print(
-                    f"Epoch {epoch + 1} | Step {step} | Global Step {global_step} | Loss: {loss:.4f} | LR: {current_lr:.2e} | TPS: {tokens_per_sec:.0f} | TFLOPS: {tflops:.4f}"
+                    f"Epoch {epoch + 1} | Step {step} | Global Step {global_step} | Loss: {loss:.4f} | PPL: {ppl:.4f} | LR: {current_lr:.2e} | TPS: {tokens_per_sec:.0f} | TFLOPS: {tflops:.4f}"
                 )
 
             # Periodic Generation
@@ -548,8 +550,10 @@ def main():
         if args.max_steps and global_step >= args.max_steps:
             break
 
+        avg_loss = epoch_loss / steps_per_epoch
+        avg_ppl = jnp.exp(avg_loss)
         print(
-            f"Epoch {epoch + 1} Complete | Avg Loss: {epoch_loss / steps_per_epoch:.4f}"
+            f"Epoch {epoch + 1} Complete | Avg Loss: {avg_loss:.4f} | Avg PPL: {avg_ppl:.4f}"
         )
         pool_util = log_pool_utilization(state)
         writer.add_scalar("Pool/Utilization", pool_util, global_step)
