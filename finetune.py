@@ -45,7 +45,7 @@ from dpsn_r_jax.training.finetune_trainer import (
 from dpsn_r_jax.training.checkpoint import (
     save_checkpoint,
     load_checkpoint,
-    load_pretrained_checkpoint,
+    load_pretrained_params,
     get_mesh,
     get_latest_step,
 )
@@ -611,27 +611,38 @@ def main():
         total_steps=total_steps,
     )
 
-    # Create training state
-    print("\nInitializing model...")
+    # Load pretrained params BEFORE creating state (avoids double compilation)
+    pretrained_params = None
+    if args.load_pretrained:
+        # Create dummy state to get target param shapes/shardings
+        print("\nInitializing model structure for pretrained loading...")
+        dummy_state = create_finetune_state(
+            rng=init_rng,
+            config=config,
+            learning_rate_fn=lr_schedule,
+            freeze_controller=args.freeze_controller,
+            freeze_pool=args.freeze_pool,
+            mesh=mesh,
+        )
+        # Load pretrained params (handles truncation and resharing)
+        pretrained_params = load_pretrained_params(
+            args.load_pretrained, dummy_state.params
+        )
+        # Clear dummy state to free memory
+        del dummy_state
+
+    # Create training state (compile finetune_step only ONCE)
+    print("\nInitializing model..." if pretrained_params is None else "\nCreating training state with pretrained params...")
     state = create_finetune_state(
         rng=init_rng,
         config=config,
         learning_rate_fn=lr_schedule,
         freeze_controller=args.freeze_controller,
         freeze_pool=args.freeze_pool,
-        pretrained_path=args.load_pretrained,
+        pretrained_params=pretrained_params,
         mesh=mesh,
     )
-
     # Resume from checkpoint if specified
-    if args.resume_from_checkpoint:
-        print(f"Resuming from checkpoint: {args.resume_from_checkpoint}")
-        latest_step = get_latest_step(args.resume_from_checkpoint)
-        if latest_step is not None:
-            state, loaded_step = load_checkpoint(
-                args.resume_from_checkpoint, state, latest_step
-            )
-            print(f"Resumed from step {loaded_step}")
 
     # Setup logging
     log_dir = args.log_dir or os.path.join(args.output_dir, "logs")

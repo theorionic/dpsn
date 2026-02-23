@@ -60,10 +60,13 @@ def create_finetune_state(
     learning_rate_fn: Callable[[int], float],
     freeze_controller: bool = False,
     freeze_pool: bool = True,
-    pretrained_path: Optional[str] = None,
+    pretrained_params: Optional[Dict] = None,
     mesh: Optional[Mesh] = None,
 ) -> FineTuneState:
     """Create fine-tuning state with optional TPU sharding.
+
+    IMPORTANT: To avoid double JAX compilation, pass pretrained_params from
+    load_pretrained_params() instead of loading after state creation.
 
     Args:
         rng: JAX random key
@@ -71,7 +74,8 @@ def create_finetune_state(
         learning_rate_fn: Learning rate schedule function
         freeze_controller: Whether to freeze controller params
         freeze_pool: Whether to freeze pool params
-        pretrained_path: Path to pretrained checkpoint
+        pretrained_params: Pretrained params (from load_pretrained_params()).
+            Pass this to compile finetune_step only once.
         mesh: Optional JAX mesh for TPU/multi-device sharding
 
     Returns:
@@ -89,7 +93,11 @@ def create_finetune_state(
         # Everything else is replicated
         return NamedSharding(mesh, PartitionSpec())
 
-    if mesh is not None and jax.device_count() > 1:
+    # If we have pretrained params, use them directly (avoid double compilation)
+    if pretrained_params is not None:
+        print("Using pretrained parameters (single compilation)")
+        params = pretrained_params
+    elif mesh is not None and jax.device_count() > 1:
         # TPU/Multi-device: Initialize with sharding constraints
         print(f"Initializing with sharding on mesh: {mesh}")
 
@@ -109,11 +117,11 @@ def create_finetune_state(
         variables = jax.lax.with_sharding_constraint(
             init_model(rng, dummy_input), sharding_tree
         )
+        params = variables["params"]
     else:
         # Single device: Standard initialization
         variables = model.init(rng, dummy_input)
-
-    params = variables["params"]
+        params = variables["params"]
 
     pool_key = ("pool", "params_storage")
     flat_params = traverse_util.flatten_dict(params)
@@ -150,10 +158,6 @@ def create_finetune_state(
         window_size=config.max_k,
         learning_rate_fn=learning_rate_fn,
     )
-
-    if pretrained_path:
-        print(f"Loading pretrained weights from {pretrained_path}")
-        state = load_pretrained_checkpoint(pretrained_path, state)
 
     return state
 

@@ -232,25 +232,22 @@ def load_checkpoint(
     raise FileNotFoundError(f"No valid checkpoint found in {abs_dir}")
 
 
-def load_pretrained_checkpoint(
+def load_pretrained_params(
     pretrained_path: str,
-    target_state: train_state.TrainState,
-) -> train_state.TrainState:
-    """Load a pretrained checkpoint for fine-tuning.
+    target_params: dict,
+) -> dict:
+    """Load pretrained parameters from checkpoint.
 
-    This is a convenience wrapper around load_checkpoint that loads only
-    model parameters (not optimizer state), which is typical for transfer
-    learning / fine-tuning scenarios.
-
-    Uses partial restore to handle structure mismatches between saved
-    checkpoint and target state (e.g., different optimizer state format).
+    Loads params from checkpoint, handling:
+    - Position embedding truncation (if checkpoint has longer seq_len)
+    - Device resharing (if checkpoint was saved with different device ordering)
 
     Args:
         pretrained_path: Path to pretrained checkpoint.
-        target_state: Target state with correct model architecture and sharding.
+        target_params: Target params with correct shapes and shardings.
 
     Returns:
-        Training state with pretrained parameters loaded.
+        Loaded params with correct shapes and shardings for fine-tuning.
     """
     abs_dir = os.path.abspath(pretrained_path)
 
@@ -289,11 +286,10 @@ def load_pretrained_checkpoint(
     if not os.path.exists(ckpt_path):
         ckpt_path = os.path.join(abs_dir, str(step))
 
-    logging.info(f"Loading pretrained weights from {ckpt_path}")
+    print(f"Loading pretrained weights from {ckpt_path}")
 
     # Create a partial target with only params for partial restore
-    # This handles structure mismatches (e.g., opt_state dict vs list)
-    params_target = {"params": target_state.params}
+    params_target = {"params": target_params}
 
     # Build restore args for partial restore
     restore_args = ocp.checkpoint_utils.construct_restore_args(
@@ -302,7 +298,7 @@ def load_pretrained_checkpoint(
     )
 
     try:
-        # Try partial restore - only loads params, ignores other state
+        # Try partial restore - only loads params
         restored = checkpointer.restore(
             ckpt_path,
             items=params_target,
@@ -312,6 +308,43 @@ def load_pretrained_checkpoint(
     except Exception as e:
         logging.warning(f"Partial restore failed: {e}, trying full restore")
         # Fallback: try full restore and extract params
+        try:
+            restored = checkpointer.restore(ckpt_path)
+            params = restored["params"]
+        except Exception as e2:
+            raise RuntimeError(f"Failed to load pretrained checkpoint: {e2}") from e2
+
+    # Truncate position embeddings if needed
+    params = _truncate_position_embeddings(params, target_params)
+
+    # Reshard to match target device placement
+    params = _reshard_to_target(params, target_params)
+
+    print(f"Loaded pretrained params from step {step}")
+    return params
+
+
+def load_pretrained_checkpoint(
+    pretrained_path: str,
+    target_state: train_state.TrainState,
+) -> train_state.TrainState:
+    """Load a pretrained checkpoint for fine-tuning.
+
+    DEPRECATED: Use load_pretrained_params() before create_finetune_state()
+    to avoid double compilation.
+
+    This function modifies state.params after creation, which triggers
+    JAX recompilation of jit-compiled functions.
+
+    Args:
+        pretrained_path: Path to pretrained checkpoint.
+        target_state: Target state with correct model architecture and sharding.
+
+    Returns:
+        Training state with pretrained parameters loaded.
+    """
+    params = load_pretrained_params(pretrained_path, target_state.params)
+    return target_state.replace(params=params)
         try:
             restored = checkpointer.restore(ckpt_path)
             params = restored["params"]
