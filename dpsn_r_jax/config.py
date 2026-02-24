@@ -79,6 +79,10 @@ class DPSNRConfig:
     learning_rate: float = 3e-4
     num_workers: int = 4
     gradient_checkpointing: bool = False
+    # ── Indexer improvements ───────────────────────────────────────────────
+    num_indexer_heads: int = 1      # Multi-head pool queries per reasoning step
+    sigma_min: float = 0.01         # Minimum retrieval bandwidth (sharp/precise)
+    sigma_max: float = 5.0          # Maximum retrieval bandwidth (broad/soft)
     finetune: Optional[FineTuningConfig] = None
 
     @classmethod

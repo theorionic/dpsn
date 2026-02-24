@@ -21,7 +21,12 @@ class DPSNR(nn.Module):
             acc_cls = AdaptiveComputeController
 
         self.controller = controller_cls(self.config)
-        self.indexer = LearnedIndexer(self.config.controller_hidden_dim)
+        self.indexer = LearnedIndexer(
+            self.config.controller_hidden_dim,
+            num_heads=self.config.num_indexer_heads,
+            sigma_min=self.config.sigma_min,
+            sigma_max=self.config.sigma_max,
+        )
         self.pool = CoordinateMassivePool(
             PoolConfig(
                 self.config.pool_total_vectors, self.config.controller_hidden_dim
@@ -56,8 +61,8 @@ class DPSNR(nn.Module):
 
         # Initialize sub-modules before scan to avoid UnexpectedTracerError
         # (JAX transformations like scan/jit do not allow parameter creation inside)
-        _ = self.indexer(jnp.zeros((B, D)))
-        _ = self.pool(jnp.zeros((B,)), jnp.zeros((B,)))
+        _ = self.indexer(jnp.zeros((B, T, D)))               # (B,T,D) for attn-pooled indexer
+        _ = self.pool(jnp.zeros((B,)), jnp.zeros((B,)))      # pool still takes per-head (B,)
         _ = self.retrieval_integrator(
             jnp.zeros((B, T, D + self.config.controller_hidden_dim))
         )
@@ -67,12 +72,33 @@ class DPSNR(nn.Module):
         def reasoning_step(carry, i):
             s_hidden, h_prob, h_mask = carry
             prev_s_hidden = s_hidden
+            H = self.config.num_indexer_heads
 
-            pooled_state = s_hidden[:, -1, :]
-            mu, sigma = self.indexer(pooled_state)
+            # ── 1. Attention-pooled multi-head indexing ─────────────────────────
+            # LearnedIndexer now takes the full (B, T, D) sequence and does
+            # attention pooling internally, returning (B, H) coordinates.
+            mu, sigma = self.indexer(s_hidden)  # (B, H), (B, H)
 
-            retrieved, start_indices = self.pool(mu, sigma)
+            # ── 2. Per-head pool retrieval ────────────────────────────────
+            # Python loop is unrolled at JAX trace time (H is a static int),
+            # so XLA sees a fixed computation graph regardless of num_heads.
+            all_retrieved = []
+            all_start_indices = []
+            for h in range(H):
+                retrieved_h, start_idx_h = self.pool(mu[:, h], sigma[:, h])
+                all_retrieved.append(retrieved_h)      # (B, D)
+                all_start_indices.append(start_idx_h) # (B,)
 
+            # Average across heads → (B, D).
+            # Downstream (retrieval_integrator, ACC) remain completely unchanged.
+            retrieved = jnp.mean(jnp.stack(all_retrieved, axis=1), axis=1)  # (B, D)
+
+            # Concatenate indices from every head → (H*B,).
+            # When H=1 this is just (B,) — fully backward-compatible with trainer.py.
+            # trainer.py's Sparse Adam naturally handles the larger index set.
+            start_indices = jnp.concatenate(all_start_indices, axis=0)  # (H*B,)
+
+            # ── 3. Integrate retrieved knowledge & update hidden state ───────
             retrieved_expanded = jnp.expand_dims(retrieved, 1).repeat(T, axis=1)
 
             combined = jnp.concatenate([s_hidden, retrieved_expanded], axis=-1)
