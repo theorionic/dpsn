@@ -317,9 +317,8 @@ def main():
         total_steps=total_steps,
     )
 
-    # Initialize optimizer with initial LR from schedule
-    init_lr = lr_schedule(0)
-    tx = optax.adamw(init_lr)
+    # Initialize optimizer with the LR schedule so it decays properly each step
+    tx = optax.adamw(lr_schedule)
     opt_state = tx.init(dense_params)
 
     pool_m = jnp.zeros_like(pool_params)

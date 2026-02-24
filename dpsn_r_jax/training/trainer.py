@@ -30,19 +30,17 @@ def create_train_state(rng, config, learning_rate_fn=None):
     dense_flat_params = {k: v for k, v in flat_params.items() if k != pool_key}
     dense_params = traverse_util.unflatten_dict(dense_flat_params)
 
-    # Use initial LR from schedule function or fallback to config
-    init_lr = learning_rate_fn(0) if learning_rate_fn else config.learning_rate
-    tx = optax.adamw(learning_rate=init_lr)
+    # If no schedule provided, create a constant schedule
+    if learning_rate_fn is None:
+        from dpsn_r_jax.training.lr_schedules import create_constant_schedule
+        learning_rate_fn = create_constant_schedule(config.learning_rate)
+
+    # Pass the schedule directly so the optimizer decays LR each step
+    tx = optax.adamw(learning_rate=learning_rate_fn)
     opt_state = tx.init(dense_params)
 
     pool_m = jnp.zeros_like(pool_params)
     pool_v = jnp.zeros_like(pool_params)
-
-    # If no schedule provided, create a constant schedule
-    if learning_rate_fn is None:
-        from dpsn_r_jax.training.lr_schedules import create_constant_schedule
-
-        learning_rate_fn = create_constant_schedule(config.learning_rate)
 
     return TrainState(
         step=0,

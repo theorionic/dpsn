@@ -134,14 +134,14 @@ def create_finetune_state(
         freeze_mask = get_frozen_mask(dense_params, freeze_controller, freeze_pool)
         tx = optax.multi_transform(
             {
-                "train": optax.adamw(learning_rate=learning_rate_fn(0)),
+                "train": optax.adamw(learning_rate=learning_rate_fn),
                 "freeze": optax.set_to_zero(),
             },
             freeze_mask,
         )
         opt_state = tx.init(dense_params)
     else:
-        tx = optax.adamw(learning_rate=learning_rate_fn(0))
+        tx = optax.adamw(learning_rate=learning_rate_fn)
         opt_state = tx.init(dense_params)
 
     pool_m = jnp.zeros_like(pool_params)
