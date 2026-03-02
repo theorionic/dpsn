@@ -79,29 +79,34 @@ class HFStreamSource:
                 item["text"] = item[self.text_column]
             yield item
 
-    def skip(self, n: int):
-        if n > 0:
-            self._dataset = self.dataset.skip(n)
-        return self
+    def state_dict(self):
+        return self.dataset.state_dict()
+
+    def load_state_dict(self, state_dict):
+        self.dataset.load_state_dict(state_dict)
 
 
 class SequentialSource:
     def __init__(
-        self, sources: list[HFStreamSource], dataset_idx: int = 0, sample_idx: int = 0
+        self, sources: list[HFStreamSource], dataset_idx: int = 0, hf_state: Optional[dict] = None
     ):
         self.sources = sources
-        self.dataset_idx = dataset_idx
-        self.sample_idx = sample_idx
-        self.current_sample_idx = sample_idx
+        self.start_dataset_idx = dataset_idx
+        self.hf_state = hf_state
+        self.current_dataset_idx = 0
+        self.current_sample_idx = 0
 
     def __iter__(self):
-        for i in range(self.dataset_idx, len(self.sources)):
-            self.dataset_idx = i
-            source = self.sources[i]
-
-            if i == self.dataset_idx and self.sample_idx > 0:
-                source.skip(self.sample_idx)
-                self.current_sample_idx = self.sample_idx
+        for i, source in enumerate(self.sources):
+            if i < self.start_dataset_idx:
+                continue
+            
+            self.current_dataset_idx = i
+            
+            if i == self.start_dataset_idx and self.hf_state is not None:
+                source.load_state_dict(self.hf_state)
+                self.hf_state = None
+                self.current_sample_idx = 0
             else:
                 self.current_sample_idx = 0
 
@@ -109,15 +114,18 @@ class SequentialSource:
                 yield item
                 self.current_sample_idx += 1
 
-            self.sample_idx = 0
-
-        # After completing all sources, reset indices for potential re-iteration
-        self.dataset_idx = 0
-        self.sample_idx = 0
+        self.current_dataset_idx = 0
         self.current_sample_idx = 0
+        self.start_dataset_idx = 0
 
     def get_state(self):
-        return {"dataset_idx": self.dataset_idx, "sample_idx": self.current_sample_idx}
+        state = {
+            "dataset_idx": self.current_dataset_idx,
+            "sample_idx": self.current_sample_idx
+        }
+        if self.current_dataset_idx < len(self.sources):
+            state["hf_state"] = self.sources[self.current_dataset_idx].state_dict()
+        return state
 
 
 class HFStreamLoader:
@@ -161,7 +169,8 @@ class HFStreamLoader:
                 batch = []
 
     def get_state(self):
-        return self.source.get_state()
+        state = self.source.get_state()
+        return state
 
 
 def dummy_tokenize(text: str, max_length: int = 64):
@@ -224,7 +233,7 @@ def get_grain_loader(
 
     if hf_datasets:
         dataset_idx = 0
-        sample_idx = 0
+        hf_state = None
 
         # Try to load resume state if resume_data flag is set
         if getattr(config, "resume_data", False) and os.path.exists(resume_data_path):
@@ -235,8 +244,9 @@ def get_grain_loader(
                     state = json.load(f)
                     dataset_idx = state.get("dataset_idx", 0)
                     sample_idx = state.get("sample_idx", 0)
+                    hf_state = state.get("hf_state")
                 print(
-                    f"Resuming HF stream from dataset {dataset_idx}, sample {sample_idx}"
+                    f"Resuming HF stream from dataset {dataset_idx}, sample {sample_idx} (using state_dict)"
                 )
             except Exception as e:
                 print(f"Failed to load resume state: {e}")
@@ -264,7 +274,7 @@ def get_grain_loader(
             for path, col in zip(hf_datasets, text_columns)
         ]
         source = SequentialSource(
-            sources, dataset_idx=dataset_idx, sample_idx=sample_idx
+            sources, dataset_idx=dataset_idx, hf_state=hf_state
         )
 
         transform = TokenizeTransform(tokenizer, max_length=seq_len)

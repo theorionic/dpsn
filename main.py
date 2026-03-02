@@ -507,8 +507,9 @@ def main():
                 if hasattr(grain_loader, "get_state"):
                     import json
 
+                    state_dict = grain_loader.get_state()
                     with open(args.resume_data_path, "w") as f:
-                        json.dump(grain_loader.get_state(), f)
+                        json.dump(state_dict, f)
 
             if step % 10 == 0:
                 ppl = jnp.exp(loss)
@@ -570,8 +571,9 @@ def main():
             if hasattr(grain_loader, "get_state"):
                 import json
 
+                state_dict = grain_loader.get_state()
                 with open(args.resume_data_path, "w") as f:
-                    json.dump(grain_loader.get_state(), f)
+                    json.dump(state_dict, f)
 
     # Generation Test
     print("\nVerifying model generation...")
