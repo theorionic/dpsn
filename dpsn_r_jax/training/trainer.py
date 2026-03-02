@@ -36,7 +36,11 @@ def create_train_state(rng, config, learning_rate_fn=None):
         learning_rate_fn = create_constant_schedule(config.learning_rate)
 
     # Pass the schedule directly so the optimizer decays LR each step
-    tx = optax.adamw(learning_rate=learning_rate_fn)
+    # Gradient clipping prevents training instability from large gradient spikes
+    tx = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adamw(learning_rate=learning_rate_fn)
+    )
     opt_state = tx.init(dense_params)
 
     pool_m = jnp.zeros_like(pool_params)
@@ -114,9 +118,15 @@ def train_step(state, batch, pad_token_id=0):
     v_slice = state.pool_v[safe_indices]
 
     current_lr = state.learning_rate_fn(state.step + 1)
+    
+    # Clip pool gradients for stability (same principle as dense gradient clipping)
+    pool_grad_norm = jnp.sqrt(jnp.sum(pool_grads**2) + 1e-9)
+    pool_grad_scale = jnp.minimum(1.0, 1.0 / pool_grad_norm)
+    clipped_g_slice = g_slice * pool_grad_scale
+    
     new_p_s, new_m_s, new_v_s = sparse_adam_update(
         p_slice,
-        g_slice,
+        clipped_g_slice,
         m_slice,
         v_slice,
         state.step + 1,

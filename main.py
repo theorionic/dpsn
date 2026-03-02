@@ -318,7 +318,11 @@ def main():
     )
 
     # Initialize optimizer with the LR schedule so it decays properly each step
-    tx = optax.adamw(lr_schedule)
+    # Gradient clipping prevents training instability from large gradient spikes
+    tx = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adamw(lr_schedule)
+    )
     opt_state = tx.init(dense_params)
 
     pool_m = jnp.zeros_like(pool_params)
