@@ -68,9 +68,25 @@ class HFStreamSource:
         if self._dataset is None:
             import datasets
 
-            self._dataset = datasets.load_dataset(
-                self.path, name=self.name, split=self.split, streaming=True
-            )
+            try:
+                self._dataset = datasets.load_dataset(
+                    self.path, name=self.name, split=self.split, streaming=True
+                )
+            except ValueError as e:
+                if "Bad split" in str(e):
+                    # Try to fall back to the first available split if the requested one doesn't exist
+                    builder = datasets.load_dataset_builder(self.path, name=self.name)
+                    splits = list(builder.info.splits.keys())
+                    if splits:
+                        print(f"Split '{self.split}' not found. Falling back to '{splits[0]}'")
+                        self.split = splits[0]
+                        self._dataset = datasets.load_dataset(
+                            self.path, name=self.name, split=self.split, streaming=True
+                        )
+                    else:
+                        raise e
+                else:
+                    raise e
         return self._dataset
 
     def __iter__(self):
