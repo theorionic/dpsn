@@ -95,7 +95,7 @@ def _get_forward_fn(state, batch_size: int, seq_len: int):
 
         # Static apply function (won't change identity between steps)
         # Type(state) is typically a frozen dataclass, we get the unbound function
-        unbound_apply_fn = state.__class__.apply_fn
+        unbound_apply_fn = state.apply_fn
         
         @partial(jax.jit, static_argnums=(0,))
         def forward_fn(apply_fn, params, input_ids):
