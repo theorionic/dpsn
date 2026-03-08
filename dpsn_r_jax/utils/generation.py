@@ -63,10 +63,9 @@ def _sample_token(
     return jax.random.categorical(rng, scaled_logits)
 
 
-# Cached forward function - JIT'd once per (state, batch_shape, seq_len) combination
+# Cached forward function - JIT'd once per (state_shape, batch_shape, seq_len) combination
 _CACHED_FORWARD_FN = {}
 _CACHE_KEY = None
-
 
 def _get_forward_fn(state, batch_size: int, seq_len: int):
     """Get or create a JIT-compiled forward function for the given shape.
@@ -75,6 +74,15 @@ def _get_forward_fn(state, batch_size: int, seq_len: int):
     forward pass so we don't recompile for the same shape.
     """
     global _CACHED_FORWARD_FN, _CACHE_KEY
+
+    # The critical fix for XLA recompilation: JAX checks the identity/structure 
+    # of the function being jitted. When `apply_fn` is bound to the `state` object, 
+    # and the `state` object changes every training step (e.g. state = state.apply_gradients(...)), 
+    # the closure captures a *new* apply_fn object identity, causing a cache miss and recompilation.
+    # To fix this, we don't capture `state.apply_fn` in the closure. We pass it as a static argument,
+    # or rely on the fact that `state.apply_fn` is usually a method of the underlying Flax module
+    # which we can extract statically.
+    # We use a trick: cache the jitted function globally, but extract apply_fn here.
 
     cache_key = (batch_size, seq_len)
 
@@ -85,19 +93,21 @@ def _get_forward_fn(state, batch_size: int, seq_len: int):
     if cache_key not in _CACHED_FORWARD_FN:
         _log_compilation(f"Compiling forward pass for shape ({batch_size}, {seq_len})")
 
-        # Bind apply_fn directly to the closure to prevent recompilations
-        # caused by the `state` object being recreated dynamically by optax
-        apply_fn = state.apply_fn
-        @jax.jit
-        def forward_fn(params, input_ids):
+        # Static apply function (won't change identity between steps)
+        # Type(state) is typically a frozen dataclass, we get the unbound function
+        unbound_apply_fn = state.__class__.apply_fn
+        
+        @partial(jax.jit, static_argnums=(0,))
+        def forward_fn(apply_fn, params, input_ids):
             print("Compiling generation forward_fn for XLA...", flush=True)
             _log_compilation(f"Forward pass JIT executing for shape {input_ids.shape}")
+            # apply_fn expects (self, variables, *args)
             logits, aux = apply_fn(
-                {"params": params}, input_ids, deterministic=True
+                state, {"params": params}, input_ids, deterministic=True
             )
             return logits, aux
 
-        _CACHED_FORWARD_FN[cache_key] = forward_fn
+        _CACHED_FORWARD_FN[cache_key] = (forward_fn, unbound_apply_fn)
     else:
         _log_compilation(
             f"Using cached forward pass for shape ({batch_size}, {seq_len})"
@@ -108,7 +118,7 @@ def _get_forward_fn(state, batch_size: int, seq_len: int):
 def clear_generation_cache():
     """Clear compiled generation functions from XLA device memory to avoid OOM."""
     global _CACHED_FORWARD_FN, _CACHE_KEY
-    for cache_key, fn in _CACHED_FORWARD_FN.items():
+    for cache_key, (fn, _) in _CACHED_FORWARD_FN.items():
         if hasattr(fn, "clear_cache"):
             fn.clear_cache()
     _CACHED_FORWARD_FN.clear()
@@ -213,7 +223,7 @@ def generate_fast(
     num_generated = 0  # Python int to track count (not in JAX computation graph)
 
     # Get JIT'd forward function for fixed shape (1, max_seq_len)
-    forward_fn = _get_forward_fn(state, batch_size=1, seq_len=max_seq_len)
+    forward_fn, apply_fn = _get_forward_fn(state, batch_size=1, seq_len=max_seq_len)
 
     for step in range(max_len):
         current_len = prompt_len + step
@@ -227,7 +237,7 @@ def generate_fast(
         )
 
         # Call cached JIT function (SAME SHAPE EVERY TIME)
-        logits, _ = forward_fn(state.params, token_buffer)
+        logits, _ = forward_fn(apply_fn, state.params, token_buffer)
 
         # Get logits for last actual token (not padded position)
         next_logits = logits[0, current_len - 1, :]

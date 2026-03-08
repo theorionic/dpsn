@@ -163,7 +163,7 @@ def create_finetune_state(
     return state
 
 
-@jax.jit
+@jax.jit(donate_argnums=(0,))
 def finetune_step(
     state: FineTuneState,
     batch: Dict[str, jnp.ndarray],

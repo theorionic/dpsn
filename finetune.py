@@ -656,7 +656,7 @@ def main():
     # Training loop
     print("\nStarting training...")
     global_step = state.step
-    accumulated_loss = 0.0
+    accumulated_loss = jnp.array(0.0)
     checkpoint_history = []
 
     for epoch in range(num_epochs):
@@ -687,33 +687,35 @@ def main():
             # Training step
             state, loss = finetune_step(state, batch_jax, pad_token_id)
 
-            # Gradient accumulation
-            accumulated_loss += float(loss)
+                # Gradient accumulation
+                accumulated_loss += loss
 
-            if (step + 1) % args.gradient_accumulation_steps == 0:
-                avg_loss = accumulated_loss / args.gradient_accumulation_steps
-                accumulated_loss = 0.0
-                global_step += 1
+                if (step + 1) % args.gradient_accumulation_steps == 0:
+                    avg_loss = accumulated_loss / args.gradient_accumulation_steps
+                    accumulated_loss = jnp.array(0.0)
+                    global_step += 1
 
-                epoch_loss += avg_loss
-                epoch_steps += 1
+                    epoch_loss += avg_loss
+                    epoch_steps += 1
 
-                # Logging
-                if global_step % args.logging_steps == 0:
-                    current_lr = lr_schedule(global_step)
-                    perplexity = compute_perplexity(avg_loss)
+                    # Logging
+                    if global_step % args.logging_steps == 0:
+                        # Only wait for GPU block here when logging instead of every step
+                        avg_loss_float = float(avg_loss)
+                        current_lr = lr_schedule(global_step)
+                        perplexity = compute_perplexity(avg_loss_float)
 
-                    print(
-                        f"Epoch {epoch + 1}/{num_epochs} | Step {global_step}/{total_steps} | "
-                        f"Loss: {avg_loss:.4f} | PPL: {perplexity:.2f} | LR: {current_lr:.2e}"
-                    )
-
-                    if writer:
-                        writer.add_scalar("train/loss", avg_loss, global_step)
-                        writer.add_scalar("train/perplexity", perplexity, global_step)
-                        writer.add_scalar(
-                            "train/learning_rate", current_lr, global_step
+                        print(
+                            f"Epoch {epoch + 1}/{num_epochs} | Step {global_step}/{total_steps} | "
+                            f"Loss: {avg_loss_float:.4f} | PPL: {perplexity:.2f} | LR: {current_lr:.2e}"
                         )
+
+                        if writer:
+                            writer.add_scalar("train/loss", avg_loss_float, global_step)
+                            writer.add_scalar("train/perplexity", perplexity, global_step)
+                            writer.add_scalar(
+                                "train/learning_rate", current_lr, global_step
+                            )
 
                 # Evaluation
                 has_eval = (eval_loader is not None and eval_loader.has_validation) or (
@@ -770,26 +772,46 @@ def main():
                     and global_step % args.generation_steps == 0
                     and args.generation_prompts
                 ):
-                    _run_generation(
-                        state=state,
-                        tokenizer=tokenizer,
-                        prompts=args.generation_prompts,
-                        max_len=args.generation_max_len,
-                        max_seq_len=args.max_seq_length,
-                        temperature=args.generation_temperature,
-                        top_k=args.generation_top_k,
-                        global_step=global_step,
-                        rng=rng,
-                    )
-                    rng, _ = random.split(rng)  # Update RNG for next generation
-                    clear_generation_cache()  # Free XLA memory to avoid OOM in backward pass
+                    try:
+                        from dpsn_r_jax.utils.async_tasks import submit_generation_task
+                        
+                        # Use background thread for generation 
+                        submit_generation_task(
+                            _run_generation,
+                            state=state,
+                            tokenizer=tokenizer,
+                            prompts=args.generation_prompts,
+                            max_len=args.generation_max_len,
+                            max_seq_len=args.max_seq_length,
+                            temperature=args.generation_temperature,
+                            top_k=args.generation_top_k,
+                            global_step=global_step,
+                            rng=rng,
+                        )
+                        print(f"[Async] Queued sample generation for step {global_step} in background.")
+                    except ImportError:
+                        # Fallback
+                        _run_generation(
+                            state=state,
+                            tokenizer=tokenizer,
+                            prompts=args.generation_prompts,
+                            max_len=args.generation_max_len,
+                            max_seq_len=args.max_seq_length,
+                            temperature=args.generation_temperature,
+                            top_k=args.generation_top_k,
+                            global_step=global_step,
+                            rng=rng,
+                        )
+                        clear_generation_cache()  # Free XLA memory to avoid OOM in backward pass
                     
+                    rng, _ = random.split(rng)  # Update RNG for next generation
+
                 # Checkpoint saving
                 if global_step % args.save_steps == 0:
                     checkpoint_dir = os.path.join(
                         args.output_dir, f"checkpoint_{global_step}"
                     )
-                    save_checkpoint(checkpoint_dir, state, int(global_step))
+                    save_checkpoint(checkpoint_dir, state, int(global_step), async_save=True)
                     checkpoint_history.append(global_step)
 
                     # Remove old checkpoints
@@ -821,6 +843,14 @@ def main():
 
     if writer:
         writer.close()
+
+    # Wait for any pending async tasks (generation and checkpoint saving)
+    try:
+        from dpsn_r_jax.utils.async_tasks import wait_for_all_tasks
+        print("\nWaiting for background tasks to finish...")
+        wait_for_all_tasks()
+    except ImportError:
+        pass
 
 
 if __name__ == "__main__":

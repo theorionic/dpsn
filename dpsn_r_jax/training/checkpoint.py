@@ -113,6 +113,7 @@ def save_checkpoint(
     state: train_state.TrainState,
     step: int,
     max_to_keep: int = 3,
+    async_save: bool = False,
 ) -> None:
     """Save a training state checkpoint.
 
@@ -121,12 +122,24 @@ def save_checkpoint(
         state: Training state to save.
         step: Current training step.
         max_to_keep: Maximum number of checkpoints to keep.
+        async_save: Whether to save in a background thread to avoid blocking.
     """
-    mgr = create_checkpoint_manager(checkpoint_dir, max_to_keep=max_to_keep)
-    mgr.save(step, state)
-    mgr.wait_until_finished()
+    def _do_save():
+        mgr = create_checkpoint_manager(checkpoint_dir, max_to_keep=max_to_keep)
+        mgr.save(step, state)
+        mgr.wait_until_finished()
+        logging.info(f"Saved checkpoint at step {step} to {checkpoint_dir}")
 
-    logging.info(f"Saved checkpoint at step {step} to {checkpoint_dir}")
+    if async_save:
+        try:
+            from dpsn_r_jax.utils.async_tasks import submit_checkpoint_task
+            submit_checkpoint_task(_do_save)
+            logging.info(f"Queued background checkpoint save for step {step}")
+        except ImportError:
+            logging.warning("Could not import async_tasks, falling back to sync save.")
+            _do_save()
+    else:
+        _do_save()
 
 
 def load_checkpoint(
