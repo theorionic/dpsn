@@ -298,7 +298,7 @@ def main():
     )
 
     # Create TrainState (using the sharded variables)
-    from dpsn_r_jax.training.trainer import TrainState
+    from dpsn_r_jax.training.trainer import TrainState, _make_sigma_anneal_fn
     from dpsn_r_jax.training.lr_schedules import get_scheduler
     from flax import traverse_util
 
@@ -334,6 +334,11 @@ def main():
     pool_m = jnp.zeros_like(pool_params)
     pool_v = jnp.zeros_like(pool_params)
 
+    sigma_target_ratio = config.sigma_target / max(config.sigma_max, 1e-8)
+    sigma_anneal_fn = _make_sigma_anneal_fn(
+        getattr(config, 'sigma_anneal_steps', 0), sigma_target_ratio
+    )
+
     state = TrainState(
         step=0,
         apply_fn=model.apply,
@@ -345,6 +350,7 @@ def main():
         pool_v=pool_v,
         window_size=config.max_k,
         learning_rate_fn=lr_schedule,
+        sigma_anneal_fn=sigma_anneal_fn,
     )
 
     # RESTORE CHECKPOINT IF REQUESTED
