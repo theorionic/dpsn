@@ -101,9 +101,9 @@ def _get_forward_fn(state, batch_size: int, seq_len: int):
         def forward_fn(apply_fn, params, input_ids):
             print("Compiling generation forward_fn for XLA...", flush=True)
             _log_compilation(f"Forward pass JIT executing for shape {input_ids.shape}")
-            # apply_fn expects (self, variables, *args)
+            # apply_fn is bound to model.apply, so it takes variables as first arg
             logits, aux = apply_fn(
-                state, {"params": params}, input_ids, deterministic=True
+                {"params": params}, input_ids, deterministic=True
             )
             return logits, aux
 
