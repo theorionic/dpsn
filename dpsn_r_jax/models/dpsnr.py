@@ -3,7 +3,11 @@ import jax.numpy as jnp
 import flax.linen as nn
 from dpsn_r_jax.config import DPSNRConfig, PoolConfig
 from dpsn_r_jax.models.controller import TinyController
-from dpsn_r_jax.models.memory import CoordinateMassivePool, LearnedIndexer
+from dpsn_r_jax.models.memory import (
+    CoordinateMassivePool,
+    CoordinateMassivePool2D,
+    LearnedIndexer,
+)
 from dpsn_r_jax.models.reasoning import AdaptiveComputeController
 
 
@@ -27,12 +31,27 @@ class DPSNR(nn.Module):
             sigma_min=self.config.sigma_min,
             sigma_max=self.config.sigma_max,
         )
-        self.pool = CoordinateMassivePool(
-            PoolConfig(
-                self.config.pool_total_vectors, self.config.controller_hidden_dim
-            ),
-            window_size=self.config.max_k,
-        )
+
+        # ── Pool selection: 1D (flat) or 2D (grid) ────────────────────────────
+        if self.config.use_2d_pool:
+            # 2D Grid Pool: each coordinate only needs 1/sqrt(N) precision.
+            # The window_size here is per-axis; total retrieved = max_k × max_k.
+            axis_window = max(2, int(self.config.max_k ** 0.5))
+            self.pool = CoordinateMassivePool2D(
+                rows=self.config.pool_grid_rows,
+                cols=self.config.pool_grid_cols,
+                hidden_dim=self.config.controller_hidden_dim,
+                window_size=axis_window,
+            )
+        else:
+            self.pool = CoordinateMassivePool(
+                PoolConfig(
+                    self.config.pool_total_vectors,
+                    self.config.controller_hidden_dim,
+                ),
+                window_size=self.config.max_k,
+            )
+
         self.acc = acc_cls(
             self.config.controller_hidden_dim,
             self.config.max_reasoning_loops,
@@ -47,9 +66,23 @@ class DPSNR(nn.Module):
             ]
         )
 
-    def __call__(self, input_ids, deterministic=True):
+    def __call__(self, input_ids, deterministic=True, sigma_max_scale: float = 1.0):
+        """
+        Args:
+            input_ids:        (B, T) integer token ids.
+            deterministic:    Set False during training (enables dropout).
+            sigma_max_scale:  Sigma annealing multiplier ∈ (0, 1].
+                              Pass via trainer's sigma_anneal_fn; 1.0 at step 0,
+                              decreasing to ~0.01 at sigma_anneal_steps.
+                              Shrinks the effective sigma_max so routing becomes
+                              progressively more precise without param changes.
+
+        Returns:
+            logits:       (B, T, vocab)
+            aux:          (max_loops, all_indices, mean_sigma)
+                          mean_sigma is logged and used for precision loss.
+        """
         # 1. Encode
-        # Use __call__ to support rematerialization if enabled
         hidden = self.controller(input_ids, deterministic=deterministic)
 
         # 2. Reasoning Loop
@@ -59,80 +92,107 @@ class DPSNR(nn.Module):
         halt_prob = jnp.zeros((B, T, 1))
         halted_mask = jnp.zeros((B, T, 1))
 
-        # Initialize sub-modules before scan to avoid UnexpectedTracerError
-        # (JAX transformations like scan/jit do not allow parameter creation inside)
-        _ = self.indexer(jnp.zeros((B, T, D)))               # (B,T,D) for attn-pooled indexer
-        _ = self.pool(jnp.zeros((B,)), jnp.zeros((B,)))      # pool still takes per-head (B,)
+        # ── Warm-up calls: force Flax to trace all sub-modules before scan ────
+        _mu, _sigma = self.indexer(
+            jnp.zeros((B, T, D)), sigma_max_scale=sigma_max_scale
+        )
+        if self.config.use_2d_pool:
+            H = self.config.num_indexer_heads
+            # For 2D pool, indexer outputs _mu (B, H) for row and col alternating.
+            # Use half-heads for row, half for col.
+            h_per_dim = max(1, H // 2)
+            _ = self.pool(
+                jnp.zeros((B,)), jnp.zeros((B,)), jnp.zeros((B,))
+            )
+        else:
+            _ = self.pool(jnp.zeros((B,)), jnp.zeros((B,)))
         _ = self.retrieval_integrator(
             jnp.zeros((B, T, D + self.config.controller_hidden_dim))
         )
         _ = self.acc(state_hidden, state_hidden, 0, halt_prob, halted_mask)
 
-        # We use a functional scan for reasoning steps to support easy checkpointing
+        use_2d = self.config.use_2d_pool
+        H = self.config.num_indexer_heads
+
         def reasoning_step(carry, i):
             s_hidden, h_prob, h_mask = carry
             prev_s_hidden = s_hidden
-            H = self.config.num_indexer_heads
 
-            # ── 1. Attention-pooled multi-head indexing ─────────────────────────
-            # LearnedIndexer now takes the full (B, T, D) sequence and does
-            # attention pooling internally, returning (B, H) coordinates.
-            mu, sigma = self.indexer(s_hidden)  # (B, H), (B, H)
+            # ── 1. Multi-head indexing with runtime sigma scale ─────────────
+            mu, sigma = self.indexer(s_hidden, sigma_max_scale=sigma_max_scale)
+            # mu: (B, H), sigma: (B, H)
 
-            # ── 2. Per-head pool retrieval ────────────────────────────────
-            # Python loop is unrolled at JAX trace time (H is a static int),
-            # so XLA sees a fixed computation graph regardless of num_heads.
+            # ── 2. Per-head pool retrieval ────────────────────────────────────
             all_retrieved = []
             all_start_indices = []
-            for h in range(H):
-                retrieved_h, start_idx_h = self.pool(mu[:, h], sigma[:, h])
-                all_retrieved.append(retrieved_h)      # (B, D)
-                all_start_indices.append(start_idx_h) # (B,)
 
-            # Average across heads → (B, D).
-            # Downstream (retrieval_integrator, ACC) remain completely unchanged.
-            retrieved = jnp.mean(jnp.stack(all_retrieved, axis=1), axis=1)  # (B, D)
+            if use_2d:
+                # 2D pool: each head supplies (mu_row, mu_col) from consecutive
+                # pairs of heads. If H=1 reuse same coord for row and col.
+                heads_per_dim = max(1, H // 2)
+                for h in range(heads_per_dim):
+                    h_row = h
+                    h_col = min(h + heads_per_dim, H - 1)
+                    # Use same sigma across both axes (mean of the two heads)
+                    sigma_h = (sigma[:, h_row] + sigma[:, h_col]) / 2.0
+                    retrieved_h, start_idx_h = self.pool(
+                        mu[:, h_row], mu[:, h_col], sigma_h
+                    )
+                    all_retrieved.append(retrieved_h)
+                    all_start_indices.append(start_idx_h)
+            else:
+                for h in range(H):
+                    retrieved_h, start_idx_h = self.pool(mu[:, h], sigma[:, h])
+                    all_retrieved.append(retrieved_h)
+                    all_start_indices.append(start_idx_h)
 
-            # Concatenate indices from every head → (H*B,).
-            # When H=1 this is just (B,) — fully backward-compatible with trainer.py.
-            # trainer.py's Sparse Adam naturally handles the larger index set.
-            start_indices = jnp.concatenate(all_start_indices, axis=0)  # (H*B,)
+            # Average retrieved vectors across heads → (B, D)
+            retrieved = jnp.mean(jnp.stack(all_retrieved, axis=1), axis=1)
 
-            # ── 3. Integrate retrieved knowledge & update hidden state ───────
+            # Concatenate start indices across heads → sparse Adam can update all
+            start_indices = jnp.concatenate(all_start_indices, axis=0)   # (heads*B,)
+
+            # ── Mean sigma for logging and precision loss ─────────────────────
+            mean_sigma_step = jnp.mean(sigma)   # scalar
+
+            # ── 3. Integrate retrieved knowledge ───────────────────────────────
             retrieved_expanded = jnp.expand_dims(retrieved, 1).repeat(T, axis=1)
-
             combined = jnp.concatenate([s_hidden, retrieved_expanded], axis=-1)
             integrated = self.retrieval_integrator(combined)
 
-            # Step (ACC is already rematerialized if requested)
+            # ── 4. ACC: accumulate state and decide whether to halt ────────────
             new_s_hidden, h_prob, new_h_mask = self.acc(
                 s_hidden,
-                s_hidden + integrated,  # input to accumulation
+                s_hidden + integrated,
                 i,
                 h_prob,
                 h_mask,
             )
 
-            # Mask format: (B, T, 1) -> Broadcast to (B, T, D)
             update_mask = 1.0 - h_mask
             s_hidden = update_mask * new_s_hidden + h_mask * prev_s_hidden
 
-            return (s_hidden, h_prob, new_h_mask), start_indices
+            return (s_hidden, h_prob, new_h_mask), (start_indices, mean_sigma_step)
 
-        # Checkpoint the scan body if requested
         if self.config.gradient_checkpointing:
             reasoning_step = jax.checkpoint(reasoning_step)
 
         init_carry = (state_hidden, halt_prob, halted_mask)
-        (state_hidden, halt_prob, halted_mask), all_indices = jax.lax.scan(
-            reasoning_step,
-            init_carry,
-            jnp.arange(self.config.max_reasoning_loops),
+        (state_hidden, halt_prob, halted_mask), (all_indices, sigma_per_loop) = (
+            jax.lax.scan(
+                reasoning_step,
+                init_carry,
+                jnp.arange(self.config.max_reasoning_loops),
+            )
         )
 
         # 3. Decode
         logits = self.controller.decode(state_hidden)
 
-        # Transpose all_indices from (max_loops, B) to (B, max_loops)
+        # all_indices: (max_loops, heads*B) → transpose to (B*heads, max_loops)
         all_indices = jnp.transpose(all_indices, (1, 0))
-        return logits, (self.config.max_reasoning_loops, all_indices)
+
+        # mean_sigma averaged across all reasoning loops
+        mean_sigma = jnp.mean(sigma_per_loop)
+
+        return logits, (self.config.max_reasoning_loops, all_indices, mean_sigma)

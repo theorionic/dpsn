@@ -85,6 +85,24 @@ class DPSNRConfig:
     sigma_max: float = 5.0          # Maximum retrieval bandwidth (broad/soft)
     finetune: Optional[FineTuningConfig] = None
 
+    # ── Precision Routing ──────────────────────────────────────────────────
+    # 2D Grid Pool: instead of (N, D), pool is (rows, cols, D).
+    # Precision per coordinate: 1/sqrt(N) instead of 1/N  → huge improvement.
+    use_2d_pool: bool = False
+    pool_grid_rows: int = 512   # rows × cols must equal pool_total_vectors
+    pool_grid_cols: int = 512
+
+    # Sigma annealing: sigma_max decays from its initial value to sigma_target
+    # over sigma_anneal_steps training steps.  0 disables annealing.
+    # Effect: routing starts broad (easy to learn), ends precise (accurate retrieval).
+    sigma_anneal_steps: int = 0
+    sigma_target: float = 0.05
+
+    # Precision auxiliary loss: small weight penalising large sigma values.
+    # The model is rewarded for using precise, narrow retrievals.
+    # weight is linearly ramped from 0 → precision_loss_weight over sigma_anneal_steps.
+    precision_loss_weight: float = 0.0
+
     @classmethod
     def from_yaml(cls, path: str) -> "DPSNRConfig":
         import yaml
@@ -107,6 +125,10 @@ def get_model_config(name: str) -> DPSNRConfig:
     - base: ~125M params (TPU v3-8 / GPU)
     - large: ~350M params (TPU Pod Slice)
     - xl: ~1B params (Large TPU Pod - Massive Pool)
+
+    Precision-routing variants (same param count, better pool addressing):
+    - precise_tiny:  tiny  + 2D pool + sigma annealing (for quick experiments)
+    - precise_large: large + 2D pool + sigma annealing + precision loss
     """
     if name == "tiny":
         return DPSNRConfig(
@@ -166,6 +188,66 @@ def get_model_config(name: str) -> DPSNRConfig:
             pool_hidden_dim=1024,
             max_reasoning_loops=8,
             learning_rate=2e-4,
+        )
+
+    # ── Precision Routing Variants ─────────────────────────────────────────────
+    elif name == "precise_tiny":
+        return DPSNRConfig(
+            # Same capacity as tiny, but with full precision routing stack
+            vocab_size=24,
+            controller_hidden_dim=32,
+            controller_num_layers=2,
+            controller_num_heads=2,
+            controller_ff_multiplier=2.0,
+            max_seq_len=64,
+            dropout=0.0,
+            pool_total_vectors=100,    # 10×10 grid when use_2d_pool=True
+            pool_hidden_dim=32,
+            librarian_hidden_dim=16,
+            max_reasoning_loops=2,
+            halt_threshold=0.5,
+            min_k=2,
+            max_k=10,
+            learning_rate=1e-3,
+            num_indexer_heads=2,
+            sigma_min=0.01,
+            sigma_max=5.0,             # starts broad
+            # 2D pool: 10×10 = 100 vectors; 10x easier to address precisely
+            use_2d_pool=True,
+            pool_grid_rows=10,
+            pool_grid_cols=10,
+            # Sigma annealing: broad → precise over 5 000 steps
+            sigma_anneal_steps=5_000,
+            sigma_target=0.05,
+            # Precision loss: penalise large sigma (ramped in over annealing period)
+            precision_loss_weight=0.01,
+        )
+
+    elif name == "precise_large":
+        return DPSNRConfig(
+            # Same 340M params as large, but with full precision routing
+            vocab_size=50257,
+            controller_hidden_dim=768,
+            controller_num_layers=12,
+            controller_num_heads=12,
+            max_seq_len=1024,
+            pool_total_vectors=262144,
+            pool_hidden_dim=768,
+            max_reasoning_loops=6,
+            learning_rate=3e-4,
+            num_indexer_heads=4,
+            sigma_min=0.01,
+            sigma_max=5.0,
+            # 2D pool: 512×512 = 262 144 vectors
+            # Each coordinate only needs 1/512 ≈ 0.2% precision (vs 1/262144 = 0.0004%)
+            use_2d_pool=True,
+            pool_grid_rows=512,
+            pool_grid_cols=512,
+            # Anneal sigma over first 50 000 steps: broad → precise routing
+            sigma_anneal_steps=50_000,
+            sigma_target=0.05,
+            # Precision loss: small penalty on broad sigma
+            precision_loss_weight=0.01,
         )
 
     else:

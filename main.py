@@ -63,8 +63,14 @@ def main():
         "--config",
         type=str,
         default="base",
-        choices=["tiny", "base", "large", "xl"],
-        help="Model configuration size",
+        choices=["tiny", "base", "large", "xl", "precise_tiny", "precise_large"],
+        help="Model configuration size (precise_* variants enable 2D pool + sigma annealing)",
+    )
+    parser.add_argument(
+        "--sigma_anneal_steps",
+        type=int,
+        default=None,
+        help="Override sigma annealing steps (0 = disabled; default from config)",
     )
     parser.add_argument(
         "--epochs", type=int, default=1, help="Number of training epochs"
@@ -476,7 +482,11 @@ def main():
             batch = jax.device_put(batch, batch_sharding)
 
             start_time = time.time()
-            state, loss = distributed_train_step(state, batch, config.pad_token_id)
+            state, loss, mean_sigma = distributed_train_step(
+                state, batch, config.pad_token_id,
+                precision_loss_weight=getattr(config, 'precision_loss_weight', 0.0),
+                sigma_anneal_steps=getattr(config, 'sigma_anneal_steps', 0),
+            )
             loss.block_until_ready()
             step_time = time.time() - start_time
 
@@ -493,6 +503,10 @@ def main():
             writer.add_scalar("Perf/TFLOPS", tflops, global_step)
             current_lr = state.learning_rate_fn(global_step)
             writer.add_scalar("LR", current_lr, global_step)
+            # Precision routing metrics
+            writer.add_scalar("Routing/mean_sigma", float(mean_sigma), global_step)
+            sigma_scale = float(state.sigma_anneal_fn(global_step))
+            writer.add_scalar("Routing/sigma_scale", sigma_scale, global_step)
 
             # Save Checkpoint
             if (
@@ -513,8 +527,13 @@ def main():
 
             if step % 10 == 0:
                 ppl = jnp.exp(loss)
+                sigma_scale = float(state.sigma_anneal_fn(global_step))
+                precision_tag = "broad" if float(mean_sigma) > 1.0 else ("precise" if float(mean_sigma) < 0.1 else "narrowing")
                 print(
-                    f"Epoch {epoch + 1} | Step {step} | Global Step {global_step} | Loss: {loss:.4f} | PPL: {ppl:.4f} | LR: {current_lr:.2e} | TPS: {tokens_per_sec:.0f} | TFLOPS: {tflops:.4f}"
+                    f"Epoch {epoch + 1} | Step {step} | Global Step {global_step} | "
+                    f"Loss: {loss:.4f} | PPL: {ppl:.4f} | LR: {current_lr:.2e} | "
+                    f"sigma={float(mean_sigma):.3f} ({precision_tag}) | scale={sigma_scale:.3f} | "
+                    f"TPS: {tokens_per_sec:.0f} | TFLOPS: {tflops:.4f}"
                 )
 
             # Periodic Generation
