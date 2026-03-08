@@ -460,9 +460,9 @@ def main():
 
     from dpsn_r_jax.training.trainer import train_step
 
-    # JIT the train step - XLA automatically handles the communication!
+    # train_step is already JIT-compiled with static_argnames in trainer.py!
     # We just need to ensure inputs are sharded correctly before entering.
-    distributed_train_step = jax.jit(train_step)
+    distributed_train_step = train_step
 
     flops_per_step = calculate_flops(config, args.batch_size)
     steps_per_epoch = max(1, args.dataset_size // args.batch_size)
