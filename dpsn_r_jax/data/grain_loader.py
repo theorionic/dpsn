@@ -159,6 +159,14 @@ class HFStreamLoader:
             if "text" in item:
                 item = self.transform.map(item)
                 batch.append(item)
+            elif "input_ids" in item:
+                # If it's already tokenized, just append it but ensure it's a numpy array
+                if not isinstance(item["input_ids"], np.ndarray):
+                    item["input_ids"] = np.array(item["input_ids"], dtype=np.int32)
+                batch.append(item)
+            else:
+                # If we cannot process it, we should probably warn, but for now we skip
+                pass
 
             if len(batch) == self.batch_size:
                 collated = {}

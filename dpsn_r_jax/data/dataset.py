@@ -144,11 +144,17 @@ class BackgroundGenerator:
             try:
                 batch = self.dataset.get_batch(self.batch_size)
                 self.queue.put(batch)
-            except Exception:
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                self.queue.put(e)
                 break
 
     def get_batch(self, batch_size=None):
-        return self.queue.get()
+        res = self.queue.get()
+        if isinstance(res, Exception):
+            raise res
+        return res
 
     def stop(self):
         self.stop_event.set()
