@@ -475,6 +475,8 @@ def main():
     tokens_per_sec = 0.0
     tflops = 0.0
 
+    start_time = time.time()
+
     for epoch in range(args.epochs):
         epoch_loss = 0
 
@@ -490,7 +492,6 @@ def main():
             # (Batch, SeqLen) -> split Batch across 'shard' axis
             batch = jax.device_put(batch, batch_sharding)
 
-            start_time = time.time() if step % 10 == 0 else start_time
             state, loss, mean_sigma = distributed_train_step(
                 state, batch, config.pad_token_id,
                 precision_loss_weight=getattr(config, 'precision_loss_weight', 0.0),
@@ -531,7 +532,8 @@ def main():
 
             if step % 10 == 0:
                 loss.block_until_ready() # synchronize only on printing
-                step_time_10 = time.time() - start_time
+                current_time = time.time()
+                step_time_10 = current_time - start_time
                 avg_step_time = step_time_10 / 10 if step > 0 else step_time_10
                 tokens_per_sec = (args.batch_size * config.max_seq_len) / avg_step_time
                 tflops = flops_per_step / avg_step_time / 1e12
@@ -579,6 +581,10 @@ def main():
                     print(f"Output: {output}")
                 clear_generation_cache()  # Free XLA memory to avoid OOM in backward pass
                 print("---------------------------------------")
+
+            # Reset start_time to measure the next 10 steps purely
+            if step % 10 == 0:
+                start_time = time.time()
 
         if args.max_steps and global_step >= args.max_steps:
             break
