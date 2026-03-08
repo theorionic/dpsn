@@ -77,7 +77,7 @@ def create_train_state(rng, config, learning_rate_fn=None):
     )
 
     return TrainState(
-        step=0,
+        step=jnp.array(0, dtype=jnp.int32),
         apply_fn=model.apply,
         params=params,
         tx=tx,

@@ -382,14 +382,14 @@ def main():
                         if target_path.endswith("default")
                         else target_path
                     )
-                    global_step = int(step_str)
+                    global_step = jnp.array(int(step_str), dtype=jnp.int32)
                 except ValueError:
-                    global_step = 0
+                    global_step = jnp.array(0, dtype=jnp.int32)
             else:
                 print("No checkpoint found to resume from. Starting from scratch.")
-                global_step = 0
+                global_step = jnp.array(0, dtype=jnp.int32)
     else:
-        global_step = 0
+        global_step = jnp.array(0, dtype=jnp.int32)
 
     # Data Loader Initialization
     if args.skip_batches > 0:
