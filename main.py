@@ -472,6 +472,9 @@ def main():
 
     dataset = BackgroundGenerator(dataset, args.batch_size, prefetch_size=5)
 
+    tokens_per_sec = 0.0
+    tflops = 0.0
+
     for epoch in range(args.epochs):
         epoch_loss = 0
 
