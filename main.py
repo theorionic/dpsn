@@ -475,6 +475,8 @@ def main():
     tokens_per_sec = 0.0
     tflops = 0.0
 
+    start_time = time.time()
+
     for epoch in range(args.epochs):
         epoch_loss = 0
 
@@ -490,18 +492,12 @@ def main():
             # (Batch, SeqLen) -> split Batch across 'shard' axis
             batch = jax.device_put(batch, batch_sharding)
 
-            start_time = time.time()
             state, loss, mean_sigma = distributed_train_step(
                 state, batch, config.pad_token_id,
                 precision_loss_weight=getattr(config, 'precision_loss_weight', 0.0),
                 sigma_anneal_steps=getattr(config, 'sigma_anneal_steps', 0),
             )
-            loss.block_until_ready()
-            step_time = time.time() - start_time
-
-            tokens_per_sec = (args.batch_size * config.max_seq_len) / step_time
-            tflops = flops_per_step / step_time / 1e12
-
+            
             epoch_loss += loss
             global_step += 1
 
@@ -535,6 +531,13 @@ def main():
                         json.dump(state_dict, f)
 
             if step % 10 == 0:
+                loss.block_until_ready() # synchronize only on printing
+                current_time = time.time()
+                step_time_10 = current_time - start_time
+                avg_step_time = step_time_10 / 10 if step > 0 else step_time_10
+                tokens_per_sec = (args.batch_size * config.max_seq_len) / avg_step_time
+                tflops = flops_per_step / avg_step_time / 1e12
+                
                 ppl = jnp.exp(loss)
                 sigma_scale = float(state.sigma_anneal_fn(global_step))
                 precision_tag = "broad" if float(mean_sigma) > 1.0 else ("precise" if float(mean_sigma) < 0.1 else "narrowing")
@@ -578,6 +581,10 @@ def main():
                     print(f"Output: {output}")
                 clear_generation_cache()  # Free XLA memory to avoid OOM in backward pass
                 print("---------------------------------------")
+
+            # Reset start_time to measure the next 10 steps purely
+            if step % 10 == 0:
+                start_time = time.time()
 
         if args.max_steps and global_step >= args.max_steps:
             break
