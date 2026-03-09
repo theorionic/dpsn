@@ -39,6 +39,7 @@ from dpsn_r_jax.data.dataset import (
 )
 from dpsn_r_jax.data.tokenizer import get_tokenizer
 from dpsn_r_jax.data.grain_loader import get_grain_loader
+from dpsn_r_jax.data.prefetch import DevicePrefetchIterator
 from dpsn_r_jax.utils.generation import generate, clear_generation_cache
 from dpsn_r_jax.utils.metrics import calculate_flops
 
@@ -480,11 +481,24 @@ def main():
     # Define test samples for generation
     test_samples = ["Sort: 5 2 8 1 ->", "Sort: 10 3 7 ->", "Sort: 1 1 1 ->"]
 
-    dataset = BackgroundGenerator(dataset, args.batch_size, prefetch_size=5)
+    # ── Async double-buffered data pipeline ────────────────────────────────
+    # 1. CPU-side: BackgroundGenerator prefetches 50 batches into a Python queue
+    # 2. GPU/TPU-side: DevicePrefetchIterator runs jax.device_put in a background
+    #    thread, keeping 2 on-device batches ready (double-buffer).
+    # Result: H2D transfer overlaps with compute → TPU never idles for data.
+    cpu_prefetch = BackgroundGenerator(dataset, args.batch_size, prefetch_size=50)
+    dataset = DevicePrefetchIterator(
+        data_source=cpu_prefetch,
+        batch_size=args.batch_size,
+        sharding=batch_sharding,
+        prefetch_depth=2,
+    )
+
+    LOG_INTERVAL = 50  # sync + log every N steps (lower = more sync overhead)
 
     tokens_per_sec = 0.0
     tflops = 0.0
-    total_data_wait_time_10 = 0.0
+    total_data_wait_time_interval = 0.0
 
     start_time = time.time()
 
@@ -501,12 +515,10 @@ def main():
             current_data_wait_time = time.time() - data_start_time
             
             # Accumulate wait time
-            total_data_wait_time_10 += current_data_wait_time
+            total_data_wait_time_interval += current_data_wait_time
 
-            # Shard the batch input!
-            # We must put the batch onto the mesh with the data sharding spec
-            # (Batch, SeqLen) -> split Batch across 'shard' axis
-            batch = jax.device_put(batch, batch_sharding)
+            # Batch is ALREADY on-device (transferred by DevicePrefetchIterator)
+            # No jax.device_put needed here — that's the whole point!
 
             state, loss, mean_sigma = distributed_train_step(
                 state, batch, config.pad_token_id,
@@ -544,13 +556,14 @@ def main():
                     with open(args.resume_data_path, "w") as f:
                         json.dump(state_dict, f)
 
-            if step % 10 == 0:
+            if step % LOG_INTERVAL == 0:
                 loss.block_until_ready() # synchronize only on printing
                 current_time = time.time()
-                step_time_10 = current_time - start_time
+                elapsed = current_time - start_time
                 
-                avg_step_time = step_time_10 / 10 if step > 0 else step_time_10
-                avg_data_wait = total_data_wait_time_10 / 10 if step > 0 else total_data_wait_time_10
+                steps_in_interval = LOG_INTERVAL if step > 0 else 1
+                avg_step_time = elapsed / steps_in_interval
+                avg_data_wait = total_data_wait_time_interval / steps_in_interval
                 
                 # Active TPU time is total time minus the time spent waiting for data feed
                 active_tpu_time = max(0.0001, avg_step_time - avg_data_wait)
@@ -559,7 +572,7 @@ def main():
                 # TFLOPS uniquely should be calculated on ACTIVE TPU time, not wait time
                 tflops = flops_per_step / active_tpu_time / 1e12
                 
-                # Log the performance metrics every 10 steps
+                # Log the performance metrics
                 writer.add_scalar("Perf/TPS", tokens_per_sec, global_step)
                 writer.add_scalar("Perf/TFLOPS", tflops, global_step)
                 writer.add_scalar("Perf/DataWaitTime_s", avg_data_wait, global_step)
@@ -608,10 +621,10 @@ def main():
                 clear_generation_cache()  # Free XLA memory to avoid OOM in backward pass
                 print("---------------------------------------")
 
-            # Reset start_time to measure the next 10 steps purely
-            if step % 10 == 0:
+            # Reset start_time to measure the next interval purely
+            if step % LOG_INTERVAL == 0:
                 start_time = time.time()
-                total_data_wait_time_10 = 0.0
+                total_data_wait_time_interval = 0.0
 
         if args.max_steps and global_step >= args.max_steps:
             break
