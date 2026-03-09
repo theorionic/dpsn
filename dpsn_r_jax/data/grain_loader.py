@@ -12,6 +12,21 @@ import os
 from typing import Optional, Any
 
 
+class NumpySource:
+    def __init__(self, path: str):
+        self.path = path
+        # Memory-map the numpy array to avoid loading it all into RAM at once
+        self.data = np.load(path, mmap_mode='r')
+        self.size = len(self.data)
+        print(f"Loaded {path} with {self.size} pre-tokenized sequences.")
+
+    def __len__(self):
+        return self.size
+
+    def __getitem__(self, idx):
+        # Directly yield the heavily-optimized integer array
+        return {"input_ids": self.data[idx]}
+
 class DummySource:
     def __init__(self, path: str = "dummy", size: int = 1000):
         self.path = path
@@ -314,19 +329,31 @@ def get_grain_loader(
         if not dataset_paths:
             source = DummySource(size=dataset_size)
         elif len(dataset_paths) == 1:
-            source = DummySource(path=dataset_paths[0], size=dataset_size)
+            if dataset_paths[0].endswith('.npy'):
+                source = NumpySource(path=dataset_paths[0])
+            else:
+                source = DummySource(path=dataset_paths[0], size=dataset_size)
         else:
             # Multi-dataset support: concatenate sources
-            sources = [DummySource(path=p, size=dataset_size) for p in dataset_paths]
+            sources = []
+            for p in dataset_paths:
+                if p.endswith('.npy'):
+                    sources.append(NumpySource(path=p))
+                else:
+                    sources.append(DummySource(path=p, size=dataset_size))
             source = ConcatenatedSource(sources)
 
         batch_size = getattr(config, "batch_size", 8)
         start_index = start_step * batch_size
 
-        operations = [
-            TokenizeTransform(tokenizer, max_length=seq_len),
-            grain.Batch(batch_size=batch_size, drop_remainder=True),
-        ]
+        operations = []
+        
+        # Only tokenize if the source doesn't already provide input_ids
+        # (e.g. if we loaded from .npy files, it's already tokenized!)
+        if not any(p.endswith(".npy") for p in (dataset_paths or [])):
+            operations.append(TokenizeTransform(tokenizer, max_length=seq_len))
+            
+        operations.append(grain.Batch(batch_size=batch_size, drop_remainder=True))
 
         worker_count = getattr(config, "num_workers", 4)
         if sys.platform == "darwin":

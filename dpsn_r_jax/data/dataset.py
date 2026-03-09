@@ -1,6 +1,8 @@
 import random
 import threading
 import queue
+import time
+import multiprocessing as mp
 import numpy as np
 import jax.numpy as jnp
 from datasets import load_dataset
@@ -84,6 +86,164 @@ class HFStreamingDataset:
             batch_ids.append(ids)
 
         return np.array(batch_ids)
+
+def _worker_tokenize(worker_id, dataset_name, subset, split, tokenizer_name, seq_len, batch_size, out_queue, stop_event):
+    """
+    Subprocess worker that streams HF dataset and tokenizes aggressively.
+    """
+    import numpy as np
+    from datasets import load_dataset
+    from dpsn_r_jax.data.tokenizer import get_tokenizer
+
+    # Re-initialize tokenizer in the child process
+    tokenizer = get_tokenizer(tokenizer_name)
+    
+    # Check if HF tokenizer
+    is_hf = hasattr(tokenizer, "__call__") and not hasattr(tokenizer, "max_val")
+    pad_id = getattr(tokenizer, "pad_token_id", 0)
+    if pad_id is None:
+        pad_id = 0
+
+    # Each worker needs to skip a different number of items to avoid extreme overlap
+    # Note: For True streaming we can't easily shard perfectly, but we skip to stagger them
+    try:
+        dataset = load_dataset(dataset_name, name=subset, split=split, streaming=True)
+    except ValueError as e:
+        if "Bad split" in str(e):
+            import datasets
+            builder = datasets.load_dataset_builder(dataset_name, name=subset)
+            splits = list(builder.info.splits.keys())
+            if splits:
+                print(f"[Worker {worker_id}] Split '{split}' not found. Falling back to '{splits[0]}'")
+                split = splits[0]
+                dataset = load_dataset(dataset_name, name=subset, split=split, streaming=True)
+            else:
+                raise e
+        else:
+            raise e
+            
+    iterator = iter(dataset)
+    
+    # Stagger workers
+    for _ in range(worker_id * 5000):
+        try:
+            next(iterator)
+        except StopIteration:
+            break
+
+    batch_texts = []
+    
+    while not stop_event.is_set():
+        try:
+            while len(batch_texts) < batch_size:
+                item = next(iterator)
+                text = item.get("text") or item.get("content") or item.get("sentence") or ""
+                if text:
+                    batch_texts.append(text)
+                    
+            # Tokenize batch
+            if is_hf:
+                encoded = tokenizer(
+                    batch_texts,
+                    max_length=seq_len,
+                    truncation=True,
+                    padding="max_length",
+                    return_tensors="np"
+                )
+                batch_ids = encoded["input_ids"].astype(np.int32)
+            else:
+                batch_ids = []
+                for text in batch_texts:
+                    ids = tokenizer.encode(text)
+                    if len(ids) > seq_len:
+                        ids = ids[:seq_len]
+                    else:
+                        ids = ids + [pad_id] * (seq_len - len(ids))
+                    batch_ids.append(ids)
+                batch_ids = np.array(batch_ids, dtype=np.int32)
+
+            # Try to push to queue (timeout allows checking stop_event)
+            while not stop_event.is_set():
+                try:
+                    out_queue.put(batch_ids, timeout=1.0)
+                    break
+                except queue.Full:
+                    continue
+
+            batch_texts = []
+            
+        except StopIteration:
+            # Loop dataset
+            iterator = iter(dataset)
+        except Exception as e:
+            if not stop_event.is_set():
+                import traceback
+                traceback.print_exc()
+            break
+
+class MultiprocessingHFDataset:
+    """
+    A replacement for HFStreamingDataset that uses multiple Python processes 
+    to fetch and tokenize huggingface data in parallel.
+    """
+    def __init__(
+        self,
+        dataset_name,
+        tokenizer_name,
+        subset=None,
+        split="train",
+        seq_len=64,
+        batch_size=8,
+        num_workers=8,
+        prefetch_batches=100
+    ):
+        self.dataset_name = dataset_name
+        self.tokenizer_name = tokenizer_name
+        self.subset = subset
+        self.split = split
+        self.seq_len = seq_len
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        
+        # Cross-process resources
+        manager = mp.Manager()
+        self.queue = manager.Queue(maxsize=prefetch_batches)
+        self.stop_event = manager.Event()
+        self.processes = []
+        
+        print(f"Starting {self.num_workers} parallel data workers for {dataset_name}...")
+        for i in range(self.num_workers):
+            p = mp.Process(
+                target=_worker_tokenize, 
+                args=(
+                    i, 
+                    self.dataset_name, 
+                    self.subset, 
+                    self.split, 
+                    self.tokenizer_name, 
+                    self.seq_len, 
+                    self.batch_size, 
+                    self.queue,
+                    self.stop_event
+                ),
+                daemon=True
+            )
+            p.start()
+            self.processes.append(p)
+
+    def get_batch(self, batch_size=None):
+        # We ignore requested batch_size since workers already batch it correctly
+        try:
+            # Block until a batch is ready
+            return self.queue.get(timeout=60.0) 
+        except queue.Empty:
+            raise RuntimeError("Dataloader queue is empty! Workers might have crashed or network is down.")
+
+    def stop(self):
+        self.stop_event.set()
+        for p in self.processes:
+            p.terminate()
+            p.join(timeout=1.0)
 
 
 class SyntheticReasoningDataset:

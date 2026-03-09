@@ -33,7 +33,7 @@ except ImportError:
 from dpsn_r_jax.config import DPSNRConfig, get_model_config
 from dpsn_r_jax.models.dpsnr import DPSNR
 from dpsn_r_jax.data.dataset import (
-    HFStreamingDataset,
+    MultiprocessingHFDataset,
     SyntheticReasoningDataset,
     BackgroundGenerator,
 )
@@ -429,14 +429,16 @@ def main():
         dataset = GrainWrapper(grain_loader)
     elif args.hf_dataset:
         print(
-            f"Loading HF streaming dataset: {args.hf_dataset} (subset: {args.hf_subset})"
+            f"Loading HF multiprocessing dataset: {args.hf_dataset} (subset: {args.hf_subset}) with {args.num_workers} workers"
         )
-        dataset = HFStreamingDataset(
-            args.hf_dataset,
-            tokenizer,
+        dataset = MultiprocessingHFDataset(
+            dataset_name=args.hf_dataset,
+            tokenizer_name=tokenizer_name,
             subset=args.hf_subset,
             seq_len=config.max_seq_len,
             batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            prefetch_batches=100
         )
     else:
         print("Generating synthetic sorting dataset...")
@@ -482,6 +484,7 @@ def main():
 
     tokens_per_sec = 0.0
     tflops = 0.0
+    total_data_wait_time_10 = 0.0
 
     start_time = time.time()
 
@@ -493,7 +496,12 @@ def main():
                 print(f"Reached max_steps ({args.max_steps}). Stopping training.")
                 break
 
+            data_start_time = time.time()
             batch = dataset.get_batch(args.batch_size)
+            current_data_wait_time = time.time() - data_start_time
+            
+            # Accumulate wait time
+            total_data_wait_time_10 += current_data_wait_time
 
             # Shard the batch input!
             # We must put the batch onto the mesh with the data sharding spec
@@ -540,13 +548,21 @@ def main():
                 loss.block_until_ready() # synchronize only on printing
                 current_time = time.time()
                 step_time_10 = current_time - start_time
+                
                 avg_step_time = step_time_10 / 10 if step > 0 else step_time_10
+                avg_data_wait = total_data_wait_time_10 / 10 if step > 0 else total_data_wait_time_10
+                
+                # Active TPU time is total time minus the time spent waiting for data feed
+                active_tpu_time = max(0.0001, avg_step_time - avg_data_wait)
+                
                 tokens_per_sec = (args.batch_size * config.max_seq_len) / avg_step_time
-                tflops = flops_per_step / avg_step_time / 1e12
+                # TFLOPS uniquely should be calculated on ACTIVE TPU time, not wait time
+                tflops = flops_per_step / active_tpu_time / 1e12
                 
                 # Log the performance metrics every 10 steps
                 writer.add_scalar("Perf/TPS", tokens_per_sec, global_step)
                 writer.add_scalar("Perf/TFLOPS", tflops, global_step)
+                writer.add_scalar("Perf/DataWaitTime_s", avg_data_wait, global_step)
                 
                 ppl = jnp.exp(loss)
                 sigma_scale = float(state.sigma_anneal_fn(global_step))
@@ -554,8 +570,8 @@ def main():
                 print(
                     f"Epoch {epoch + 1} | Step {step} | Global Step {global_step} | "
                     f"Loss: {loss:.4f} | PPL: {ppl:.4f} | LR: {current_lr:.2e} | "
-                    f"sigma={float(mean_sigma):.3f} ({precision_tag}) | scale={sigma_scale:.3f} | "
-                    f"TPS: {tokens_per_sec:.0f} | TFLOPS: {tflops:.4f}"
+                    f"sigma={float(mean_sigma):.3f} ({precision_tag}) | "
+                    f"TPS: {tokens_per_sec:.0f} | TFLOPS: {tflops:.4f} | DataWait: {avg_data_wait:.3f}s"
                 )
 
             # Periodic Generation
@@ -595,6 +611,7 @@ def main():
             # Reset start_time to measure the next 10 steps purely
             if step % 10 == 0:
                 start_time = time.time()
+                total_data_wait_time_10 = 0.0
 
         if args.max_steps and global_step >= args.max_steps:
             break
