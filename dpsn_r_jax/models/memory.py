@@ -125,7 +125,7 @@ class CoordinateMassivePool(nn.Module):
 
         distances = relative_indices - center_idx[:, None]
 
-        weights = jnp.exp(-(distances**2) / (2 * (sigma[:, None] + 1e-6) ** 2)) + 1e-9
+        weights = jnp.exp(-(distances**2) / (2 * (sigma[:, None] + 1e-6) ** 2)) + 1e-6
         weights = weights / jnp.sum(weights, axis=-1, keepdims=True)
 
         aggregated = jnp.einsum("bw,bwd->bd", weights, selected)
@@ -223,7 +223,7 @@ class CoordinateMassivePool2D(nn.Module):
         c_w = jnp.exp(-c_dist ** 2 / (2 * sigma_sq[:, None]))       # (B, W)
 
         # Outer product → 2D weight matrix
-        w_2d = jnp.einsum("bi,bj->bij", r_w, c_w) + 1e-9            # (B, W, W)
+        w_2d = jnp.einsum("bi,bj->bij", r_w, c_w) + 1e-6            # (B, W, W)
         w_2d = w_2d / jnp.sum(w_2d, axis=(-2, -1), keepdims=True)
 
         # Weighted sum over the W×W window

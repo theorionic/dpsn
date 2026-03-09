@@ -46,7 +46,7 @@ from dpsn_r_jax.utils.metrics import calculate_flops
 def log_pool_utilization(state):
     touched_mask = jnp.any(state.pool_v > 0, axis=-1)
     num_touched = jnp.sum(touched_mask)
-    total_vectors = state.pool_v.shape[0]
+    total_vectors = touched_mask.size
     percentage = (num_touched / total_vectors) * 100
     print(
         f"Pool Utilization: {percentage:.2f}% ({int(num_touched)} / {total_vectors} vectors touched)"
@@ -254,6 +254,14 @@ def main():
 
     tokenizer_name = config.hf_tokenizer_name or "numeric"
     tokenizer = get_tokenizer(tokenizer_name)
+
+    if hasattr(tokenizer, "vocab_size"):
+        config.vocab_size = tokenizer.vocab_size
+    elif hasattr(tokenizer, "__len__"):
+        config.vocab_size = len(tokenizer)
+        
+    if hasattr(tokenizer, "pad_token_id") and tokenizer.pad_token_id is not None:
+        config.pad_token_id = tokenizer.pad_token_id
 
     # Initialize Model
     model = DPSNR(config)
