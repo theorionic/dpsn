@@ -47,7 +47,7 @@ class TinyController(nn.Module):
 
         mask = nn.make_causal_mask(input_ids)
         # mask is (1, 1, T, T) bool usually? make_causal_mask returns (1, 1, T, T)
-        mask = jnp.where(mask, 0, -1e9)
+        mask = jnp.where(mask, 0, -1e4)
 
         for layer in self.layers:
             x = layer(x, mask=mask, deterministic=deterministic)
