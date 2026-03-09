@@ -40,6 +40,7 @@ from dpsn_r_jax.data.dataset import (
 from dpsn_r_jax.data.tokenizer import get_tokenizer
 from dpsn_r_jax.data.grain_loader import get_grain_loader
 from dpsn_r_jax.data.prefetch import DevicePrefetchIterator
+from dpsn_r_jax.data.ram_cache import TokenizedRAMCache
 from dpsn_r_jax.utils.generation import generate, clear_generation_cache
 from dpsn_r_jax.utils.metrics import calculate_flops
 
@@ -175,6 +176,18 @@ def main():
         type=int,
         default=0,
         help="Number of warmup steps for learning rate scheduler",
+    )
+    parser.add_argument(
+        "--ram_cache_gb",
+        type=float,
+        default=0,
+        help="Pre-tokenize and cache this many GB in RAM before training (0=disabled)",
+    )
+    parser.add_argument(
+        "--prefill_pct",
+        type=float,
+        default=0.1,
+        help="Fraction of RAM cache to prefill before training starts (0.0-1.0)",
     )
 
     args = parser.parse_args()
@@ -482,13 +495,29 @@ def main():
     test_samples = ["Sort: 5 2 8 1 ->", "Sort: 10 3 7 ->", "Sort: 1 1 1 ->"]
 
     # ── Async double-buffered data pipeline ────────────────────────────────
-    # 1. CPU-side: BackgroundGenerator prefetches 50 batches into a Python queue
-    # 2. GPU/TPU-side: DevicePrefetchIterator runs jax.device_put in a background
-    #    thread, keeping 2 on-device batches ready (double-buffer).
-    # Result: H2D transfer overlaps with compute → TPU never idles for data.
-    cpu_prefetch = BackgroundGenerator(dataset, args.batch_size, prefetch_size=50)
+    # Two modes:
+    #   A) RAM Cache enabled (--ram_cache_gb > 0):
+    #      HF Stream → RAM Cache (pre-tokenized, GB-scale) → DevicePrefetchIterator → TPU
+    #      Eliminates tokenization bottleneck entirely during training.
+    #   B) RAM Cache disabled:
+    #      DataSource → BackgroundGenerator (CPU queue) → DevicePrefetchIterator → TPU
+    if args.ram_cache_gb > 0:
+        print(f"\nEnabling RAM Cache: {args.ram_cache_gb:.1f} GB, "
+              f"prefill {args.prefill_pct*100:.0f}% before training")
+        dataset = TokenizedRAMCache(
+            data_source=dataset,
+            batch_size=args.batch_size,
+            seq_len=config.max_seq_len,
+            cache_size_gb=args.ram_cache_gb,
+            prefill_pct=args.prefill_pct,
+        )
+    else:
+        # CPU-side prefetch only (original path)
+        dataset = BackgroundGenerator(dataset, args.batch_size, prefetch_size=50)
+
+    # On-device double-buffer: transfers batches to TPU in a background thread
     dataset = DevicePrefetchIterator(
-        data_source=cpu_prefetch,
+        data_source=dataset,
         batch_size=args.batch_size,
         sharding=batch_sharding,
         prefetch_depth=2,
