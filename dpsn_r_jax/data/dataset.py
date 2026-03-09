@@ -124,12 +124,18 @@ def _worker_tokenize(worker_id, dataset_name, subset, split, tokenizer_name, seq
             
     iterator = iter(dataset)
     
-    # Stagger workers
-    for _ in range(worker_id * 5000):
-        try:
-            next(iterator)
-        except StopIteration:
-            break
+    # Stagger workers efficiently
+    try:
+        if worker_id > 0:
+            # We skip a manageable number to stagger the streams without hammering HF servers
+            dataset = dataset.skip(worker_id * 200)
+    except AttributeError:
+        # Fallback if skip isn't supported on this iterable
+        for _ in range(worker_id * 200):
+            try:
+                next(iterator)
+            except StopIteration:
+                break
 
     batch_texts = []
     
@@ -205,15 +211,17 @@ class MultiprocessingHFDataset:
         self.batch_size = batch_size
         self.num_workers = num_workers
         
-        # Cross-process resources
-        manager = mp.Manager()
+        # Cross-process resources using SPAWN context to avoid JAX multithreading deadlocks
+        # and OS fork throttling/limits
+        ctx = mp.get_context("spawn")
+        manager = ctx.Manager()
         self.queue = manager.Queue(maxsize=prefetch_batches)
         self.stop_event = manager.Event()
         self.processes = []
         
-        print(f"Starting {self.num_workers} parallel data workers for {dataset_name}...")
+        print(f"Starting {self.num_workers} parallel data workers for {dataset_name} using SPAWN context...")
         for i in range(self.num_workers):
-            p = mp.Process(
+            p = ctx.Process(
                 target=_worker_tokenize, 
                 args=(
                     i, 
