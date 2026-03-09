@@ -512,8 +512,6 @@ def main():
             # TensorBoard logging
             writer.add_scalar("Loss/train", float(loss), global_step)
             writer.add_scalar("PPL/train", float(jnp.exp(loss)), global_step)
-            writer.add_scalar("Perf/TPS", tokens_per_sec, global_step)
-            writer.add_scalar("Perf/TFLOPS", tflops, global_step)
             current_lr = state.learning_rate_fn(global_step)
             writer.add_scalar("LR", current_lr, global_step)
             # Precision routing metrics
@@ -545,6 +543,10 @@ def main():
                 avg_step_time = step_time_10 / 10 if step > 0 else step_time_10
                 tokens_per_sec = (args.batch_size * config.max_seq_len) / avg_step_time
                 tflops = flops_per_step / avg_step_time / 1e12
+                
+                # Log the performance metrics every 10 steps
+                writer.add_scalar("Perf/TPS", tokens_per_sec, global_step)
+                writer.add_scalar("Perf/TFLOPS", tflops, global_step)
                 
                 ppl = jnp.exp(loss)
                 sigma_scale = float(state.sigma_anneal_fn(global_step))
