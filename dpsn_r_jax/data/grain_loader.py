@@ -376,14 +376,23 @@ def get_grain_loader(
         if sys.platform == "darwin":
             worker_count = 0
 
+        # Shuffling requires generating a random permutation of `num_records`. 
+        # For huge datasets (e.g., 200M sequences), this takes several minutes on CPU
+        # and hangs the DevicePrefetchIterator causing `_queue.Empty` timeouts.
+        # We disable shuffling for massive datasets.
+        total_records = len(source)
+        should_shuffle = total_records < 10_000_000
+        if not should_shuffle:
+            print(f"Dataset is massive ({total_records:,} sequences). Disabling IndexSampler shuffling to prevent initialization timeouts.")
+
         loader = grain.DataLoader(
             data_source=source,
             operations=operations,
             sampler=grain.IndexSampler(
-                num_records=len(source),
+                num_records=total_records,
                 shard_options=grain.NoSharding(),
-                shuffle=True,
-                seed=0,
+                shuffle=should_shuffle,
+                seed=0 if should_shuffle else None,
                 num_epochs=getattr(config, "epochs", 1),
             ),
             worker_count=worker_count,
