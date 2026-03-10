@@ -15,19 +15,31 @@ from typing import Optional, Any
 
 
 class NumpySource:
-    def __init__(self, path: str):
+    def __init__(self, path: str, seq_len: int = 1024):
         self.path = path
         # Memory-map the numpy array to avoid loading it all into RAM at once
-        self.data = np.load(path, mmap_mode='r')
+        raw = np.load(path, mmap_mode='r')
+
+        # If the array is 1D (flat token stream), reshape into sequences
+        if raw.ndim == 1:
+            num_tokens = len(raw)
+            num_sequences = num_tokens // seq_len
+            # Trim any leftover tokens that don't fill a complete sequence
+            self.data = raw[:num_sequences * seq_len].reshape(num_sequences, seq_len)
+            print(f"Loaded {path}: {num_tokens:,} tokens → {num_sequences:,} sequences of length {seq_len}.")
+        else:
+            # Already 2D (num_sequences, seq_len)
+            self.data = raw
+            print(f"Loaded {path} with {len(self.data):,} pre-tokenized sequences.")
+
         self.size = len(self.data)
-        print(f"Loaded {path} with {self.size} pre-tokenized sequences.")
 
     def __len__(self):
         return self.size
 
     def __getitem__(self, idx):
-        # Directly yield the heavily-optimized integer array
-        return {"input_ids": self.data[idx]}
+        # Returns a 1D array of shape (seq_len,) — grain Batch stacks these into (B, seq_len)
+        return {"input_ids": np.array(self.data[idx])}
 
 class DummySource:
     def __init__(self, path: str = "dummy", size: int = 1000):
@@ -349,7 +361,7 @@ def get_grain_loader(
             source = DummySource(size=dataset_size)
         elif len(dataset_paths) == 1:
             if dataset_paths[0].endswith('.npy'):
-                source = NumpySource(path=dataset_paths[0])
+                source = NumpySource(path=dataset_paths[0], seq_len=seq_len)
             else:
                 source = DummySource(path=dataset_paths[0], size=dataset_size)
         else:
@@ -357,7 +369,7 @@ def get_grain_loader(
             sources = []
             for p in dataset_paths:
                 if p.endswith('.npy'):
-                    sources.append(NumpySource(path=p))
+                    sources.append(NumpySource(path=p, seq_len=seq_len))
                 else:
                     sources.append(DummySource(path=p, size=dataset_size))
             source = ConcatenatedSource(sources)
@@ -429,12 +441,18 @@ def expand_npy_paths(dataset_paths: Optional[list[str]]) -> list[str]:
 
 
 def get_single_npy_grain_loader(
-    npy_path: str, config: Any, start_step: int = 0
+    npy_path: str, args: Any, start_step: int = 0, config: Any = None
 ) -> Optional[tuple[Any, int]]:
     """Create a grain DataLoader for a single .npy file.
 
     This loads only ONE file into memory at a time, avoiding the RAM blow-up
     caused by ConcatenatedSource loading all files simultaneously.
+
+    Args:
+        npy_path:    Path to a single .npy file.
+        args:        Argparse namespace (has batch_size, num_workers).
+        start_step:  Resume offset.
+        config:      Model config (has max_seq_len). Falls back to args if None.
 
     Returns:
         (loader, total_records) tuple, or None on failure.
@@ -443,15 +461,18 @@ def get_single_npy_grain_loader(
         return None
 
     try:
-        source = NumpySource(path=npy_path)
-        batch_size = getattr(config, "batch_size", 8)
+        # Prefer config for seq_len, fall back to args
+        cfg = config if config is not None else args
+        seq_len = getattr(cfg, "max_seq_len", getattr(cfg, "seq_len", 1024))
+        source = NumpySource(path=npy_path, seq_len=seq_len)
+        batch_size = getattr(args, "batch_size", 8)
         start_index = start_step * batch_size
 
         operations = [
             grain.Batch(batch_size=batch_size, drop_remainder=True),
         ]
 
-        worker_count = getattr(config, "num_workers", 4)
+        worker_count = getattr(args, "num_workers", 4)
         if sys.platform == "darwin":
             worker_count = 0
 

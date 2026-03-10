@@ -718,7 +718,7 @@ def main():
                 print(f"{'='*60}")
 
                 # Create loader for just this one file
-                result = get_single_npy_grain_loader(npy_path, args)
+                result = get_single_npy_grain_loader(npy_path, args, config=config)
                 if result is None:
                     print(f"{file_label}Failed to load, skipping.")
                     continue
