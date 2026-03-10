@@ -18,8 +18,12 @@ class TinyController(nn.Module):
         ff_dim = int(
             self.config.controller_hidden_dim * self.config.controller_ff_multiplier
         )
+        layer_cls = TinyTransformerLayer
+        if self.config.gradient_checkpointing:
+            layer_cls = nn.remat(TinyTransformerLayer, static_argnums=(3,))
+
         self.layers = [
-            TinyTransformerLayer(
+            layer_cls(
                 self.config.controller_hidden_dim,
                 self.config.controller_num_heads,
                 ff_dim,
@@ -50,7 +54,9 @@ class TinyController(nn.Module):
         mask = jnp.where(mask, 0, -1e4)
 
         for layer in self.layers:
-            x = layer(x, mask=mask, deterministic=deterministic)
+            # Pass mask and deterministic AS POSITIONAL arguments 
+            # so that static_argnums=(2,) in nn.remat catches deterministic.
+            x = layer(x, mask, deterministic)
 
         return x
 

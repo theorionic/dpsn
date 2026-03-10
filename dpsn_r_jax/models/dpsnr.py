@@ -15,14 +15,8 @@ class DPSNR(nn.Module):
     config: DPSNRConfig
 
     def setup(self):
-        # Conditionally apply gradient checkpointing (rematerialization)
-        # to the heavy components of the model.
-        if self.config.gradient_checkpointing:
-            controller_cls = nn.remat(TinyController)
-            acc_cls = nn.remat(AdaptiveComputeController)
-        else:
-            controller_cls = TinyController
-            acc_cls = AdaptiveComputeController
+        controller_cls = TinyController
+        acc_cls = AdaptiveComputeController
 
         self.controller = controller_cls(self.config)
         self.indexer = LearnedIndexer(
@@ -52,7 +46,7 @@ class DPSNR(nn.Module):
                 window_size=self.config.max_k,
             )
 
-        self.acc = acc_cls(
+        self.acc = AdaptiveComputeController(
             self.config.controller_hidden_dim,
             self.config.max_reasoning_loops,
             self.config.halt_threshold,
@@ -83,7 +77,8 @@ class DPSNR(nn.Module):
                           mean_sigma is logged and used for precision loss.
         """
         # 1. Encode
-        hidden = self.controller(input_ids, deterministic=deterministic)
+        # MUST pass deterministic as a positional argument so static_argnums=(1,) catches it!
+        hidden = self.controller(input_ids, deterministic)
 
         # 2. Reasoning Loop
         state_hidden = hidden
@@ -174,8 +169,12 @@ class DPSNR(nn.Module):
 
             return (s_hidden, h_prob, new_h_mask), (start_indices, mean_sigma_step)
 
-        if self.config.gradient_checkpointing:
-            reasoning_step = jax.checkpoint(reasoning_step)
+        # Do not use jax.checkpoint on reasoning_step directly, because it captures Flax module 
+        # methods (self.indexer, self.acc) which interact with Flax's variable dictionary.
+        # This causes JAX tracer leaks. Checkpointing is already handled at the module level
+        # for TinyController and AdaptiveComputeController.
+        # if self.config.gradient_checkpointing:
+        #     reasoning_step = jax.checkpoint(reasoning_step)
 
         init_carry = (state_hidden, halt_prob, halted_mask)
         (state_hidden, halt_prob, halted_mask), (all_indices, sigma_per_loop) = (
