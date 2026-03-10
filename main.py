@@ -502,15 +502,44 @@ def main():
     #   B) RAM Cache disabled:
     #      DataSource → BackgroundGenerator (CPU queue) → DevicePrefetchIterator → TPU
     if args.ram_cache_gb > 0:
+        # For HF datasets, use parallel multi-process workers for fast prefill
+        # instead of the single-threaded HFStreamLoader (which only does ~300 seq/s).
+        cache_source = dataset  # default: whatever data source was created above
+        hf_name = None
+
+        if args.hf_datasets:
+            hf_name = args.hf_datasets[0]
+        elif args.hf_dataset:
+            hf_name = args.hf_dataset
+
+        if hf_name:
+            cache_workers = max(16, args.num_workers * 4)
+            print(f"\nUsing {cache_workers} parallel workers for fast HF cache fill "
+                  f"(dataset: {hf_name})...")
+            cache_source = MultiprocessingHFDataset(
+                dataset_name=hf_name,
+                tokenizer_name=tokenizer_name,
+                subset=args.hf_subset,
+                seq_len=config.max_seq_len,
+                batch_size=args.batch_size,
+                num_workers=cache_workers,
+                prefetch_batches=500,
+            )
+
         print(f"\nEnabling RAM Cache: {args.ram_cache_gb:.1f} GB, "
               f"prefill {args.prefill_pct*100:.0f}% before training")
         dataset = TokenizedRAMCache(
-            data_source=dataset,
+            data_source=cache_source,
             batch_size=args.batch_size,
             seq_len=config.max_seq_len,
             cache_size_gb=args.ram_cache_gb,
             prefill_pct=args.prefill_pct,
         )
+
+        # Stop the parallel workers once cache is filled enough to start training.
+        # Background fill thread in TokenizedRAMCache will continue using them.
+        # They'll be cleaned up when the cache is full (daemon processes).
+
     else:
         # CPU-side prefetch only (original path)
         dataset = BackgroundGenerator(dataset, args.batch_size, prefetch_size=50)

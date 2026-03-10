@@ -325,6 +325,23 @@ def get_grain_loader(
         return None
 
     try:
+        import glob
+        
+        # Expand wildcard dataset paths
+        expanded_paths = []
+        if dataset_paths:
+            for p in dataset_paths:
+                if '*' in p or '?' in p:
+                    matches = glob.glob(p)
+                    if matches:
+                        expanded_paths.extend(matches)
+                    else:
+                        print(f"Warning: No files matched pattern {p}")
+                        expanded_paths.append(p)
+                else:
+                    expanded_paths.append(p)
+            dataset_paths = expanded_paths
+
         dataset_size = getattr(config, "dataset_size", 1000)
         if not dataset_paths:
             source = DummySource(size=dataset_size)
@@ -366,13 +383,16 @@ def get_grain_loader(
                 num_records=len(source),
                 shard_options=grain.NoSharding(),
                 shuffle=True,
+                seed=0,
                 num_epochs=getattr(config, "epochs", 1),
             ),
             worker_count=worker_count,
             worker_buffer_size=500,
-            read_options=grain.ReadOptions(start_index=start_index),
         )
 
         return loader
-    except Exception:
+    except Exception as e:
+        import traceback
+        print("Error initializing grain dataloader:")
+        traceback.print_exc()
         return None

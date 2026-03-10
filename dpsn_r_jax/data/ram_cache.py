@@ -168,6 +168,10 @@ class TokenizedRAMCache:
             f"{self._available:,} sequences ({gb:.2f} GB)"
         )
 
+        # Clean up data source workers if it supports stopping
+        if hasattr(source, 'stop'):
+            source.stop()
+
     # ── Public API ─────────────────────────────────────────────────────────
 
     def get_batch(self, batch_size: int = None) -> np.ndarray:
