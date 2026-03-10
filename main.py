@@ -38,7 +38,12 @@ from dpsn_r_jax.data.dataset import (
     BackgroundGenerator,
 )
 from dpsn_r_jax.data.tokenizer import get_tokenizer
-from dpsn_r_jax.data.grain_loader import get_grain_loader
+from dpsn_r_jax.data.grain_loader import (
+    get_grain_loader,
+    expand_npy_paths,
+    get_single_npy_grain_loader,
+    release_npy_loader,
+)
 from dpsn_r_jax.data.prefetch import DevicePrefetchIterator
 from dpsn_r_jax.data.ram_cache import TokenizedRAMCache
 from dpsn_r_jax.utils.generation import generate, clear_generation_cache
@@ -420,45 +425,57 @@ def main():
         loader_start_step = global_step
     else:
         loader_start_step = 0
-    grain_loader = get_grain_loader(
-        args.dataset_path, args, start_step=loader_start_step
-    )
 
-    if grain_loader:
-        print(f"Using Google Grain data loader (start_step={loader_start_step}).")
+    # ── Detect sequential NPY mode ─────────────────────────────────────────
+    npy_files = expand_npy_paths(args.dataset_path) if args.dataset_path else []
+    use_sequential_npy = len(npy_files) > 0
 
-        class GrainWrapper:
-            def __init__(self, loader):
-                self.loader = loader
-                self.iterator = iter(loader)
-
-            def get_batch(self, batch_size=None):
-                try:
-                    batch = next(self.iterator)
-                except StopIteration:
-                    self.iterator = iter(self.loader)
-                    batch = next(self.iterator)
-                return batch["input_ids"]
-
-        dataset = GrainWrapper(grain_loader)
-    elif args.hf_dataset:
-        print(
-            f"Loading HF multiprocessing dataset: {args.hf_dataset} (subset: {args.hf_subset}) with {args.num_workers} workers"
-        )
-        dataset = MultiprocessingHFDataset(
-            dataset_name=args.hf_dataset,
-            tokenizer_name=tokenizer_name,
-            subset=args.hf_subset,
-            seq_len=config.max_seq_len,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            prefetch_batches=100
-        )
+    if use_sequential_npy:
+        print(f"\nSequential NPY mode: {len(npy_files)} files detected.")
+        print(f"Files will be loaded ONE AT A TIME to minimize RAM usage.")
+        for i, f in enumerate(npy_files):
+            print(f"  [{i+1}/{len(npy_files)}] {os.path.basename(f)}")
     else:
-        print("Generating synthetic sorting dataset...")
-        dataset = SyntheticReasoningDataset(
-            size=args.dataset_size, seq_len=config.max_seq_len
+        # Fallback: original loader path for non-NPY datasets
+        grain_loader = get_grain_loader(
+            args.dataset_path, args, start_step=loader_start_step
         )
+
+        if grain_loader:
+            print(f"Using Google Grain data loader (start_step={loader_start_step}).")
+
+            class GrainWrapper:
+                def __init__(self, loader):
+                    self.loader = loader
+                    self.iterator = iter(loader)
+
+                def get_batch(self, batch_size=None):
+                    try:
+                        batch = next(self.iterator)
+                    except StopIteration:
+                        self.iterator = iter(self.loader)
+                        batch = next(self.iterator)
+                    return batch["input_ids"]
+
+            dataset = GrainWrapper(grain_loader)
+        elif args.hf_dataset:
+            print(
+                f"Loading HF multiprocessing dataset: {args.hf_dataset} (subset: {args.hf_subset}) with {args.num_workers} workers"
+            )
+            dataset = MultiprocessingHFDataset(
+                dataset_name=args.hf_dataset,
+                tokenizer_name=tokenizer_name,
+                subset=args.hf_subset,
+                seq_len=config.max_seq_len,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                prefetch_batches=100
+            )
+        else:
+            print("Generating synthetic sorting dataset...")
+            dataset = SyntheticReasoningDataset(
+                size=args.dataset_size, seq_len=config.max_seq_len
+            )
 
     def count_params(tree):
         return sum(x.size for x in jax.tree_util.tree_leaves(tree))
@@ -494,63 +511,49 @@ def main():
     # Define test samples for generation
     test_samples = ["Sort: 5 2 8 1 ->", "Sort: 10 3 7 ->", "Sort: 1 1 1 ->"]
 
-    # ── Async double-buffered data pipeline ────────────────────────────────
-    # Two modes:
-    #   A) RAM Cache enabled (--ram_cache_gb > 0):
-    #      HF Stream → RAM Cache (pre-tokenized, GB-scale) → DevicePrefetchIterator → TPU
-    #      Eliminates tokenization bottleneck entirely during training.
-    #   B) RAM Cache disabled:
-    #      DataSource → BackgroundGenerator (CPU queue) → DevicePrefetchIterator → TPU
-    if args.ram_cache_gb > 0:
-        # For HF datasets, use parallel multi-process workers for fast prefill
-        # instead of the single-threaded HFStreamLoader (which only does ~300 seq/s).
-        cache_source = dataset  # default: whatever data source was created above
-        hf_name = None
+    # ── Build data pipeline (non-sequential path) ──────────────────────────
+    if not use_sequential_npy:
+        if args.ram_cache_gb > 0:
+            cache_source = dataset
+            hf_name = None
 
-        if args.hf_datasets:
-            hf_name = args.hf_datasets[0]
-        elif args.hf_dataset:
-            hf_name = args.hf_dataset
+            if args.hf_datasets:
+                hf_name = args.hf_datasets[0]
+            elif args.hf_dataset:
+                hf_name = args.hf_dataset
 
-        if hf_name:
-            cache_workers = max(16, args.num_workers * 4)
-            print(f"\nUsing {cache_workers} parallel workers for fast HF cache fill "
-                  f"(dataset: {hf_name})...")
-            cache_source = MultiprocessingHFDataset(
-                dataset_name=hf_name,
-                tokenizer_name=tokenizer_name,
-                subset=args.hf_subset,
-                seq_len=config.max_seq_len,
+            if hf_name:
+                cache_workers = max(16, args.num_workers * 4)
+                print(f"\nUsing {cache_workers} parallel workers for fast HF cache fill "
+                      f"(dataset: {hf_name})...")
+                cache_source = MultiprocessingHFDataset(
+                    dataset_name=hf_name,
+                    tokenizer_name=tokenizer_name,
+                    subset=args.hf_subset,
+                    seq_len=config.max_seq_len,
+                    batch_size=args.batch_size,
+                    num_workers=cache_workers,
+                    prefetch_batches=500,
+                )
+
+            print(f"\nEnabling RAM Cache: {args.ram_cache_gb:.1f} GB, "
+                  f"prefill {args.prefill_pct*100:.0f}% before training")
+            dataset = TokenizedRAMCache(
+                data_source=cache_source,
                 batch_size=args.batch_size,
-                num_workers=cache_workers,
-                prefetch_batches=500,
+                seq_len=config.max_seq_len,
+                cache_size_gb=args.ram_cache_gb,
+                prefill_pct=args.prefill_pct,
             )
+        else:
+            dataset = BackgroundGenerator(dataset, args.batch_size, prefetch_size=50)
 
-        print(f"\nEnabling RAM Cache: {args.ram_cache_gb:.1f} GB, "
-              f"prefill {args.prefill_pct*100:.0f}% before training")
-        dataset = TokenizedRAMCache(
-            data_source=cache_source,
+        dataset = DevicePrefetchIterator(
+            data_source=dataset,
             batch_size=args.batch_size,
-            seq_len=config.max_seq_len,
-            cache_size_gb=args.ram_cache_gb,
-            prefill_pct=args.prefill_pct,
+            sharding=batch_sharding,
+            prefetch_depth=2,
         )
-
-        # Stop the parallel workers once cache is filled enough to start training.
-        # Background fill thread in TokenizedRAMCache will continue using them.
-        # They'll be cleaned up when the cache is full (daemon processes).
-
-    else:
-        # CPU-side prefetch only (original path)
-        dataset = BackgroundGenerator(dataset, args.batch_size, prefetch_size=50)
-
-    # On-device double-buffer: transfers batches to TPU in a background thread
-    dataset = DevicePrefetchIterator(
-        data_source=dataset,
-        batch_size=args.batch_size,
-        sharding=batch_sharding,
-        prefetch_depth=2,
-    )
 
     LOG_INTERVAL = 50  # sync + log every N steps (lower = more sync overhead)
 
@@ -558,32 +561,38 @@ def main():
     tflops = 0.0
     total_data_wait_time_interval = 0.0
 
-    start_time = time.time()
-
-    for epoch in range(args.epochs):
+    # ── Helper: run training steps on a data pipeline ──────────────────────
+    def _run_training_steps(dataset_pipeline, state, global_step, epoch,
+                            steps_per_epoch, start_time, total_data_wait_time_interval,
+                            file_label=""):
+        """Run training steps using the given data pipeline.
+        Returns (state, global_step, epoch_loss, start_time, total_data_wait_time_interval, hit_max_steps).
+        """
         epoch_loss = 0
+        hit_max_steps = False
 
         for step in range(steps_per_epoch):
             if args.max_steps and global_step >= args.max_steps:
                 print(f"Reached max_steps ({args.max_steps}). Stopping training.")
+                hit_max_steps = True
                 break
 
             data_start_time = time.time()
-            batch = dataset.get_batch(args.batch_size)
+            try:
+                batch = dataset_pipeline.get_batch(args.batch_size)
+            except (StopIteration, Exception) as e:
+                if isinstance(e, StopIteration) or "StopIteration" in str(type(e).__name__):
+                    break  # This file is exhausted
+                raise
             current_data_wait_time = time.time() - data_start_time
-            
-            # Accumulate wait time
             total_data_wait_time_interval += current_data_wait_time
-
-            # Batch is ALREADY on-device (transferred by DevicePrefetchIterator)
-            # No jax.device_put needed here — that's the whole point!
 
             state, loss, mean_sigma = distributed_train_step(
                 state, batch, config.pad_token_id,
                 precision_loss_weight=getattr(config, 'precision_loss_weight', 0.0),
                 sigma_anneal_steps=getattr(config, 'sigma_anneal_steps', 0),
             )
-            
+
             epoch_loss += loss
             global_step += 1
 
@@ -592,7 +601,6 @@ def main():
             writer.add_scalar("PPL/train", float(jnp.exp(loss)), global_step)
             current_lr = state.learning_rate_fn(global_step)
             writer.add_scalar("LR", current_lr, global_step)
-            # Precision routing metrics
             writer.add_scalar("Routing/mean_sigma", float(mean_sigma), global_step)
             sigma_scale = float(state.sigma_anneal_fn(global_step))
             writer.add_scalar("Routing/sigma_scale", sigma_scale, global_step)
@@ -606,40 +614,30 @@ def main():
             ):
                 print(f"Saving checkpoint at step {global_step}...")
                 checkpoint_manager.save(global_step, state)
-                # Save data loader state if supported
-                if hasattr(grain_loader, "get_state"):
-                    import json
-
-                    state_dict = grain_loader.get_state()
-                    with open(args.resume_data_path, "w") as f:
-                        json.dump(state_dict, f)
 
             if step % LOG_INTERVAL == 0:
-                loss.block_until_ready() # synchronize only on printing
+                loss.block_until_ready()
                 current_time = time.time()
                 elapsed = current_time - start_time
-                
+
                 steps_in_interval = LOG_INTERVAL if step > 0 else 1
                 avg_step_time = elapsed / steps_in_interval
                 avg_data_wait = total_data_wait_time_interval / steps_in_interval
-                
-                # Active TPU time is total time minus the time spent waiting for data feed
+
                 active_tpu_time = max(0.0001, avg_step_time - avg_data_wait)
-                
+
                 tokens_per_sec = (args.batch_size * config.max_seq_len) / avg_step_time
-                # TFLOPS uniquely should be calculated on ACTIVE TPU time, not wait time
                 tflops = flops_per_step / active_tpu_time / 1e12
-                
-                # Log the performance metrics
+
                 writer.add_scalar("Perf/TPS", tokens_per_sec, global_step)
                 writer.add_scalar("Perf/TFLOPS", tflops, global_step)
                 writer.add_scalar("Perf/DataWaitTime_s", avg_data_wait, global_step)
-                
+
                 ppl = jnp.exp(loss)
                 sigma_scale = float(state.sigma_anneal_fn(global_step))
                 precision_tag = "broad" if float(mean_sigma) > 1.0 else ("precise" if float(mean_sigma) < 0.1 else "narrowing")
                 print(
-                    f"Epoch {epoch + 1} | Step {step} | Global Step {global_step} | "
+                    f"{file_label}Epoch {epoch + 1} | Step {step} | Global Step {global_step} | "
                     f"Loss: {loss:.4f} | PPL: {ppl:.4f} | LR: {current_lr:.2e} | "
                     f"sigma={float(mean_sigma):.3f} ({precision_tag}) | "
                     f"TPS: {tokens_per_sec:.0f} | TFLOPS: {tflops:.4f} | DataWait: {avg_data_wait:.3f}s"
@@ -676,37 +674,133 @@ def main():
                         repetition_penalty=1.2,
                     )
                     print(f"Output: {output}")
-                clear_generation_cache()  # Free XLA memory to avoid OOM in backward pass
+                clear_generation_cache()
                 print("---------------------------------------")
 
-            # Reset start_time to measure the next interval purely
+            # Reset start_time for next interval
             if step % LOG_INTERVAL == 0:
                 start_time = time.time()
                 total_data_wait_time_interval = 0.0
 
-        if args.max_steps and global_step >= args.max_steps:
-            break
+        return state, global_step, epoch_loss, start_time, total_data_wait_time_interval, hit_max_steps
 
-        avg_loss = epoch_loss / steps_per_epoch
-        avg_ppl = jnp.exp(avg_loss)
-        print(
-            f"Epoch {epoch + 1} Complete | Avg Loss: {avg_loss:.4f} | Avg PPL: {avg_ppl:.4f}"
-        )
-        pool_util = log_pool_utilization(state)
-        writer.add_scalar("Pool/Utilization", pool_util, global_step)
+    start_time = time.time()
 
-        # Save checkpoint at end of epoch
-        if checkpoint_manager:
-            print(
-                f"Saving checkpoint at end of epoch {epoch + 1} (step {global_step})..."
+    # ══════════════════════════════════════════════════════════════════════════
+    #  SEQUENTIAL NPY FILE TRAINING
+    # ══════════════════════════════════════════════════════════════════════════
+    if use_sequential_npy:
+        import gc
+
+        class GrainWrapperSingleFile:
+            """Wraps a single-file grain DataLoader; raises StopIteration at EOF."""
+            def __init__(self, loader):
+                self.loader = loader
+                self.iterator = iter(loader)
+
+            def get_batch(self, batch_size=None):
+                batch = next(self.iterator)  # raises StopIteration at end
+                return batch["input_ids"]
+
+        for epoch in range(args.epochs):
+            epoch_loss_total = 0
+            epoch_steps = 0
+            hit_max_steps = False
+
+            for file_idx, npy_path in enumerate(npy_files):
+                if args.max_steps and global_step >= args.max_steps:
+                    hit_max_steps = True
+                    break
+
+                file_label = f"[File {file_idx+1}/{len(npy_files)}] "
+                print(f"\n{'='*60}")
+                print(f"{file_label}Loading {os.path.basename(npy_path)}...")
+                print(f"{'='*60}")
+
+                # Create loader for just this one file
+                result = get_single_npy_grain_loader(npy_path, args)
+                if result is None:
+                    print(f"{file_label}Failed to load, skipping.")
+                    continue
+                single_loader, num_records = result
+
+                # Build the async pipeline: GrainWrapper → BackgroundGenerator → DevicePrefetch
+                grain_source = GrainWrapperSingleFile(single_loader)
+                bg_source = BackgroundGenerator(grain_source, args.batch_size, prefetch_size=50)
+                pipeline = DevicePrefetchIterator(
+                    data_source=bg_source,
+                    batch_size=args.batch_size,
+                    sharding=batch_sharding,
+                    prefetch_depth=2,
+                )
+
+                # Calculate steps for this file
+                file_steps = max(1, num_records // args.batch_size)
+
+                state, global_step, file_loss, start_time, total_data_wait_time_interval, hit_max_steps = (
+                    _run_training_steps(
+                        pipeline, state, global_step, epoch,
+                        file_steps, start_time, total_data_wait_time_interval,
+                        file_label=file_label,
+                    )
+                )
+
+                epoch_loss_total += file_loss
+                epoch_steps += file_steps
+
+                # ── Tear down pipeline & free RAM ──────────────────────────
+                print(f"{file_label}Finished {os.path.basename(npy_path)}. Releasing memory...")
+                pipeline.stop()
+                bg_source.stop()
+                release_npy_loader(single_loader)
+                del pipeline, bg_source, grain_source, single_loader
+                gc.collect()
+
+                if hit_max_steps:
+                    break
+
+            if hit_max_steps:
+                break
+
+            if epoch_steps > 0:
+                avg_loss = epoch_loss_total / epoch_steps
+                avg_ppl = jnp.exp(avg_loss)
+                print(
+                    f"\nEpoch {epoch + 1} Complete | Avg Loss: {avg_loss:.4f} | Avg PPL: {avg_ppl:.4f}"
+                )
+            pool_util = log_pool_utilization(state)
+            writer.add_scalar("Pool/Utilization", pool_util, global_step)
+
+            if checkpoint_manager:
+                print(f"Saving checkpoint at end of epoch {epoch + 1} (step {global_step})...")
+                checkpoint_manager.save(global_step, state)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  ORIGINAL SINGLE-PIPELINE TRAINING
+    # ══════════════════════════════════════════════════════════════════════════
+    else:
+        for epoch in range(args.epochs):
+            state, global_step, epoch_loss, start_time, total_data_wait_time_interval, hit_max_steps = (
+                _run_training_steps(
+                    dataset, state, global_step, epoch,
+                    steps_per_epoch, start_time, total_data_wait_time_interval,
+                )
             )
-            checkpoint_manager.save(global_step, state)
-            if hasattr(grain_loader, "get_state"):
-                import json
 
-                state_dict = grain_loader.get_state()
-                with open(args.resume_data_path, "w") as f:
-                    json.dump(state_dict, f)
+            if hit_max_steps:
+                break
+
+            avg_loss = epoch_loss / steps_per_epoch
+            avg_ppl = jnp.exp(avg_loss)
+            print(
+                f"Epoch {epoch + 1} Complete | Avg Loss: {avg_loss:.4f} | Avg PPL: {avg_ppl:.4f}"
+            )
+            pool_util = log_pool_utilization(state)
+            writer.add_scalar("Pool/Utilization", pool_util, global_step)
+
+            if checkpoint_manager:
+                print(f"Saving checkpoint at end of epoch {epoch + 1} (step {global_step})...")
+                checkpoint_manager.save(global_step, state)
 
     # Generation Test
     print("\nVerifying model generation...")

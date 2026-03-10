@@ -5,6 +5,8 @@ try:
 except (ImportError, RuntimeError):
     GRAIN_AVAILABLE = False
 
+import gc
+import glob
 import numpy as np
 import sys
 import bisect
@@ -405,3 +407,96 @@ def get_grain_loader(
         print("Error initializing grain dataloader:")
         traceback.print_exc()
         return None
+
+
+def expand_npy_paths(dataset_paths: Optional[list[str]]) -> list[str]:
+    """Expand glob patterns and return a sorted list of .npy file paths."""
+    if not dataset_paths:
+        return []
+
+    expanded = []
+    for p in dataset_paths:
+        if '*' in p or '?' in p:
+            matches = sorted(glob.glob(p))
+            if matches:
+                expanded.extend(matches)
+            else:
+                print(f"Warning: No files matched pattern {p}")
+        elif p.endswith('.npy'):
+            expanded.append(p)
+
+    return sorted(set(expanded))
+
+
+def get_single_npy_grain_loader(
+    npy_path: str, config: Any, start_step: int = 0
+) -> Optional[tuple[Any, int]]:
+    """Create a grain DataLoader for a single .npy file.
+
+    This loads only ONE file into memory at a time, avoiding the RAM blow-up
+    caused by ConcatenatedSource loading all files simultaneously.
+
+    Returns:
+        (loader, total_records) tuple, or None on failure.
+    """
+    if not GRAIN_AVAILABLE:
+        return None
+
+    try:
+        source = NumpySource(path=npy_path)
+        batch_size = getattr(config, "batch_size", 8)
+        start_index = start_step * batch_size
+
+        operations = [
+            grain.Batch(batch_size=batch_size, drop_remainder=True),
+        ]
+
+        worker_count = getattr(config, "num_workers", 4)
+        if sys.platform == "darwin":
+            worker_count = 0
+
+        total_records = len(source)
+        should_shuffle = total_records < 10_000_000
+        if not should_shuffle:
+            print(
+                f"File has {total_records:,} sequences. "
+                f"Disabling IndexSampler shuffling."
+            )
+
+        loader = grain.DataLoader(
+            data_source=source,
+            operations=operations,
+            sampler=grain.IndexSampler(
+                num_records=total_records,
+                shard_options=grain.NoSharding(),
+                shuffle=should_shuffle,
+                seed=0 if should_shuffle else None,
+                num_epochs=1,  # single pass per file
+            ),
+            worker_count=worker_count,
+            worker_buffer_size=500,
+        )
+
+        return loader, total_records
+    except Exception as e:
+        import traceback
+        print(f"Error initializing grain loader for {npy_path}:")
+        traceback.print_exc()
+        return None
+
+
+def release_npy_loader(loader: Any) -> None:
+    """Explicitly release a single-file grain loader and free memory."""
+    if loader is None:
+        return
+    # Drop references to the data source so mmap can be released
+    try:
+        if hasattr(loader, '_data_source'):
+            loader._data_source = None
+        if hasattr(loader, 'data_source'):
+            loader.data_source = None
+    except Exception:
+        pass
+    del loader
+    gc.collect()
+
