@@ -472,9 +472,13 @@ def get_single_npy_grain_loader(
             grain.Batch(batch_size=batch_size, drop_remainder=True),
         ]
 
-        worker_count = getattr(args, "num_workers", 4)
-        if sys.platform == "darwin":
-            worker_count = 0
+        # IMPORTANT: worker_count MUST be 0 for TPU training with mmap'd data.
+        # Each grain worker subprocess initializes JAX → reserves TPU HBM.
+        # With --num_workers 30, that's 30 JAX instances eating HBM, leaving
+        # almost none for actual training (batch_size drops from 288 to ~64).
+        # mmap reads are already near-zero cost (OS page cache), so workers
+        # provide no benefit here.
+        worker_count = 0
 
         total_records = len(source)
         should_shuffle = total_records < 10_000_000
