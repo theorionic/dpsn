@@ -91,7 +91,9 @@ def create_train_state(rng, config, learning_rate_fn=None):
     )
 
 
-@jax.jit(static_argnames=["pad_token_id", "precision_loss_weight", "sigma_anneal_steps"], donate_argnums=(0,))
+import functools
+
+@functools.partial(jax.jit, static_argnames=["pad_token_id", "precision_loss_weight", "sigma_anneal_steps"], donate_argnums=(0,))
 def train_step(state, batch, pad_token_id=0,
                precision_loss_weight=0.0, sigma_anneal_steps=0):
     """One training step with precision routing support.
