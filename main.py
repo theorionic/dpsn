@@ -48,6 +48,7 @@ from dpsn_r_jax.data.prefetch import DevicePrefetchIterator
 from dpsn_r_jax.data.ram_cache import TokenizedRAMCache
 from dpsn_r_jax.utils.generation import generate, clear_generation_cache
 from dpsn_r_jax.utils.metrics import calculate_flops
+from dpsn_r_jax.utils.memory_debug import print_tpu_memory, print_param_memory
 
 
 def log_pool_utilization(state):
@@ -506,6 +507,10 @@ def main():
     print("-" * 50)
     print(f"{'Total Parameters':<35} | {total_params:>12,}")
     print("=" * 50 + "\n")
+
+    # ── Memory breakdown (static: params + optimizer + activation estimates) ──
+    print_param_memory(state, config, args.batch_size)
+    print_tpu_memory("after model init (before first train_step compile)")
 
     from dpsn_r_jax.training.trainer import train_step
 
