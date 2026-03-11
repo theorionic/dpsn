@@ -84,8 +84,8 @@ class DPSNR(nn.Module):
         state_hidden = hidden
         B, T, D = hidden.shape
 
-        halt_prob = jnp.zeros((B, T, 1))
-        halted_mask = jnp.zeros((B, T, 1))
+        halt_prob = jnp.zeros((B, T, 1), dtype=hidden.dtype)
+        halted_mask = jnp.zeros((B, T, 1), dtype=hidden.dtype)
 
         # ── Warm-up calls: force Flax to trace all sub-modules before scan ────
         _mu, _sigma = self.indexer(
@@ -166,6 +166,15 @@ class DPSNR(nn.Module):
 
             update_mask = 1.0 - h_mask
             s_hidden = update_mask * new_s_hidden + h_mask * prev_s_hidden
+
+            # ── Preserve carry dtypes for jax.lax.scan ────────────────────────
+            # Some ops inside ACC/LayerNorm/sigmoid can upcast to float32 even
+            # when the inputs are bfloat16.  scan requires that carry input and
+            # output have *identical* dtypes, so we cast back explicitly.
+            carry_dtype = prev_s_hidden.dtype
+            s_hidden   = s_hidden.astype(carry_dtype)
+            h_prob     = h_prob.astype(carry_dtype)
+            new_h_mask = new_h_mask.astype(carry_dtype)
 
             return (s_hidden, h_prob, new_h_mask), (start_indices, mean_sigma_step)
 
