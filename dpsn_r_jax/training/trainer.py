@@ -93,10 +93,86 @@ def create_train_state(rng, config, learning_rate_fn=None):
 
 import functools
 
-@functools.partial(jax.jit, static_argnames=["pad_token_id", "precision_loss_weight", "sigma_anneal_steps", "use_bf16"], donate_argnums=(0,))
+
+def chunked_lm_loss(
+    hidden: jnp.ndarray,
+    labels: jnp.ndarray,
+    decode_fn,
+    pad_token_id: int,
+    chunk_size: int,
+) -> jnp.ndarray:
+    """Compute LM cross-entropy loss without ever materialising the full (B, T, V) logits.
+
+    The LM head (decode_fn) is applied to `chunk_size` samples at a time via
+    jax.lax.scan with a checkpointed body.  XLA only keeps (chunk_size, T, V)
+    logits in HBM at any moment — typically ~0.4 GB instead of ~13 GB for
+    BS=256 on TPU v5e-8.
+
+    Args:
+        hidden:       (B, T, D) hidden states from encode_to_hidden.
+        labels:       (B, T)    integer token ids (same as input_ids).
+        decode_fn:    Callable (chunk_h: (C, T, D)) -> (C, T, V) logits.
+        pad_token_id: Padding token id (masked out of loss).
+        chunk_size:   Number of samples to decode at once.
+
+    Returns:
+        Scalar loss averaged over non-padding tokens.
+    """
+    B, T, D = hidden.shape
+
+    # Pad batch to a multiple of chunk_size if needed
+    remainder = B % chunk_size
+    if remainder != 0:
+        pad = chunk_size - remainder
+        hidden = jnp.concatenate(
+            [hidden, jnp.zeros((pad, T, D), dtype=hidden.dtype)], axis=0
+        )
+        labels = jnp.concatenate(
+            [labels, jnp.zeros((pad, T), dtype=labels.dtype)], axis=0
+        )
+        B_padded = B + pad
+    else:
+        B_padded = B
+
+    n_chunks = B_padded // chunk_size
+    hidden_chunks = hidden.reshape(n_chunks, chunk_size, T, D)
+    labels_chunks = labels.reshape(n_chunks, chunk_size, T)
+
+    # Checkpoint decode_fn so XLA recomputes logits in backward pass
+    # rather than storing all chunks' logits simultaneously.
+    checkpointed_decode = jax.checkpoint(decode_fn)
+
+    def scan_body(carry, chunk):
+        chunk_h, chunk_l = chunk
+        # Apply LM head: (chunk_size, T, D) → (chunk_size, T, V)
+        chunk_logits = checkpointed_decode(chunk_h)
+        # Always compute loss in float32 for stability
+        chunk_logits = chunk_logits.astype(jnp.float32)
+
+        shift_logits = chunk_logits[:, :-1, :]
+        shift_labels = chunk_l[:, 1:]
+
+        per_token_loss = optax.softmax_cross_entropy_with_integer_labels(
+            shift_logits, shift_labels
+        )
+        mask = (shift_labels != pad_token_id).astype(jnp.float32)
+        return carry, (per_token_loss * mask, mask)
+
+    _, (weighted_losses, masks) = jax.lax.scan(
+        scan_body,
+        None,
+        (hidden_chunks, labels_chunks),
+    )
+
+    total_loss = weighted_losses.sum()
+    total_mask = masks.sum()
+    return total_loss / (total_mask + 1e-9)
+
+
+@functools.partial(jax.jit, static_argnames=["pad_token_id", "precision_loss_weight", "sigma_anneal_steps", "use_bf16", "loss_chunk_size"], donate_argnums=(0,))
 def train_step(state, batch, pad_token_id=0,
                precision_loss_weight=0.0, sigma_anneal_steps=0,
-               use_bf16=False):
+               use_bf16=False, loss_chunk_size=0):
     """One training step with precision routing support.
 
     New vs original:
@@ -149,25 +225,52 @@ def train_step(state, batch, pad_token_id=0,
         else:
             compute_params = params
 
-        logits, (_, indices, mean_sigma) = state.apply_fn(
-            {"params": compute_params},
-            batch,
-            deterministic=False,
-            sigma_max_scale=sigma_scale,
-            rngs={"dropout": dropout_rng},
-        )
+        if loss_chunk_size > 0:
+            # ── Chunked LM loss path ───────────────────────────────────────
+            # Run encode+reasoning (no LM head) → tiny (B, T, D) hidden state.
+            # Then apply LM head in sub-batches of `loss_chunk_size` so the
+            # peak (chunk_size, T, V) logits tensor is tiny.
+            state_hidden, (_, indices, mean_sigma) = state.apply_fn(
+                {"params": compute_params},
+                batch,
+                deterministic=False,
+                sigma_max_scale=sigma_scale,
+                rngs={"dropout": dropout_rng},
+                method=lambda mod, *a, **kw: mod.encode_to_hidden(*a, **kw),
+            )
 
-        # Cast logits back to float32 for numerically stable loss computation
-        logits = logits.astype(jnp.float32)
+            def decode_fn(chunk_h):
+                return state.apply_fn(
+                    {"params": compute_params},
+                    chunk_h,
+                    method=lambda mod, h: mod.controller.decode(h),
+                )
 
-        shift_logits = logits[:, :-1, :]
-        shift_labels = batch[:, 1:]
+            lm_loss = chunked_lm_loss(
+                state_hidden, batch, decode_fn, pad_token_id, loss_chunk_size
+            )
+            lm_loss = lm_loss.astype(jnp.float32)
+        else:
+            # ── Standard path: full (B, T, V) logits ──────────────────────
+            logits, (_, indices, mean_sigma) = state.apply_fn(
+                {"params": compute_params},
+                batch,
+                deterministic=False,
+                sigma_max_scale=sigma_scale,
+                rngs={"dropout": dropout_rng},
+            )
 
-        lm_loss = optax.softmax_cross_entropy_with_integer_labels(
-            shift_logits, shift_labels
-        )
-        mask = (shift_labels != pad_token_id).astype(jnp.float32)
-        lm_loss = (lm_loss * mask).sum() / (mask.sum() + 1e-9)
+            # Cast logits back to float32 for numerically stable loss computation
+            logits = logits.astype(jnp.float32)
+
+            shift_logits = logits[:, :-1, :]
+            shift_labels = batch[:, 1:]
+
+            lm_loss = optax.softmax_cross_entropy_with_integer_labels(
+                shift_logits, shift_labels
+            )
+            mask = (shift_labels != pad_token_id).astype(jnp.float32)
+            lm_loss = (lm_loss * mask).sum() / (mask.sum() + 1e-9)
 
         # ── Precision auxiliary loss ────────────────────────────────────────
         # Penalises broad sigma (large = imprecise retrieval).

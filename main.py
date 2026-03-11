@@ -157,6 +157,13 @@ def main():
         help="Use bfloat16 mixed precision (halves activation memory)",
     )
     parser.add_argument(
+        "--loss_chunk_size",
+        type=int,
+        default=0,
+        help="Chunk size for chunked cross-entropy loss (0=disabled). "
+             "Avoids materialising full (B,T,V) logits; recommended: 16 for TPU v5e-8.",
+    )
+    parser.add_argument(
         "--resume_data",
         action="store_true",
         help="Resume data loader from the checkpointed step",
@@ -223,6 +230,9 @@ def main():
 
     if args.bf16:
         config.use_bf16 = True
+
+    if args.loss_chunk_size > 0:
+        config.loss_chunk_size = args.loss_chunk_size
 
     # Create device mesh - handles 1 to N devices automatically
     devices = mesh_utils.create_device_mesh((jax.device_count(),))
@@ -605,6 +615,7 @@ def main():
                 precision_loss_weight=getattr(config, 'precision_loss_weight', 0.0),
                 sigma_anneal_steps=getattr(config, 'sigma_anneal_steps', 0),
                 use_bf16=getattr(config, 'use_bf16', False),
+                loss_chunk_size=getattr(config, 'loss_chunk_size', 0),
             )
 
             epoch_loss += loss

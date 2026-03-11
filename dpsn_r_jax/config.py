@@ -80,6 +80,10 @@ class DPSNRConfig:
     num_workers: int = 4
     gradient_checkpointing: bool = False
     use_bf16: bool = False
+    # LM head chunking: compute cross-entropy in sub-batches of this size to
+    # avoid ever materialising the full (B, T, vocab) logits tensor.
+    # 0 = disabled (standard path).  Recommended: 16 for TPU v5e-8.
+    loss_chunk_size: int = 0
     # ── Indexer improvements ───────────────────────────────────────────────
     num_indexer_heads: int = 1      # Multi-head pool queries per reasoning step
     sigma_min: float = 0.01         # Minimum retrieval bandwidth (sharp/precise)

@@ -76,6 +76,37 @@ class DPSNR(nn.Module):
             aux:          (max_loops, all_indices, mean_sigma)
                           mean_sigma is logged and used for precision loss.
         """
+        state_hidden, all_indices, mean_sigma = self._encode_hidden(
+            input_ids, deterministic, sigma_max_scale
+        )
+
+        # 3. Decode — the expensive (B, T, V) step
+        logits = self.controller.decode(state_hidden)
+
+        return logits, (self.config.max_reasoning_loops, all_indices, mean_sigma)
+
+    def encode_to_hidden(self, input_ids, deterministic=True, sigma_max_scale: float = 1.0):
+        """Run controller + reasoning loop and return state_hidden WITHOUT the LM head.
+
+        Used by chunked_lm_loss in trainer.py to avoid materialising the full
+        (B, T, vocab) logits tensor.  Only the compact (B, T, D) hidden tensor
+        is returned; the LM head is applied later in small batch chunks.
+
+        Returns:
+            state_hidden: (B, T, D)
+            aux:          (max_loops, all_indices, mean_sigma)
+        """
+        state_hidden, all_indices, mean_sigma = self._encode_hidden(
+            input_ids, deterministic, sigma_max_scale
+        )
+        return state_hidden, (self.config.max_reasoning_loops, all_indices, mean_sigma)
+
+    def _encode_hidden(self, input_ids, deterministic=True, sigma_max_scale: float = 1.0):
+        """Core shared encoder: controller + reasoning loop.
+
+        Returns (state_hidden, all_indices, mean_sigma).
+        Called by both __call__ and encode_to_hidden so they share code.
+        """
         # 1. Encode
         # MUST pass deterministic as a positional argument so static_argnums=(1,) catches it!
         hidden = self.controller(input_ids, deterministic)
@@ -84,7 +115,7 @@ class DPSNR(nn.Module):
         state_hidden = hidden
         B, T, D = hidden.shape
 
-        halt_prob = jnp.zeros((B, T, 1), dtype=hidden.dtype)
+        halt_prob   = jnp.zeros((B, T, 1), dtype=hidden.dtype)
         halted_mask = jnp.zeros((B, T, 1), dtype=hidden.dtype)
 
         # ── Warm-up calls: force Flax to trace all sub-modules before scan ────
@@ -178,7 +209,7 @@ class DPSNR(nn.Module):
 
             return (s_hidden, h_prob, new_h_mask), (start_indices, mean_sigma_step)
 
-        # Do not use jax.checkpoint on reasoning_step directly, because it captures Flax module 
+        # Do not use jax.checkpoint on reasoning_step directly, because it captures Flax module
         # methods (self.indexer, self.acc) which interact with Flax's variable dictionary.
         # This causes JAX tracer leaks. Checkpointing is already handled at the module level
         # for TinyController and AdaptiveComputeController.
@@ -194,13 +225,10 @@ class DPSNR(nn.Module):
             )
         )
 
-        # 3. Decode
-        logits = self.controller.decode(state_hidden)
-
         # all_indices: (max_loops, heads*B) → transpose to (B*heads, max_loops)
         all_indices = jnp.transpose(all_indices, (1, 0))
 
         # mean_sigma averaged across all reasoning loops
         mean_sigma = jnp.mean(sigma_per_loop)
 
-        return logits, (self.config.max_reasoning_loops, all_indices, mean_sigma)
+        return state_hidden, all_indices, mean_sigma
