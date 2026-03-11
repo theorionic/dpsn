@@ -209,21 +209,30 @@ class DPSNR(nn.Module):
 
             return (s_hidden, h_prob, new_h_mask), (start_indices, mean_sigma_step)
 
-        # Do not use jax.checkpoint on reasoning_step directly, because it captures Flax module
-        # methods (self.indexer, self.acc) which interact with Flax's variable dictionary.
-        # This causes JAX tracer leaks. Checkpointing is already handled at the module level
-        # for TinyController and AdaptiveComputeController.
-        # if self.config.gradient_checkpointing:
-        #     reasoning_step = jax.checkpoint(reasoning_step)
+        # ── Optional gradient checkpointing on reasoning_step ─────────────────
+        # The old tracer-leak (TracerBoolConversionError) was because the
+        # previous reasoning_step closed over `deterministic` (a JAX bool
+        # tracer).  In _encode_hidden, reasoning_step only closes over `self`,
+        # `sigma_max_scale`, `use_2d`, `H`, `T` — concrete Python values —
+        # so jax.checkpoint is now safe to use.
+        #
+        # Without checkpointing, the backward stores 18+ buffers of shape
+        # f32[max_loops, B/chips, T, D] = ~450 MB each → 8+ GB total at BS=200.
+        # With checkpointing, XLA recomputes reasoning_step during backward
+        # keeping peak memory to one loop iteration at a time.
+        _scan_fn = reasoning_step
+        if self.config.gradient_checkpointing:
+            _scan_fn = jax.checkpoint(reasoning_step)
 
         init_carry = (state_hidden, halt_prob, halted_mask)
         (state_hidden, halt_prob, halted_mask), (all_indices, sigma_per_loop) = (
             jax.lax.scan(
-                reasoning_step,
+                _scan_fn,
                 init_carry,
                 jnp.arange(self.config.max_reasoning_loops),
             )
         )
+
 
         # all_indices: (max_loops, heads*B) → transpose to (B*heads, max_loops)
         all_indices = jnp.transpose(all_indices, (1, 0))
