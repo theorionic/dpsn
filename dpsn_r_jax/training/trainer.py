@@ -138,14 +138,10 @@ def chunked_lm_loss(
     hidden_chunks = hidden.reshape(n_chunks, chunk_size, T, D)
     labels_chunks = labels.reshape(n_chunks, chunk_size, T)
 
-    # Checkpoint decode_fn so XLA recomputes logits in backward pass
-    # rather than storing all chunks' logits simultaneously.
-    checkpointed_decode = jax.checkpoint(decode_fn)
-
     def scan_body(carry, chunk):
         chunk_h, chunk_l = chunk
         # Apply LM head: (chunk_size, T, D) → (chunk_size, T, V)
-        chunk_logits = checkpointed_decode(chunk_h)
+        chunk_logits = decode_fn(chunk_h)
         # Always compute loss in float32 for stability
         chunk_logits = chunk_logits.astype(jnp.float32)
 
@@ -158,8 +154,17 @@ def chunked_lm_loss(
         mask = (shift_labels != pad_token_id).astype(jnp.float32)
         return carry, (per_token_loss * mask, mask)
 
+    # ── Checkpoint the ENTIRE scan body, not just decode_fn ───────────────
+    # With jax.checkpoint(decode_fn) only, scan backward still stores
+    # chunk_logits (the OUTPUT of decode_fn) across ALL chunks, producing a
+    # f32[n_chunks, chunk_size, T-1, V] buffer — that's as big as the full
+    # batch logits and defeats the purpose.
+    #
+    # By checkpointing the whole body, scan stores only the tiny per-chunk
+    # INPUTS (chunk_h, chunk_l) and RECOMPUTES the body (decode + cross-entropy)
+    # during backward.  Peak logit memory = one chunk at a time.
     _, (weighted_losses, masks) = jax.lax.scan(
-        scan_body,
+        jax.checkpoint(scan_body),
         None,
         (hidden_chunks, labels_chunks),
     )
