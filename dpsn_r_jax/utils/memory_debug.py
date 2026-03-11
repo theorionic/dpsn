@@ -87,13 +87,14 @@ def print_tpu_memory(label: str = "") -> None:
     print(f"{sep}\n")
 
 
-def print_param_memory(state: Any, config: Any, batch_size: int) -> None:
+def print_param_memory(state: Any, config: Any, batch_size: int, loss_chunk_size: int = 0) -> None:
     """Print a per-component HBM breakdown for params, optimizer, and activations.
 
     Args:
-        state:      The TrainState object.
-        config:     DPSNRConfig.
-        batch_size: Current batch size (used for activation estimates).
+        state:           The TrainState object.
+        config:          DPSNRConfig.
+        batch_size:      Current batch size (used for activation estimates).
+        loss_chunk_size: If > 0, logits peak is per-chunk; 0 = full batch.
     """
     sep  = "═" * 72
     sep2 = "─" * 72
@@ -181,8 +182,19 @@ def print_param_memory(state: Any, config: Any, batch_size: int) -> None:
                     f"remat saves ~{L-1}/{L} layers")
     a_ffn     = est(B * L * T * ff,"FFN intermediates (all layers)",
                     "remat saves ~{}/{} layers".format(L-1, L))
-    a_logits  = est(B * T * V,     "Logits  (B×T×V  — LARGEST)",
-                    f"{B}×{T}×{V}")
+
+    # Logits: with chunked loss only one chunk is live at a time
+    if loss_chunk_size > 0:
+        full_logits_bytes  = B * T * V * act_factor * 2
+        chunk_logits_bytes = loss_chunk_size * T * V * act_factor * 2
+        saving_gb = _gb(full_logits_bytes - chunk_logits_bytes)
+        a_logits = chunk_logits_bytes
+        print(f"  {'Logits peak  (chunked, per chunk)':<40}  {_gb(a_logits):7.3f} GB"
+              f"  (chunk={loss_chunk_size}×{T}×{V}, saves {saving_gb:.2f} GB vs full)")
+    else:
+        a_logits  = est(B * T * V, "Logits  (B×T×V  — LARGEST)",
+                        f"{B}×{T}×{V}")
+
     a_reason  = est(R * B * T * D, "Reasoning loop states (NOT remated)",
                     f"{R} loops × (B,T,D)")
 

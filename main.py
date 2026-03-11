@@ -519,7 +519,8 @@ def main():
     print("=" * 50 + "\n")
 
     # ── Memory breakdown (static: params + optimizer + activation estimates) ──
-    print_param_memory(state, config, args.batch_size)
+    print_param_memory(state, config, args.batch_size,
+                       loss_chunk_size=getattr(config, 'loss_chunk_size', 0))
     print_tpu_memory("after model init (before first train_step compile)")
 
     from dpsn_r_jax.training.trainer import train_step
