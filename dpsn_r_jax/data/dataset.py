@@ -312,6 +312,9 @@ class BackgroundGenerator:
             try:
                 batch = self.dataset.get_batch(self.batch_size)
                 self.queue.put(batch)
+            except StopIteration as e:
+                self.queue.put(e)
+                break
             except Exception as e:
                 import traceback
                 traceback.print_exc()

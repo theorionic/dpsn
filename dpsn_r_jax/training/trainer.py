@@ -93,9 +93,10 @@ def create_train_state(rng, config, learning_rate_fn=None):
 
 import functools
 
-@functools.partial(jax.jit, static_argnames=["pad_token_id", "precision_loss_weight", "sigma_anneal_steps"], donate_argnums=(0,))
+@functools.partial(jax.jit, static_argnames=["pad_token_id", "precision_loss_weight", "sigma_anneal_steps", "use_bf16"], donate_argnums=(0,))
 def train_step(state, batch, pad_token_id=0,
-               precision_loss_weight=0.0, sigma_anneal_steps=0):
+               precision_loss_weight=0.0, sigma_anneal_steps=0,
+               use_bf16=False):
     """One training step with precision routing support.
 
     New vs original:
@@ -113,6 +114,8 @@ def train_step(state, batch, pad_token_id=0,
         pad_token_id:            ignored positions
         precision_loss_weight:   max weight for sigma penalty (0 = disabled)
         sigma_anneal_steps:      steps over which precision weight is ramped in
+        use_bf16:                if True, cast params & batch to bfloat16 for
+                                 the forward pass (halves activation memory)
 
     Returns:
         new_state, loss (float), mean_sigma (float)
@@ -135,13 +138,27 @@ def train_step(state, batch, pad_token_id=0,
         effective_precision_weight = 0.0
 
     def loss_fn(params):
+        # ── BFloat16 mixed precision ───────────────────────────────────────
+        # Cast params to bf16 for the forward pass only.  Optimizer state
+        # stays in float32 for numerical stability.  All activations and
+        # logits are computed in bf16, halving their memory footprint.
+        if use_bf16:
+            compute_params = jax.tree_util.tree_map(
+                lambda x: x.astype(jnp.bfloat16), params
+            )
+        else:
+            compute_params = params
+
         logits, (_, indices, mean_sigma) = state.apply_fn(
-            {"params": params},
+            {"params": compute_params},
             batch,
             deterministic=False,
             sigma_max_scale=sigma_scale,
             rngs={"dropout": dropout_rng},
         )
+
+        # Cast logits back to float32 for numerically stable loss computation
+        logits = logits.astype(jnp.float32)
 
         shift_logits = logits[:, :-1, :]
         shift_labels = batch[:, 1:]
@@ -155,7 +172,7 @@ def train_step(state, batch, pad_token_id=0,
         # ── Precision auxiliary loss ────────────────────────────────────────
         # Penalises broad sigma (large = imprecise retrieval).
         # The model is rewarded for using narrower, more targeted windows.
-        precision_loss = effective_precision_weight * mean_sigma
+        precision_loss = effective_precision_weight * jnp.float32(mean_sigma)
 
         total_loss = lm_loss + precision_loss
         return total_loss, (indices, mean_sigma)
