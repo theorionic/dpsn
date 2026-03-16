@@ -468,57 +468,57 @@ def main():
         for i, f in enumerate(npy_files):
             print(f"  [{i+1}/{len(npy_files)}] {os.path.basename(f)}")
     else:
-        # Fallback: original loader path for non-NPY datasets
-        grain_loader = get_grain_loader(
-            args.dataset_path, args, start_step=loader_start_step
-        )
+        # Resolve the primary dataset name: --hf_dataset takes precedence,
+        # falling back to the first entry in --hf_datasets.
+        primary_hf = args.hf_dataset or (args.hf_datasets[0] if getattr(args, "hf_datasets", None) else None)
 
-        if grain_loader:
-            print(f"Using Google Grain data loader (start_step={loader_start_step}).")
+        if getattr(args, "chunk_size", 0) > 0 and primary_hf:
+            # ── Chunk-based mode (recommended for TPU): ──────────────────────
+            # Downloads `chunk_size` rows at once via the HF streaming iterator,
+            # tokenizes them in parallel across `num_workers` CPU cores,
+            # shuffles the whole chunk in RAM, then serves batches at memory
+            # speed.  A background thread keeps the next chunk ready so there
+            # is zero training stall at chunk boundaries.
+            print(
+                f"Loading HF dataset (CHUNK mode): '{primary_hf}' | "
+                f"chunk_size={args.chunk_size:,} rows | "
+                f"{args.num_workers} tokenizer workers"
+            )
+            dataset = ChunkedHFDataset(
+                dataset_name=primary_hf,
+                tokenizer_name=tokenizer_name,
+                chunk_size=args.chunk_size,
+                subset=args.hf_subset,
+                split="train",
+                seq_len=config.max_seq_len,
+                batch_size=args.batch_size,
+                num_tokenizer_workers=args.num_workers,
+                text_columns=args.hf_text_column or None,
+            )
+        else:
+            # Fallback: original loader path for non-chunked HF or non-NPY datasets
+            grain_loader = get_grain_loader(
+                args.dataset_path, args, start_step=loader_start_step
+            )
 
-            class GrainWrapper:
-                def __init__(self, loader):
-                    self.loader = loader
-                    self.iterator = iter(loader)
+            if grain_loader:
+                print(f"Using Google Grain data loader (start_step={loader_start_step}).")
 
-                def get_batch(self, batch_size=None):
-                    try:
-                        batch = next(self.iterator)
-                    except StopIteration:
-                        self.iterator = iter(self.loader)
-                        batch = next(self.iterator)
-                    return batch["input_ids"]
+                class GrainWrapper:
+                    def __init__(self, loader):
+                        self.loader = loader
+                        self.iterator = iter(loader)
 
-            dataset = GrainWrapper(grain_loader)
-        elif args.hf_dataset or args.hf_datasets:
-            # Resolve the primary dataset name: --hf_dataset takes precedence,
-            # falling back to the first entry in --hf_datasets.
-            primary_hf = args.hf_dataset or (args.hf_datasets[0] if args.hf_datasets else None)
+                    def get_batch(self, batch_size=None):
+                        try:
+                            batch = next(self.iterator)
+                        except StopIteration:
+                            self.iterator = iter(self.loader)
+                            batch = next(self.iterator)
+                        return batch["input_ids"]
 
-            if getattr(args, "chunk_size", 0) > 0:
-                # ── Chunk-based mode (recommended for TPU): ──────────────────────
-                # Downloads `chunk_size` rows at once via the HF streaming iterator,
-                # tokenizes them in parallel across `num_workers` CPU cores,
-                # shuffles the whole chunk in RAM, then serves batches at memory
-                # speed.  A background thread keeps the next chunk ready so there
-                # is zero training stall at chunk boundaries.
-                print(
-                    f"Loading HF dataset (CHUNK mode): '{primary_hf}' | "
-                    f"chunk_size={args.chunk_size:,} rows | "
-                    f"{args.num_workers} tokenizer workers"
-                )
-                dataset = ChunkedHFDataset(
-                    dataset_name=primary_hf,
-                    tokenizer_name=tokenizer_name,
-                    chunk_size=args.chunk_size,
-                    subset=args.hf_subset,
-                    split="train",
-                    seq_len=config.max_seq_len,
-                    batch_size=args.batch_size,
-                    num_tokenizer_workers=args.num_workers,
-                    text_columns=args.hf_text_column or None,
-                )
-            else:
+                dataset = GrainWrapper(grain_loader)
+            elif primary_hf:
                 # ── Legacy streaming mode: row-by-row, N parallel worker processes ──
                 print(
                     f"Loading HF dataset (streaming mode): '{primary_hf}' "
@@ -533,11 +533,11 @@ def main():
                     num_workers=args.num_workers,
                     prefetch_batches=100,
                 )
-        else:
-            print("Generating synthetic sorting dataset...")
-            dataset = SyntheticReasoningDataset(
-                size=args.dataset_size, seq_len=config.max_seq_len
-            )
+            else:
+                print("Generating synthetic sorting dataset...")
+                dataset = SyntheticReasoningDataset(
+                    size=args.dataset_size, seq_len=config.max_seq_len
+                )
 
     def count_params(tree):
         return sum(x.size for x in jax.tree_util.tree_leaves(tree))
