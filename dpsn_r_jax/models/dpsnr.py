@@ -123,10 +123,6 @@ class DPSNR(nn.Module):
             jnp.zeros((B, T, D)), sigma_max_scale=sigma_max_scale
         )
         if self.config.use_2d_pool:
-            H = self.config.num_indexer_heads
-            # For 2D pool, indexer outputs _mu (B, H) for row and col alternating.
-            # Use half-heads for row, half for col.
-            h_per_dim = max(1, H // 2)
             _ = self.pool(
                 jnp.zeros((B,)), jnp.zeros((B,)), jnp.zeros((B,))
             )
@@ -148,35 +144,48 @@ class DPSNR(nn.Module):
             mu, sigma = self.indexer(s_hidden, sigma_max_scale=sigma_max_scale)
             # mu: (B, H), sigma: (B, H)
 
-            # ── 2. Per-head pool retrieval ────────────────────────────────────
-            all_retrieved = []
-            all_start_indices = []
-
+            # ── 2. Per-head pool retrieval — vectorized with jax.vmap ─────────
+            # Instead of a Python for-loop (which XLA unrolls into separate
+            # kernel launches), vmap dispatches all heads as a single fused op.
             if use_2d:
-                # 2D pool: each head supplies (mu_row, mu_col) from consecutive
-                # pairs of heads. If H=1 reuse same coord for row and col.
+                # 2D pool: pair heads into (row, col) couples.
+                # heads_per_dim pairs → each pair uses consecutive head indices.
                 heads_per_dim = max(1, H // 2)
-                for h in range(heads_per_dim):
-                    h_row = h
-                    h_col = min(h + heads_per_dim, H - 1)
-                    # Use same sigma across both axes (mean of the two heads)
-                    sigma_h = (sigma[:, h_row] + sigma[:, h_col]) / 2.0
-                    retrieved_h, start_idx_h = self.pool(
-                        mu[:, h_row], mu[:, h_col], sigma_h
-                    )
-                    all_retrieved.append(retrieved_h)
-                    all_start_indices.append(start_idx_h)
+                h_row_ids = jnp.arange(heads_per_dim)                     # (P,)
+                h_col_ids = jnp.minimum(h_row_ids + heads_per_dim, H - 1) # (P,)
+
+                # mu_r/mu_c: (B, P);  sigma_h: (B, P) — mean of both axes
+                mu_r    = mu[:, h_row_ids]                                 # (B, P)
+                mu_c    = mu[:, h_col_ids]                                 # (B, P)
+                sigma_h = (sigma[:, h_row_ids] + sigma[:, h_col_ids]) / 2.0  # (B, P)
+
+                # vmap over the head-pair axis (axis-1 of each input)
+                # in_axes=(1,1,1) → iterates over head dim; out_axes=1 → stacks on axis-1
+                def pool2d_head(mu_r_h, mu_c_h, sig_h):
+                    """Single head: inputs (B,), outputs (B,D) and (B,)."""
+                    return self.pool(mu_r_h, mu_c_h, sig_h)
+
+                retrieved_all, start_all = jax.vmap(
+                    pool2d_head, in_axes=(1, 1, 1), out_axes=(1, 1)
+                )(mu_r, mu_c, sigma_h)
+                # retrieved_all: (B, P, D)   start_all: (B, P)
+
+                retrieved     = jnp.mean(retrieved_all, axis=1)  # (B, D)
+                start_indices = start_all.reshape(-1)             # (B*P,)
+
             else:
-                for h in range(H):
-                    retrieved_h, start_idx_h = self.pool(mu[:, h], sigma[:, h])
-                    all_retrieved.append(retrieved_h)
-                    all_start_indices.append(start_idx_h)
+                # 1D pool: vmap over the H heads stored in axis-1
+                def pool1d_head(mu_h, sig_h):
+                    """Single head: inputs (B,), outputs (B,D) and (B,)."""
+                    return self.pool(mu_h, sig_h)
 
-            # Average retrieved vectors across heads → (B, D)
-            retrieved = jnp.mean(jnp.stack(all_retrieved, axis=1), axis=1)
+                retrieved_all, start_all = jax.vmap(
+                    pool1d_head, in_axes=(1, 1), out_axes=(1, 1)
+                )(mu, sigma)
+                # retrieved_all: (B, H, D)   start_all: (B, H)
 
-            # Concatenate start indices across heads → sparse Adam can update all
-            start_indices = jnp.concatenate(all_start_indices, axis=0)   # (heads*B,)
+                retrieved     = jnp.mean(retrieved_all, axis=1)  # (B, D)
+                start_indices = start_all.reshape(-1)             # (B*H,)
 
             # ── Mean sigma for logging and precision loss ─────────────────────
             mean_sigma_step = jnp.mean(sigma)   # scalar

@@ -33,6 +33,7 @@ except ImportError:
 from dpsn_r_jax.config import DPSNRConfig, get_model_config
 from dpsn_r_jax.models.dpsnr import DPSNR
 from dpsn_r_jax.data.dataset import (
+    ChunkedHFDataset,
     MultiprocessingHFDataset,
     SyntheticReasoningDataset,
     BackgroundGenerator,
@@ -110,6 +111,18 @@ def main():
     )
     parser.add_argument(
         "--hf_tokenizer", type=str, default=None, help="HuggingFace tokenizer"
+    )
+    parser.add_argument(
+        "--chunk_size",
+        type=int,
+        default=0,
+        help=(
+            "Download the HF dataset in fixed-size chunks of N rows (e.g. 10000). "
+            "Each chunk is fully downloaded, tokenized with multiple processes, "
+            "and shuffled in RAM before training; the next chunk is prefetched in "
+            "the background so there is no stall at chunk boundaries. "
+            "0 = disabled (uses the default streaming row-by-row mode)."
+        ),
     )
     parser.add_argument(
         "--dataset_path",
@@ -477,19 +490,49 @@ def main():
                     return batch["input_ids"]
 
             dataset = GrainWrapper(grain_loader)
-        elif args.hf_dataset:
-            print(
-                f"Loading HF multiprocessing dataset: {args.hf_dataset} (subset: {args.hf_subset}) with {args.num_workers} workers"
-            )
-            dataset = MultiprocessingHFDataset(
-                dataset_name=args.hf_dataset,
-                tokenizer_name=tokenizer_name,
-                subset=args.hf_subset,
-                seq_len=config.max_seq_len,
-                batch_size=args.batch_size,
-                num_workers=args.num_workers,
-                prefetch_batches=100
-            )
+        elif args.hf_dataset or args.hf_datasets:
+            # Resolve the primary dataset name: --hf_dataset takes precedence,
+            # falling back to the first entry in --hf_datasets.
+            primary_hf = args.hf_dataset or (args.hf_datasets[0] if args.hf_datasets else None)
+
+            if getattr(args, "chunk_size", 0) > 0:
+                # ── Chunk-based mode (recommended for TPU): ──────────────────────
+                # Downloads `chunk_size` rows at once via the HF streaming iterator,
+                # tokenizes them in parallel across `num_workers` CPU cores,
+                # shuffles the whole chunk in RAM, then serves batches at memory
+                # speed.  A background thread keeps the next chunk ready so there
+                # is zero training stall at chunk boundaries.
+                print(
+                    f"Loading HF dataset (CHUNK mode): '{primary_hf}' | "
+                    f"chunk_size={args.chunk_size:,} rows | "
+                    f"{args.num_workers} tokenizer workers"
+                )
+                dataset = ChunkedHFDataset(
+                    dataset_name=primary_hf,
+                    tokenizer_name=tokenizer_name,
+                    chunk_size=args.chunk_size,
+                    subset=args.hf_subset,
+                    split="train",
+                    seq_len=config.max_seq_len,
+                    batch_size=args.batch_size,
+                    num_tokenizer_workers=args.num_workers,
+                    text_columns=args.hf_text_column or None,
+                )
+            else:
+                # ── Legacy streaming mode: row-by-row, N parallel worker processes ──
+                print(
+                    f"Loading HF dataset (streaming mode): '{primary_hf}' "
+                    f"(subset: {args.hf_subset}) with {args.num_workers} workers"
+                )
+                dataset = MultiprocessingHFDataset(
+                    dataset_name=primary_hf,
+                    tokenizer_name=tokenizer_name,
+                    subset=args.hf_subset,
+                    seq_len=config.max_seq_len,
+                    batch_size=args.batch_size,
+                    num_workers=args.num_workers,
+                    prefetch_batches=100,
+                )
         else:
             print("Generating synthetic sorting dataset...")
             dataset = SyntheticReasoningDataset(
@@ -530,12 +573,28 @@ def main():
     distributed_train_step = train_step
 
     flops_per_step = calculate_flops(config, args.batch_size)
-    steps_per_epoch = max(1, args.dataset_size // args.batch_size)
+
+    # For infinite HF streaming/chunked datasets, steps_per_epoch from
+    # dataset_size is meaningless.  Use max_steps as the epoch length so the
+    # training loop runs until the step cap, otherwise fall back to the size
+    # estimate (for local .npy and synthetic datasets).
+    is_hf_streaming = (
+        not use_sequential_npy
+        and (args.hf_dataset or args.hf_datasets)
+    )
+    if is_hf_streaming and args.max_steps:
+        steps_per_epoch = args.max_steps
+    else:
+        steps_per_epoch = max(1, args.dataset_size // args.batch_size)
 
     # Define test samples for generation
     test_samples = ["Sort: 5 2 8 1 ->", "Sort: 10 3 7 ->", "Sort: 1 1 1 ->"]
 
     # ── Build data pipeline (non-sequential path) ──────────────────────────
+    # Track whether the dataset already manages its own background prefetch
+    # so we don't double-wrap with BackgroundGenerator.
+    _dataset_is_chunked = isinstance(dataset, ChunkedHFDataset) if not use_sequential_npy else False
+
     if not use_sequential_npy:
         if args.ram_cache_gb > 0:
             cache_source = dataset
@@ -569,17 +628,31 @@ def main():
                 cache_size_gb=args.ram_cache_gb,
                 prefill_pct=args.prefill_pct,
             )
-        else:
+            _dataset_is_chunked = False  # TokenizedRAMCache doesn't self-prefetch
+
+        elif not _dataset_is_chunked:
+            # Only wrap non-self-prefetching datasets.  ChunkedHFDataset already
+            # has its own background thread — adding BackgroundGenerator on top
+            # would add an extra queue hop and ~1 ms of latency per batch.
             dataset = BackgroundGenerator(dataset, args.batch_size, prefetch_size=50)
 
+        else:
+            print(
+                "[ChunkedHFDataset] Skipping BackgroundGenerator wrap — "
+                "ChunkedHFDataset self-prefetches via its own background thread."
+            )
+
+        # ChunkedHFDataset serves batches from RAM; use a deeper on-device prefetch
+        # buffer so XLA always has the next batch staged on TPU HBM.
+        _prefetch_depth = 4 if _dataset_is_chunked else 2
         dataset = DevicePrefetchIterator(
             data_source=dataset,
             batch_size=args.batch_size,
             sharding=batch_sharding,
-            prefetch_depth=2,
+            prefetch_depth=_prefetch_depth,
         )
 
-    LOG_INTERVAL = 50  # sync + log every N steps (lower = more sync overhead)
+    LOG_INTERVAL = 200  # sync + log every N steps; lower = more block_until_ready stalls
 
     tokens_per_sec = 0.0
     tflops = 0.0
@@ -828,10 +901,17 @@ def main():
                 print(f"Saving checkpoint at end of epoch {epoch + 1} (step {global_step})...")
                 checkpoint_manager.save(global_step, state)
 
+        # ── Gracefully shut down ChunkedHFDataset background thread ──────────
+        # The DevicePrefetchIterator wraps the dataset; reach through to stop().
+        if _dataset_is_chunked:
+            _inner = getattr(dataset, 'data_source', dataset)
+            if hasattr(_inner, 'stop'):
+                _inner.stop()
+
     # Generation Test
     print("\nVerifying model generation...")
 
-    if args.hf_dataset:
+    if args.hf_dataset or args.hf_datasets:
         prompt = "The quick brown fox"
         print(f"Input: {prompt}")
         output = generate(

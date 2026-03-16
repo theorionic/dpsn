@@ -158,7 +158,11 @@ def get_model_config(name: str) -> DPSNRConfig:
 
     elif name == "base":
         return DPSNRConfig(
-            vocab_size=50257,  # GPT-Neo / Standard
+            # vocab_size=50304 is the next multiple of 128 above GPT-2's 50257.
+            # Setting it explicitly avoids XLA's internal padding of the LM head
+            # matmul (hidden_dim, vocab_size), which wastes MXU cycles on TPU.
+            # Same trick used by GPT-NeoX and Llama tokenizers.
+            vocab_size=50304,  # 393 × 128 = 50304
             controller_hidden_dim=512,
             controller_num_layers=6,
             controller_num_heads=8,
@@ -171,7 +175,7 @@ def get_model_config(name: str) -> DPSNRConfig:
 
     elif name == "large":
         return DPSNRConfig(
-            vocab_size=50257,
+            vocab_size=50304,  # 393 × 128, MXU-aligned
             controller_hidden_dim=768,
             controller_num_layers=12,
             controller_num_heads=12,
@@ -184,7 +188,7 @@ def get_model_config(name: str) -> DPSNRConfig:
 
     elif name == "xl":
         return DPSNRConfig(
-            vocab_size=50257,
+            vocab_size=50304,  # 393 × 128, MXU-aligned
             controller_hidden_dim=1024,
             controller_num_layers=16,
             controller_num_heads=16,
@@ -231,7 +235,7 @@ def get_model_config(name: str) -> DPSNRConfig:
     elif name == "precise_large":
         return DPSNRConfig(
             # Same 340M params as large, but with full precision routing
-            vocab_size=50257,
+            vocab_size=50304,  # 393 × 128, MXU-aligned
             controller_hidden_dim=768,
             controller_num_layers=12,
             controller_num_heads=12,

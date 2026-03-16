@@ -1,4 +1,4 @@
-from .dataset import SyntheticReasoningDataset, HFStreamingDataset
+from .dataset import SyntheticReasoningDataset, HFStreamingDataset, ChunkedHFDataset
 from .tokenizer import SimpleNumberTokenizer, get_tokenizer
 from .templates import (
     PromptTemplate,

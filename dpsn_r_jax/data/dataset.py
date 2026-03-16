@@ -2,11 +2,54 @@ import random
 import threading
 import queue
 import time
+import gc
 import multiprocessing as mp
+from itertools import islice
 import numpy as np
 import jax.numpy as jnp
+from typing import List, Optional
 from datasets import load_dataset
 from .tokenizer import SimpleNumberTokenizer
+
+
+# ─── Top-level picklable worker for ChunkedHFDataset ──────────────────────────
+# Must be at module level (not a nested/lambda fn) so multiprocessing can pickle it.
+def _tokenize_texts_worker(args_tuple: tuple) -> np.ndarray:
+    """
+    Tokenizes a list of texts in a subprocess.
+    args_tuple: (texts: List[str], tokenizer_name: str, seq_len: int)
+    Returns np.ndarray of shape (N, seq_len) dtype int32.
+    """
+    texts, tokenizer_name, seq_len = args_tuple
+    from dpsn_r_jax.data.tokenizer import get_tokenizer  # local import: child process
+    tokenizer = get_tokenizer(tokenizer_name)
+    is_hf = hasattr(tokenizer, "__call__") and not hasattr(tokenizer, "max_val")
+
+    if is_hf:
+        # GPT-2 and other decoder-only models ship without a pad token.
+        # Set it to eos_token so padding="max_length" doesn't crash.
+        if getattr(tokenizer, "pad_token", None) is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        pad_id = tokenizer.pad_token_id or 0
+
+        encoded = tokenizer(
+            texts,
+            max_length=seq_len,
+            truncation=True,
+            padding="max_length",
+            return_tensors="np",
+        )
+        return encoded["input_ids"].astype(np.int32)
+    else:
+        result = []
+        for text in texts:
+            ids = tokenizer.encode(text)
+            if len(ids) > seq_len:
+                ids = ids[:seq_len]
+            else:
+                ids = ids + [pad_id] * (seq_len - len(ids))
+            result.append(ids)
+        return np.array(result, dtype=np.int32)
 
 
 class HFStreamingDataset:
@@ -100,9 +143,12 @@ def _worker_tokenize(worker_id, dataset_name, subset, split, tokenizer_name, seq
     
     # Check if HF tokenizer
     is_hf = hasattr(tokenizer, "__call__") and not hasattr(tokenizer, "max_val")
-    pad_id = getattr(tokenizer, "pad_token_id", 0)
-    if pad_id is None:
-        pad_id = 0
+
+    if is_hf:
+        # GPT-2 and other decoder-only models ship without a pad token.
+        if getattr(tokenizer, "pad_token", None) is None:
+            tokenizer.pad_token = tokenizer.eos_token
+    pad_id = getattr(tokenizer, "pad_token_id", 0) or 0
 
     # Each worker needs to skip a different number of items to avoid extreme overlap
     # Note: For True streaming we can't easily shard perfectly, but we skip to stagger them
@@ -334,3 +380,286 @@ class BackgroundGenerator:
                 self.queue.get_nowait()
         except queue.Empty:
             pass
+
+
+# ─── Chunk-based HuggingFace dataset ──────────────────────────────────────────
+
+class ChunkedHFDataset:
+    """
+    Chunk-based HuggingFace streaming dataset.
+
+    Downloads exactly `chunk_size` rows at a time using the HF streaming
+    iterator (equivalent to .take(chunk_size)), tokenizes them in parallel
+    with a multiprocessing.Pool, shuffles the result in-place for true
+    within-chunk randomness, then serves batches from that RAM block.
+
+    While training consumes chunk N a background thread is already
+    downloading and tokenizing chunk N+1, so chunk boundaries cause zero
+    training stall.
+
+    Timeline:
+        t=0  Download chunk-0 synchronously  →  training starts
+        t=1  Train on chunk-0  |  BG thread downloads chunk-1
+        t=2  Train on chunk-1  |  BG thread downloads chunk-2
+        ...
+
+    Args:
+        dataset_name:          HuggingFace dataset identifier.
+        tokenizer_name:        Tokenizer name passed to ``get_tokenizer()``.
+        chunk_size:            Number of rows to download per chunk (e.g. 10_000).
+        subset:                Optional dataset config/subset name.
+        split:                 Dataset split (default ``"train"``).
+        seq_len:               Token sequence length (sequences are truncated/padded).
+        batch_size:            Default batch size for ``get_batch()``.
+        num_tokenizer_workers: CPU cores used for parallel tokenization per chunk.
+        text_columns:          Column names tried (in order) to extract text.
+    """
+
+    _SENTINEL = object()  # signals background thread has no more chunks
+
+    def __init__(
+        self,
+        dataset_name: str,
+        tokenizer_name: str,
+        chunk_size: int = 10_000,
+        subset: Optional[str] = None,
+        split: str = "train",
+        seq_len: int = 512,
+        batch_size: int = 8,
+        num_tokenizer_workers: int = 4,
+        text_columns: Optional[List[str]] = None,
+    ):
+        self.dataset_name = dataset_name
+        self.tokenizer_name = tokenizer_name
+        self.chunk_size = chunk_size
+        self.subset = subset
+        self.split = split
+        self.seq_len = seq_len
+        self.batch_size = batch_size
+        self.num_tokenizer_workers = max(1, num_tokenizer_workers)
+        self.text_columns = text_columns or ["text", "content", "sentence"]
+
+        # Queue holds at most 1 pre-downloaded chunk so BG thread stays 1 chunk ahead.
+        self._next_chunk_q: queue.Queue = queue.Queue(maxsize=1)
+        self._stop_event = threading.Event()
+
+        # Current serving state
+        self._current_chunk: Optional[np.ndarray] = None
+        self._read_pos: int = 0
+
+        # Persistent HF iterator — advanced across all chunks so we never repeat rows
+        self._hf_iter = self._make_iterator()
+
+        # ── Synchronous first chunk (training cannot start until it's ready) ──
+        print(
+            f"[ChunkedHFDataset] Downloading first chunk ({chunk_size:,} rows) "
+            f"from '{dataset_name}'..."
+        )
+        first = self._fetch_and_tokenize_chunk()
+        if first is None or len(first) == 0:
+            raise RuntimeError(
+                "[ChunkedHFDataset] Failed to fetch any data for the first chunk. "
+                "Check dataset name, split, and network connectivity."
+            )
+        self._current_chunk = first
+        self._read_pos = 0
+        print(
+            f"[ChunkedHFDataset] First chunk ready — {len(first):,} sequences "
+            f"({len(first) * seq_len * 4 / 1e6:.1f} MB). Training starts now!"
+        )
+
+        # ── Background thread pre-fetches the next chunk immediately ──────────
+        self._bg_thread = threading.Thread(
+            target=self._background_prefetch, daemon=True
+        )
+        self._bg_thread.start()
+
+    # ── Internal helpers ───────────────────────────────────────────────────────
+
+    def _make_iterator(self):
+        """Create a fresh HF streaming iterator, with split fallback."""
+        try:
+            ds = load_dataset(
+                self.dataset_name, name=self.subset, split=self.split, streaming=True
+            )
+        except ValueError as exc:
+            if "Bad split" in str(exc):
+                import datasets as _hf_datasets
+                builder = _hf_datasets.load_dataset_builder(
+                    self.dataset_name, name=self.subset
+                )
+                available = list(builder.info.splits.keys())
+                if available:
+                    print(
+                        f"[ChunkedHFDataset] Split '{self.split}' not found; "
+                        f"falling back to '{available[0]}'"
+                    )
+                    self.split = available[0]
+                    ds = load_dataset(
+                        self.dataset_name,
+                        name=self.subset,
+                        split=self.split,
+                        streaming=True,
+                    )
+                else:
+                    raise
+            else:
+                raise
+        return iter(ds)
+
+    def _extract_text(self, item: dict) -> str:
+        for col in self.text_columns:
+            val = item.get(col)
+            if val:
+                return str(val)
+        return ""
+
+    def _fetch_and_tokenize_chunk(self) -> Optional[np.ndarray]:
+        """
+        Pull exactly `chunk_size` rows from the HF iterator using islice —
+        the same primitive HF's .take(N) uses internally.  Applied to the
+        *persistent* iterator so successive calls advance through the dataset
+        instead of restarting each time.
+
+        If the iterator is exhausted mid-chunk, restarts from the beginning
+        and fills the remainder so training never stalls.
+        """
+        # ── One call, no Python-level loop — grabs exactly chunk_size rows ──
+        raw: List[dict] = list(islice(self._hf_iter, self.chunk_size))
+
+        if not raw:
+            # Iterator exhausted right at a boundary — restart and try once more
+            print(
+                "[ChunkedHFDataset] End of dataset reached; "
+                "restarting stream from the beginning."
+            )
+            self._hf_iter = self._make_iterator()
+            raw = list(islice(self._hf_iter, self.chunk_size))
+            if not raw:
+                return None  # dataset has zero usable rows
+
+        elif len(raw) < self.chunk_size:
+            # Iterator ran out mid-chunk — restart and top up the remainder
+            shortage = self.chunk_size - len(raw)
+            print(
+                f"[ChunkedHFDataset] Dataset exhausted after {len(raw):,} rows; "
+                f"restarting to collect {shortage:,} more."
+            )
+            self._hf_iter = self._make_iterator()
+            raw += list(islice(self._hf_iter, shortage))
+
+        texts: List[str] = list(filter(None, (self._extract_text(item) for item in raw)))
+
+        if not texts:
+            return None
+
+        # ── Parallel tokenization ──────────────────────────────────────────────
+        # Split texts evenly across workers. Each worker gets a contiguous slice.
+        n_workers = min(self.num_tokenizer_workers, len(texts))
+        sub_size = max(1, len(texts) // n_workers)
+        sub_batches = [
+            (texts[i : i + sub_size], self.tokenizer_name, self.seq_len)
+            for i in range(0, len(texts), sub_size)
+        ]
+
+        if n_workers > 1:
+            ctx = mp.get_context("spawn")  # safe with JAX / existing threads
+            with ctx.Pool(processes=n_workers) as pool:
+                results = pool.map(_tokenize_texts_worker, sub_batches)
+        else:
+            results = [_tokenize_texts_worker(b) for b in sub_batches]
+
+        chunk = np.concatenate(results, axis=0)  # (N, seq_len)
+        np.random.shuffle(chunk)                  # true in-chunk shuffle
+        return chunk
+
+    def _background_prefetch(self) -> None:
+        """Continuously download + tokenize the next chunk and enqueue it."""
+        while not self._stop_event.is_set():
+            chunk = self._fetch_and_tokenize_chunk()
+            if self._stop_event.is_set():
+                break
+            if chunk is None:
+                self._next_chunk_q.put(self._SENTINEL)
+                break
+            # Block until the consumer slot is free (queue maxsize=1)
+            while not self._stop_event.is_set():
+                try:
+                    self._next_chunk_q.put(chunk, timeout=1.0)
+                    break
+                except queue.Full:
+                    continue
+
+    def _swap_chunk(self) -> None:
+        """
+        Block until the background thread delivers the next chunk, then swap
+        it in as the current serving buffer.
+
+        The old chunk numpy array is explicitly deleted and gc.collect() is
+        called BEFORE the new chunk is assigned so peak RAM stays at ~1 chunk
+        rather than 2 chunks during the swap.
+        """
+        print("[ChunkedHFDataset] Current chunk exhausted — waiting for next chunk...")
+        item = self._next_chunk_q.get(timeout=600.0)   # 10-min safety timeout
+        if item is self._SENTINEL:
+            # Background thread finished AND dataset has no more data;
+            # restart by re-creating the stream.
+            print("[ChunkedHFDataset] Sentinel received; restarting data stream.")
+            self._hf_iter = self._make_iterator()
+            # Re-launch background thread
+            self._bg_thread = threading.Thread(
+                target=self._background_prefetch, daemon=True
+            )
+            self._bg_thread.start()
+            item = self._next_chunk_q.get(timeout=600.0)
+            if item is self._SENTINEL:
+                raise RuntimeError("[ChunkedHFDataset] No data available.")
+
+        # ── Explicitly free old chunk BEFORE assigning new one ─────────────
+        # Simply reassigning self._current_chunk drops the ref-count to 0 but
+        # Python's allocator may not return the pages to the OS immediately.
+        # del + gc.collect() forces an immediate release so RAM stays at ~1
+        # chunk size instead of briefly peaking at 2× during the swap.
+        if self._current_chunk is not None:
+            old_mb = self._current_chunk.nbytes / 1e6
+            del self._current_chunk
+            self._current_chunk = None
+            gc.collect()   # return numpy pages back to OS now
+            print(f"[ChunkedHFDataset] Old chunk freed ({old_mb:.1f} MB released).")
+
+        self._current_chunk = item
+        self._read_pos = 0
+        print(
+            f"[ChunkedHFDataset] Swapped to new chunk: {len(self._current_chunk):,} "
+            f"sequences ({self._current_chunk.nbytes / 1e6:.1f} MB in RAM)"
+        )
+
+    # ── Public API ─────────────────────────────────────────────────────────────
+
+    def get_batch(self, batch_size: Optional[int] = None) -> np.ndarray:
+        """
+        Return the next batch of shape ``(batch_size, seq_len)``.
+
+        Served directly from the RAM chunk at memory speed.  When the chunk
+        is exhausted this call blocks only for the brief moment it takes the
+        background thread to hand off the already-downloaded next chunk.
+        """
+        bs = batch_size or self.batch_size
+
+        if self._current_chunk is None or self._read_pos + bs > len(self._current_chunk):
+            self._swap_chunk()
+
+        batch = self._current_chunk[self._read_pos : self._read_pos + bs].copy()
+        self._read_pos += bs
+        return batch
+
+    def stop(self) -> None:
+        """Signal the background thread to stop and join it."""
+        self._stop_event.set()
+        # Drain so the background thread is not stuck on a full put()
+        while not self._next_chunk_q.empty():
+            try:
+                self._next_chunk_q.get_nowait()
+            except queue.Empty:
+                break
+        self._bg_thread.join(timeout=5.0)

@@ -309,15 +309,19 @@ def train_step(state, batch, pad_token_id=0,
     # For 2D pool, flat_start indices are already flattened to 1D; same treatment.
     B_times_H, L = indices.shape
     W = state.window_size
-    flat_touched = (indices[:, :, None] + jnp.arange(W)).reshape(-1)
-    unique_indices = jnp.unique(flat_touched, size=B_times_H * L * W, fill_value=-1)
 
-    valid_mask = unique_indices != -1
-    safe_indices = jnp.where(valid_mask, unique_indices, 0)
+    # Expand all window offsets: (B*H, L, W) → flatten to (B*H*L*W,)
+    # jnp.unique is NOT needed here: .at[idx].set() handles duplicate indices
+    # correctly (last write wins), which is acceptable for Adam moment updates
+    # on nearby pool vectors.  Removing unique() saves a full sort per step.
+    offsets     = jnp.arange(W)                                    # (W,)
+    flat_touched = (
+        indices[:, :, None] + offsets[None, None, :]               # (B*H, L, W)
+    ).reshape(-1)                                                   # (B*H*L*W,)
 
-    # Clip to valid pool range (important for 2D pool where flat indices can overflow)
-    pool_size = pool_params.reshape(-1, pool_params.shape[-1]).shape[0]
-    safe_indices = jnp.clip(safe_indices, 0, pool_size - 1)
+    # Clip to valid pool range (handles both 1D and 2D pool flat indices)
+    pool_size   = pool_params.reshape(-1, pool_params.shape[-1]).shape[0]
+    safe_indices = jnp.clip(flat_touched, 0, pool_size - 1)
 
     # Reshape pool for flat indexing (handles both 1D and 2D pool storage)
     pool_flat = pool_params.reshape(-1, pool_params.shape[-1])
@@ -345,15 +349,11 @@ def train_step(state, batch, pad_token_id=0,
         lr=current_lr,
     )
 
-    new_pool_flat = pool_flat.at[safe_indices].set(
-        jnp.where(valid_mask[:, None], new_p_s, p_slice)
-    )
-    new_pool_m_flat = pool_m_flat.at[safe_indices].set(
-        jnp.where(valid_mask[:, None], new_m_s, m_slice)
-    )
-    new_pool_v_flat = pool_v_flat.at[safe_indices].set(
-        jnp.where(valid_mask[:, None], new_v_s, v_slice)
-    )
+    # Scatter updates back into the flat pool arrays.
+    # Duplicates in safe_indices write the same value twice — harmless.
+    new_pool_flat  = pool_flat.at[safe_indices].set(new_p_s)
+    new_pool_m_flat = pool_m_flat.at[safe_indices].set(new_m_s)
+    new_pool_v_flat = pool_v_flat.at[safe_indices].set(new_v_s)
 
     # Reshape back to original pool shape (works for both 1D and 2D storage)
     new_pool_params = new_pool_flat.reshape(pool_params.shape)
