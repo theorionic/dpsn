@@ -1,0 +1,210 @@
+% ============================================================
+%  dpsnr_refs.bib  —  Bibliography for DPSNR paper
+%  All author names verified via web search (March 2026)
+% ============================================================
+
+% ── Scaling Laws ─────────────────────────────────────────────
+
+@article{kaplan2020scaling,
+  title     = {Scaling Laws for Neural Language Models},
+  author    = {Kaplan, Jared and McCandlish, Sam and Henighan, Tom and
+               Brown, Tom B. and Chess, Benjamin and Child, Rewon and
+               Gray, Scott and Radford, Alec and Wu, Jeffrey and Amodei, Dario},
+  journal   = {arXiv preprint arXiv:2001.08361},
+  year      = {2020},
+  url       = {https://arxiv.org/abs/2001.08361}
+}
+
+@article{hoffmann2022chinchilla,
+  title     = {Training Compute-Optimal Large Language Models},
+  author    = {Hoffmann, Jordan and Borgeaud, Sebastian and Mensch, Arthur and
+               Buchatskaya, Elena and Cai, Trevor and Rutherford, Eliza and
+               de las Casas, Diego and Hendricks, Lisa Anne and Welbl, Johannes and
+               Clark, Aidan and Hennigan, Tom and Noland, Eric and Millican, Katie and
+               van den Driessche, George and Damoc, Bogdan and Guy, Aurelia and
+               Osindero, Simon and Simonyan, Karen and Elsen, Erich and
+               Rae, Jack W. and Vinyals, Oriol and Sifre, Laurent},
+  journal   = {arXiv preprint arXiv:2203.15556},
+  year      = {2022},
+  url       = {https://arxiv.org/abs/2203.15556}
+}
+
+% ── Transformer Architecture ─────────────────────────────────
+
+@inproceedings{vaswani2017attention,
+  title     = {Attention Is All You Need},
+  author    = {Vaswani, Ashish and Shazeer, Noam and Parmar, Niki and
+               Uszkoreit, Jakob and Jones, Llion and Gomez, Aidan N. and
+               Kaiser, {\L}ukasz and Polosukhin, Illia},
+  booktitle = {Advances in Neural Information Processing Systems},
+  volume    = {30},
+  year      = {2017},
+  url       = {https://arxiv.org/abs/1706.03762}
+}
+
+% ── Retrieval-Augmented Generation ───────────────────────────
+
+@inproceedings{lewis2020rag,
+  title     = {Retrieval-Augmented Generation for Knowledge-Intensive {NLP} Tasks},
+  author    = {Lewis, Patrick and Perez, Ethan and Piktus, Aleksandra and
+               Petroni, Fabio and Karpukhin, Vladimir and Goyal, Naman and
+               K{\"u}ttler, Heinrich and Lewis, Mike and Yih, Wen-tau and
+               Rockt{\"a}schel, Tim and Riedel, Sebastian and Kiela, Douwe},
+  booktitle = {Advances in Neural Information Processing Systems},
+  volume    = {33},
+  pages     = {9459--9474},
+  year      = {2020},
+  url       = {https://arxiv.org/abs/2005.11401}
+}
+
+% ── Mixture of Experts ───────────────────────────────────────
+
+@inproceedings{shazeer2017moe,
+  title     = {Outrageously Large Neural Networks: The Sparsely-Gated
+               Mixture-of-Experts Layer},
+  author    = {Shazeer, Noam and Mirhoseini, Azalia and Maziarz, Krzysztof and
+               Davis, Andy and Le, Quoc V. and Hinton, Geoffrey E. and Dean, Jeff},
+  booktitle = {International Conference on Learning Representations},
+  year      = {2017},
+  url       = {https://arxiv.org/abs/1701.06538}
+}
+
+% ── Adaptive Computation / Halting ───────────────────────────
+
+@article{graves2016act,
+  title     = {Adaptive Computation Time for Recurrent Neural Networks},
+  author    = {Graves, Alex},
+  journal   = {arXiv preprint arXiv:1603.08983},
+  year      = {2016},
+  url       = {https://arxiv.org/abs/1603.08983}
+}
+
+% ── Memory-Augmented Networks / DNC ──────────────────────────
+
+@article{graves2016dnc,
+  title     = {Hybrid computing using a neural network with dynamic external memory},
+  author    = {Graves, Alex and Wayne, Greg and Reynolds, Malcolm and
+               Harley, Tim and Danihelka, Ivo and Grabska-Barwi{\'n}ska, Agnieszka and
+               Colmenarejo, Sergio G{\'o}mez and Grefenstette, Edward and
+               Ramalho, Tiago and Agapiou, John and others},
+  journal   = {Nature},
+  volume    = {538},
+  number    = {7626},
+  pages     = {471--476},
+  year      = {2016},
+  publisher = {Nature Publishing Group}
+}
+
+% ── Curriculum Learning ──────────────────────────────────────
+
+@inproceedings{bengio2009curriculum,
+  title     = {Curriculum Learning},
+  author    = {Bengio, Yoshua and Louradour, J{\'e}r{\^o}me and
+               Collobert, Ronan and Weston, Jason},
+  booktitle = {Proceedings of the 26th Annual International Conference on
+               Machine Learning},
+  pages     = {41--48},
+  year      = {2009},
+  url       = {https://dl.acm.org/doi/10.1145/1553374.1553380}
+}
+
+% ── Adam Optimizer ───────────────────────────────────────────
+
+@inproceedings{kingma2015adam,
+  title     = {{Adam}: A Method for Stochastic Optimization},
+  author    = {Kingma, Diederik P. and Ba, Jimmy},
+  booktitle = {International Conference on Learning Representations},
+  year      = {2015},
+  url       = {https://arxiv.org/abs/1412.6980}
+}
+
+% ── AdamW ────────────────────────────────────────────────────
+
+@inproceedings{loshchilov2019adamw,
+  title     = {Decoupled Weight Decay Regularization},
+  author    = {Loshchilov, Ilya and Hutter, Frank},
+  booktitle = {International Conference on Learning Representations},
+  year      = {2019},
+  url       = {https://arxiv.org/abs/1711.05101}
+}
+
+% ── JAX ─────────────────────────────────────────────────────
+
+@software{jax2018github,
+  title     = {{JAX}: composable transformations of {Python}+{NumPy} programs},
+  author    = {Bradbury, James and Frostig, Roy and Hawkins, Peter and
+               Johnson, Matthew James and Leary, Chris and Maclaurin, Dougal and
+               Necula, George and Paszke, Adam and VanderPlas, Jake and
+               Wanderman-Milne, Skye and Zhang, Qiao},
+  url       = {http://github.com/jax-ml/jax},
+  version   = {0.4.x},
+  year      = {2018}
+}
+
+% ── Flax / Linen ─────────────────────────────────────────────
+
+@software{flax2020github,
+  title     = {Flax: A neural network library and ecosystem for {JAX} designed
+               for flexibility},
+  author    = {Heek, Jonathan and Levskaya, Anselm and Oliver, Avital and
+               Ritter, Marvin and Rondepierre, Bertrand and Steiner, Andreas and
+               van Zee, Marc},
+  url       = {http://github.com/google/flax},
+  version   = {0.8.x},
+  year      = {2020}
+}
+
+% ── Optax ────────────────────────────────────────────────────
+
+@software{deepmind2020jax,
+  title     = {The {DeepMind JAX} Ecosystem},
+  author    = {Babuschkin, Igor and Baumli, Kate and Bell, Alison and
+               Bhupatiraju, Surya and Bruce, Jake and Buchlovsky, Peter and
+               Budden, David and Cai, Trevor and Clark, Aidan and Danihelka, Ivo
+               and others},
+  url       = {http://github.com/deepmind},
+  year      = {2020}
+}
+
+% ── GPT-3 / Few-Shot Learners ────────────────────────────────
+
+@inproceedings{brown2020gpt3,
+  title     = {Language Models are Few-Shot Learners},
+  author    = {Brown, Tom B. and Mann, Benjamin and Ryder, Nick and Subbiah, Melanie and
+               Kaplan, Jared and Dhariwal, Prafulla and Neelakantan, Arvind and
+               Shyam, Pranav and Sastry, Girish and Askell, Amanda and others},
+  booktitle = {Advances in Neural Information Processing Systems},
+  volume    = {33},
+  pages     = {1877--1901},
+  year      = {2020},
+  url       = {https://arxiv.org/abs/2005.14165}
+}
+
+% ── Feed-forward layers as key-value memories ────────────────
+
+@inproceedings{geva2021feedforward,
+  title     = {Transformer Feed-Forward Layers Are Key-Value Memories},
+  author    = {Geva, Mor and Schuster, Roei and Berant, Jonathan and Levy, Omer},
+  booktitle = {Proceedings of the 2021 Conference on Empirical Methods in
+               Natural Language Processing},
+  pages     = {5765--5775},
+  year      = {2021},
+  url       = {https://arxiv.org/abs/2012.14913}
+}
+
+% ── Orbax (checkpointing) ────────────────────────────────────
+
+@software{orbax2022,
+  title     = {Orbax: A {JAX}-based checkpointing library},
+  author    = {{Google DeepMind}},
+  url       = {https://github.com/google/orbax},
+  year      = {2022}
+}
+
+@inproceedings{lample2019pkm,
+  title={Large Memory Layers with Product Keys},
+  author={Lample, Guillaume and Sablayrolles, Alexandre and Ranzato, Marc'Aurelio and Denoyer, Ludovic and J{\'e}gou, Herv{\'e}},
+  booktitle={Advances in Neural Information Processing Systems},
+  volume={32},
+  year={2019}
+}

@@ -235,18 +235,53 @@ def dummy_tokenize(text: str, max_length: int = 64):
     return np.array(tokens, dtype=np.int32)
 
 
-class TokenizeTransform:
+def _make_tokenize_base():
+    """
+    Return the correct base class for TokenizeTransform.
+
+    New versions of Grain require operations to be subclasses of
+    `grain.MapTransform` (which makes them callable).  Older versions
+    accepted any object with a `.map()` method.  We detect at import time
+    which API is available and build the right base class.
+    """
+    if GRAIN_AVAILABLE:
+        try:
+            return grain.MapTransform   # new API (grain >= 0.1.x)
+        except AttributeError:
+            pass
+        try:
+            return grain.python.MapTransform
+        except AttributeError:
+            pass
+    return object   # fallback — .map() method is enough for HFStreamLoader
+
+
+_TokenizeBase = _make_tokenize_base()
+
+
+class TokenizeTransform(_TokenizeBase):
+    """
+    Tokenizes a single example dict that contains a ``'text'`` key.
+
+    Compatible with both:
+    * Grain operation pipeline (called as ``operation(parent)``) when
+      ``grain.MapTransform`` is available as the base class.
+    * ``HFStreamLoader`` which calls ``.map(element)`` directly.
+    """
+
     def __init__(self, tokenizer: Any, max_length: int = 64):
         self.tokenizer = tokenizer
         self.max_length = max_length
 
+    # --- Grain MapTransform interface ----------------------------------------
     def map(self, element):
+        """Transform one example dict; must return the modified dict."""
         text = element.get("text", "")
 
         if hasattr(self.tokenizer, "__call__") and not hasattr(
             self.tokenizer, "max_val"
         ):
-            # HuggingFace Tokenizer
+            # HuggingFace tokenizer
             encoded = self.tokenizer(
                 text,
                 max_length=self.max_length,
@@ -265,10 +300,14 @@ class TokenizeTransform:
                 ids = ids + [pad_id] * (self.max_length - len(ids))
             element["input_ids"] = np.array(ids, dtype=np.int32)
         else:
-            # Fallback to dummy_tokenize if no proper tokenizer is provided
             element["input_ids"] = dummy_tokenize(text, self.max_length)
 
         return element
+
+    # --- Fallback for older Grain or non-Grain use ---------------------------
+    def __call__(self, element):
+        """Some Grain versions call the transform directly instead of .map()."""
+        return self.map(element)
 
 
 def get_grain_loader(

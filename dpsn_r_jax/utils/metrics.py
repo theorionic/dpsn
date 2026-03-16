@@ -181,7 +181,7 @@ def summarise_flops(config: DPSNRConfig, batch_size: int) -> None:
     print(f"  {'TinyController encoder':<32} {encoder_fwd*batch_size*3/T:>8.3f} TFLOPS-eq")
     print(f"  {'Reasoning loop × ' + str(r):<32} {loop_fwd*batch_size*3/T:>8.3f} TFLOPS-eq")
     print(f"    {'LearnedIndexer':<30} {r*indexer_fwd*batch_size*3/T:>8.3f}")
-    print(f"    {'Pool retrieval (W={W}, H={effective_H})':<30} {r*pool_fwd*batch_size*3/T:>8.3f}")
+    print(f"    {f'Pool retrieval (W={W}, H={effective_H})':<30} {r*pool_fwd*batch_size*3/T:>8.3f}")
     print(f"    {'Integrator':<30} {r*integrator*batch_size*3/T:>8.3f}")
     print(f"    {'ACC':<30} {r*acc_fwd*batch_size*3/T:>8.3f}")
     print(f"  {'LM head decoder':<32} {decoder_fwd*batch_size*3/T:>8.3f} TFLOPS-eq")
