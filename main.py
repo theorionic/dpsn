@@ -1,6 +1,10 @@
 import argparse
 import os
 import time
+import warnings
+
+# Suppress annoying Kaggle/Colab PyTorch XLA vs TensorFlow warning
+warnings.filterwarnings("ignore", message=".*tensorflow.*conflict with.*torch-xla.*")
 import jax
 from jax.sharding import Mesh, PartitionSpec, NamedSharding
 from jax.experimental import mesh_utils

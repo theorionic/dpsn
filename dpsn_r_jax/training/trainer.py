@@ -383,6 +383,7 @@ def train_step(state, batch, pad_token_id=0,
         "pad_token_id", "precision_loss_weight", "sigma_anneal_steps",
         "use_bf16", "loss_chunk_size", "grad_accum_steps",
     ],
+    donate_argnums=(0,),
 )
 def grad_accum_step(
     state,
@@ -487,7 +488,7 @@ def grad_accum_step(
     init_carry   = (zero_grads, jnp.float32(0.0), jnp.float32(0.0))
 
     (summed_grads, total_loss, total_sigma), all_indices = jax.lax.scan(
-        jax.checkpoint(scan_body),   # checkpoint each micro-step to save memory
+        scan_body,                   # no jax.checkpoint needed; grad is taken inside!
         init_carry,
         micro_batches,               # (grad_accum_steps, micro_B, T)
     )
