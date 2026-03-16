@@ -567,12 +567,14 @@ def main():
     print_tpu_memory("after model init (before first train_step compile)")
 
     from dpsn_r_jax.training.trainer import train_step
+    from dpsn_r_jax.utils.metrics import summarise_flops
 
     # train_step is already JIT-compiled with static_argnames in trainer.py!
     # We just need to ensure inputs are sharded correctly before entering.
     distributed_train_step = train_step
 
     flops_per_step = calculate_flops(config, args.batch_size)
+    summarise_flops(config, args.batch_size)  # print breakdown once at startup
 
     # For infinite HF streaming/chunked datasets, steps_per_epoch from
     # dataset_size is meaningless.  Use max_steps as the epoch length so the
