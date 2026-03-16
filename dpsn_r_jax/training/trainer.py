@@ -2,8 +2,9 @@ import jax
 import jax.numpy as jnp
 from jax import random
 from flax.training import train_state
-from flax import struct, traverse_util
 import optax
+from flax import struct, traverse_util
+import flax.core as core
 from typing import Any, Callable
 from dpsn_r_jax.models.dpsnr import DPSNR
 from dpsn_r_jax.training.sparse_adam import sparse_adam_update
@@ -362,7 +363,7 @@ def train_step(state, batch, pad_token_id=0,
 
     new_flat_params = traverse_util.flatten_dict(new_dense_params)
     new_flat_params[pool_key] = new_pool_params
-    new_params = traverse_util.unflatten_dict(new_flat_params)
+    new_params = core.freeze(traverse_util.unflatten_dict(new_flat_params))
 
     state = state.replace(
         step=state.step + 1,
@@ -555,7 +556,7 @@ def grad_accum_step(
 
     new_flat_params          = traverse_util.flatten_dict(new_dense_params)
     new_flat_params[pool_key] = new_pool_params
-    new_params               = traverse_util.unflatten_dict(new_flat_params)
+    new_params               = core.freeze(traverse_util.unflatten_dict(new_flat_params))
 
     state = state.replace(
         step=state.step + 1,

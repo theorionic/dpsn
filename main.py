@@ -5,6 +5,8 @@ import warnings
 
 # Suppress annoying Kaggle/Colab PyTorch XLA vs TensorFlow warning
 warnings.filterwarnings("ignore", message=".*tensorflow.*conflict with.*torch-xla.*")
+# Suppress Transparent Hugepages warning
+warnings.filterwarnings("ignore", message=".*Transparent hugepages are not enabled.*")
 import jax
 from jax.sharding import Mesh, PartitionSpec, NamedSharding
 from jax.experimental import mesh_utils
@@ -290,7 +292,19 @@ def main():
             # We shard the first dimension (total_vectors)
             return pool_sharding
 
-        # Everything else (Controller, Router, etc.) is REPLICATED
+        # FSDP (ZeRO-3) for large dense weights/embeddings to distribute across TPU chips
+        if hasattr(param, "shape") and len(param.shape) >= 2:
+            num_devices = jax.device_count()
+            if param.shape[-1] % num_devices == 0:
+                spec = [None] * len(param.shape)
+                spec[-1] = "shard"
+                return NamedSharding(mesh, PartitionSpec(*spec))
+            elif param.shape[0] % num_devices == 0:
+                spec = [None] * len(param.shape)
+                spec[0] = "shard"
+                return NamedSharding(mesh, PartitionSpec(*spec))
+
+        # Biases, LayerNorms, and 1D vectors remain replicated as they take very little memory
         return replicated_sharding
 
     print(f"Distributed Mesh: {mesh}")
