@@ -177,6 +177,14 @@ def main():
              "Avoids materialising full (B,T,V) logits; recommended: 16 for TPU v5e-8.",
     )
     parser.add_argument(
+        "--grad_accum_steps",
+        type=int,
+        default=1,
+        help="Gradient accumulation steps. Effective batch = batch_size × grad_accum_steps. "
+             "Use this to simulate large batches (e.g. 512) with a small physical batch "
+             "(e.g. 64) that fits in HBM. batch_size must be divisible by grad_accum_steps.",
+    )
+    parser.add_argument(
         "--resume_data",
         action="store_true",
         help="Resume data loader from the checkpointed step",
@@ -566,12 +574,26 @@ def main():
                        loss_chunk_size=getattr(config, 'loss_chunk_size', 0))
     print_tpu_memory("after model init (before first train_step compile)")
 
-    from dpsn_r_jax.training.trainer import train_step
+    from dpsn_r_jax.training.trainer import train_step, grad_accum_step
     from dpsn_r_jax.utils.metrics import summarise_flops
 
-    # train_step is already JIT-compiled with static_argnames in trainer.py!
-    # We just need to ensure inputs are sharded correctly before entering.
-    distributed_train_step = train_step
+    # ── Choose training function based on gradient accumulation ──────────────
+    _grad_accum = getattr(args, "grad_accum_steps", 1)
+    if _grad_accum > 1:
+        assert args.batch_size % _grad_accum == 0, (
+            f"--batch_size ({args.batch_size}) must be divisible by "
+            f"--grad_accum_steps ({_grad_accum})"
+        )
+        _micro_batch = args.batch_size // _grad_accum
+        print(
+            f"Gradient accumulation ENABLED: "
+            f"micro_batch={_micro_batch} × accum={_grad_accum} "
+            f"= effective batch {args.batch_size}"
+        )
+        distributed_train_step = None   # not used when accumulating
+    else:
+        _micro_batch = args.batch_size
+        distributed_train_step = train_step
 
     flops_per_step = calculate_flops(config, args.batch_size)
     summarise_flops(config, args.batch_size)  # print breakdown once at startup
@@ -686,13 +708,33 @@ def main():
             current_data_wait_time = time.time() - data_start_time
             total_data_wait_time_interval += current_data_wait_time
 
-            state, loss, mean_sigma = distributed_train_step(
-                state, batch, config.pad_token_id,
-                precision_loss_weight=getattr(config, 'precision_loss_weight', 0.0),
-                sigma_anneal_steps=getattr(config, 'sigma_anneal_steps', 0),
-                use_bf16=getattr(config, 'use_bf16', False),
-                loss_chunk_size=getattr(config, 'loss_chunk_size', 0),
-            )
+            if _grad_accum > 1:
+                # ── Gradient accumulation path ────────────────────────────────
+                # Caller splits (B, T) batch into (_grad_accum, micro_B, T) and
+                # hands it to the JIT-compiled grad_accum_step.
+                micro_batch_size = args.batch_size // _grad_accum
+                # Stack micro-batches: (accum, micro_B, T)
+                micro_batches = batch.reshape(
+                    _grad_accum, micro_batch_size, config.max_seq_len
+                )
+                state, loss, mean_sigma = grad_accum_step(
+                    state, micro_batches,
+                    pad_token_id=config.pad_token_id,
+                    precision_loss_weight=getattr(config, 'precision_loss_weight', 0.0),
+                    sigma_anneal_steps=getattr(config, 'sigma_anneal_steps', 0),
+                    use_bf16=getattr(config, 'use_bf16', False),
+                    loss_chunk_size=getattr(config, 'loss_chunk_size', 0),
+                    grad_accum_steps=_grad_accum,
+                )
+            else:
+                # ── Standard single-step path ─────────────────────────────────
+                state, loss, mean_sigma = distributed_train_step(
+                    state, batch, config.pad_token_id,
+                    precision_loss_weight=getattr(config, 'precision_loss_weight', 0.0),
+                    sigma_anneal_steps=getattr(config, 'sigma_anneal_steps', 0),
+                    use_bf16=getattr(config, 'use_bf16', False),
+                    loss_chunk_size=getattr(config, 'loss_chunk_size', 0),
+                )
 
             epoch_loss += loss
             global_step += 1

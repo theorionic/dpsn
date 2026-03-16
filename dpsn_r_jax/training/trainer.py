@@ -374,3 +374,194 @@ def train_step(state, batch, pad_token_id=0,
     )
 
     return state, loss, mean_sigma
+
+
+# ── Gradient Accumulation ──────────────────────────────────────────────────────
+@functools.partial(
+    jax.jit,
+    static_argnames=[
+        "pad_token_id", "precision_loss_weight", "sigma_anneal_steps",
+        "use_bf16", "loss_chunk_size", "grad_accum_steps",
+    ],
+)
+def grad_accum_step(
+    state,
+    micro_batches,          # (grad_accum_steps, micro_B, T)
+    pad_token_id=0,
+    precision_loss_weight=0.0,
+    sigma_anneal_steps=0,
+    use_bf16=False,
+    loss_chunk_size=0,
+    grad_accum_steps=1,
+):
+    """Gradient-accumulation training step.
+
+    Runs `grad_accum_steps` forward+backward passes on consecutive micro-batches,
+    averages the gradients, then applies ONE optimizer update.  This lets you
+    train with an effective batch of (grad_accum_steps × micro_batch_size) while
+    only ever holding one micro-batch of activations in HBM at a time.
+
+    Args:
+        state:              TrainState
+        micro_batches:      (grad_accum_steps, micro_B, T) — pre-split by caller
+        pad_token_id:       ignored positions
+        grad_accum_steps:   number of micro-batches to accumulate (static)
+        (all other args):   same as train_step
+
+    Returns:
+        new_state, avg_loss (float), avg_mean_sigma (float)
+    """
+    print("Compiling grad_accum_step for XLA...", flush=True)
+    dropout_rng, new_rng = random.split(state.rng)
+    sigma_scale = state.sigma_anneal_fn(state.step)
+
+    if sigma_anneal_steps > 0 and precision_loss_weight > 0.0:
+        ramp = jnp.minimum(1.0, (state.step + 1) / sigma_anneal_steps)
+        effective_precision_weight = precision_loss_weight * ramp
+    else:
+        effective_precision_weight = 0.0
+
+    def loss_fn_micro(params, micro_batch):
+        """Forward+loss for a single micro-batch. Returns (loss, aux)."""
+        if use_bf16:
+            compute_params = jax.tree_util.tree_map(
+                lambda x: x.astype(jnp.bfloat16), params
+            )
+        else:
+            compute_params = params
+
+        if loss_chunk_size > 0:
+            state_hidden, (_, indices, mean_sigma) = state.apply_fn(
+                {"params": compute_params},
+                micro_batch,
+                deterministic=False,
+                sigma_max_scale=sigma_scale,
+                rngs={"dropout": dropout_rng},
+                method=lambda mod, *a, **kw: mod.encode_to_hidden(*a, **kw),
+            )
+            def decode_fn(chunk_h):
+                return state.apply_fn(
+                    {"params": compute_params},
+                    chunk_h,
+                    method=lambda mod, h: mod.controller.decode(h),
+                )
+            lm_loss = chunked_lm_loss(
+                state_hidden, micro_batch, decode_fn, pad_token_id, loss_chunk_size
+            ).astype(jnp.float32)
+        else:
+            logits, (_, indices, mean_sigma) = state.apply_fn(
+                {"params": compute_params},
+                micro_batch,
+                deterministic=False,
+                sigma_max_scale=sigma_scale,
+                rngs={"dropout": dropout_rng},
+            )
+            logits = logits.astype(jnp.float32)
+            shift_logits = logits[:, :-1, :]
+            shift_labels = micro_batch[:, 1:]
+            per_token = optax.softmax_cross_entropy_with_integer_labels(
+                shift_logits, shift_labels
+            )
+            mask = (shift_labels != pad_token_id).astype(jnp.float32)
+            lm_loss = (per_token * mask).sum() / (mask.sum() + 1e-9)
+
+        precision_loss = effective_precision_weight * jnp.float32(mean_sigma)
+        total_loss = lm_loss + precision_loss
+        return total_loss, (indices, mean_sigma)
+
+    grad_fn_micro = jax.value_and_grad(loss_fn_micro, has_aux=True)
+
+    # ── Accumulate gradients over all micro-batches ────────────────────────
+    # Use jax.lax.scan so XLA sees a single kernel rather than N unrolled ones.
+    def scan_body(carry, micro_batch):
+        acc_grads, acc_loss, acc_sigma = carry
+        (loss, (indices, mean_sigma)), grads = grad_fn_micro(state.params, micro_batch)
+        # Sum gradients (we divide by grad_accum_steps at the end)
+        acc_grads   = jax.tree_util.tree_map(jnp.add, acc_grads, grads)
+        acc_loss    = acc_loss  + loss
+        acc_sigma   = acc_sigma + mean_sigma
+        return (acc_grads, acc_loss, acc_sigma), indices
+
+    # Initialise accumulators with zeros shaped like params
+    zero_grads   = jax.tree_util.tree_map(jnp.zeros_like, state.params)
+    init_carry   = (zero_grads, jnp.float32(0.0), jnp.float32(0.0))
+
+    (summed_grads, total_loss, total_sigma), all_indices = jax.lax.scan(
+        jax.checkpoint(scan_body),   # checkpoint each micro-step to save memory
+        init_carry,
+        micro_batches,               # (grad_accum_steps, micro_B, T)
+    )
+
+    # Average over accumulation steps
+    scale       = 1.0 / grad_accum_steps
+    avg_grads   = jax.tree_util.tree_map(lambda g: g * scale, summed_grads)
+    avg_loss    = total_loss  * scale
+    avg_sigma   = total_sigma * scale
+
+    # Use last micro-batch's indices for sparse pool update
+    indices = all_indices[-1]   # (heads*micro_B, max_loops)
+
+    # ── Optimizer update (identical to train_step) ────────────────────────
+    pool_key      = ("pool", "params_storage")
+    flat_params   = traverse_util.flatten_dict(state.params)
+    flat_grads    = traverse_util.flatten_dict(avg_grads)
+
+    pool_params   = jnp.asarray(flat_params[pool_key])
+    pool_grads    = jnp.asarray(flat_grads[pool_key])
+
+    dense_flat_grads  = {k: v for k, v in flat_grads.items()  if k != pool_key}
+    dense_flat_params = {k: v for k, v in flat_params.items() if k != pool_key}
+    dense_grads   = traverse_util.unflatten_dict(dense_flat_grads)
+    dense_params  = traverse_util.unflatten_dict(dense_flat_params)
+
+    updates, new_opt_state = state.tx.update(dense_grads, state.opt_state, dense_params)
+    new_dense_params = optax.apply_updates(dense_params, updates)
+
+    W             = state.window_size
+    offsets       = jnp.arange(W)
+    flat_touched  = (
+        indices[:, :, None] + offsets[None, None, :]
+    ).reshape(-1)
+    pool_size     = pool_params.reshape(-1, pool_params.shape[-1]).shape[0]
+    safe_indices  = jnp.clip(flat_touched, 0, pool_size - 1)
+
+    pool_flat     = pool_params.reshape(-1, pool_params.shape[-1])
+    pool_m_flat   = state.pool_m.reshape(-1, state.pool_m.shape[-1])
+    pool_v_flat   = state.pool_v.reshape(-1, state.pool_v.shape[-1])
+    pool_grads_flat = pool_grads.reshape(-1, pool_grads.shape[-1])
+
+    p_slice = pool_flat[safe_indices]
+    g_slice = pool_grads_flat[safe_indices]
+    m_slice = pool_m_flat[safe_indices]
+    v_slice = pool_v_flat[safe_indices]
+
+    current_lr      = state.learning_rate_fn(state.step + 1)
+    pool_grad_norm  = jnp.sqrt(jnp.sum(pool_grads**2) + 1e-9)
+    pool_grad_scale = jnp.minimum(1.0, 1.0 / pool_grad_norm)
+    clipped_g_slice = g_slice * pool_grad_scale
+
+    new_p_s, new_m_s, new_v_s = sparse_adam_update(
+        p_slice, clipped_g_slice, m_slice, v_slice, state.step + 1, lr=current_lr
+    )
+
+    new_pool_flat   = pool_flat.at[safe_indices].set(new_p_s)
+    new_pool_m_flat = pool_m_flat.at[safe_indices].set(new_m_s)
+    new_pool_v_flat = pool_v_flat.at[safe_indices].set(new_v_s)
+
+    new_pool_params = new_pool_flat.reshape(pool_params.shape)
+    new_pool_m      = new_pool_m_flat.reshape(state.pool_m.shape)
+    new_pool_v      = new_pool_v_flat.reshape(state.pool_v.shape)
+
+    new_flat_params          = traverse_util.flatten_dict(new_dense_params)
+    new_flat_params[pool_key] = new_pool_params
+    new_params               = traverse_util.unflatten_dict(new_flat_params)
+
+    state = state.replace(
+        step=state.step + 1,
+        params=new_params,
+        opt_state=new_opt_state,
+        pool_m=new_pool_m,
+        pool_v=new_pool_v,
+        rng=new_rng,
+    )
+    return state, avg_loss, avg_sigma
