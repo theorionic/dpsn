@@ -170,6 +170,7 @@ def print_param_memory(state: Any, config: Any, batch_size: int, loss_chunk_size
     V  = config.vocab_size
     R  = config.max_reasoning_loops
     ff = int(D * config.controller_ff_multiplier)
+    use_remat = getattr(config, "gradient_checkpointing", False)
 
     def est(nelems: int, label: str, note: str = "") -> int:
         b = nelems * act_factor * 2   # ×2 for fwd+bwd
@@ -177,11 +178,26 @@ def print_param_memory(state: Any, config: Any, batch_size: int, loss_chunk_size
         print(f"  {label:<40}  {_gb(b):7.3f} GB{suffix}")
         return b
 
-    a_embed   = est(B * T * D,     "Embeddings")
-    a_attn_kv = est(B * L * T * D, "Attention QKV cache (all layers)",
-                    f"remat saves ~{L-1}/{L} layers")
-    a_ffn     = est(B * L * T * ff,"FFN intermediates (all layers)",
-                    "remat saves ~{}/{} layers".format(L-1, L))
+    a_embed = est(B * T * D, "Embeddings")
+
+    # Attention & FFN: gradient checkpointing (remat) stores only 1 layer's
+    # activations at a time during the backward pass, recomputing the rest.
+    # Without remat, all L layers must stay live simultaneously.
+    if use_remat:
+        # Only 1 layer live at a time; the other L-1 are recomputed
+        a_attn_kv = est(B * 1 * T * D,
+                        "Attention QKV cache (remat: 1 layer live)",
+                        f"gradient_checkpointing ON — saves {L-1}/{L} layers ({_gb(B*(L-1)*T*D*act_factor*2):.2f} GB)")
+        a_ffn     = est(B * 1 * T * ff,
+                        "FFN intermediates (remat: 1 layer live)",
+                        f"gradient_checkpointing ON — saves {L-1}/{L} layers ({_gb(B*(L-1)*T*ff*act_factor*2):.2f} GB)")
+    else:
+        a_attn_kv = est(B * L * T * D,
+                        "Attention QKV cache (all layers)",
+                        f"⚠ no remat — enable --gradient_checkpointing to save {_gb(B*(L-1)*T*D*act_factor*2):.2f} GB")
+        a_ffn     = est(B * L * T * ff,
+                        "FFN intermediates (all layers)",
+                        f"⚠ no remat — enable --gradient_checkpointing to save {_gb(B*(L-1)*T*ff*act_factor*2):.2f} GB")
 
     # Logits: with chunked loss only one chunk is live at a time
     if loss_chunk_size > 0:
@@ -192,16 +208,33 @@ def print_param_memory(state: Any, config: Any, batch_size: int, loss_chunk_size
         print(f"  {'Logits peak  (chunked, per chunk)':<40}  {_gb(a_logits):7.3f} GB"
               f"  (chunk={loss_chunk_size}×{T}×{V}, saves {saving_gb:.2f} GB vs full)")
     else:
-        a_logits  = est(B * T * V, "Logits  (B×T×V  — LARGEST)",
-                        f"{B}×{T}×{V}")
+        full_logits_bytes = B * T * V * act_factor * 2
+        a_logits = full_logits_bytes
+        print(f"  {'Logits  (B×T×V  — LARGEST)':<40}  {_gb(a_logits):7.3f} GB"
+              f"  ({B}×{T}×{V}) — use --loss_chunk_size 32 to save {_gb(a_logits * (1 - 32/B)):.2f} GB")
 
-    a_reason  = est(R * B * T * D, "Reasoning loop states (NOT remated)",
-                    f"{R} loops × (B,T,D)")
+    # Reasoning loop states are carried through lax.scan without remat;
+    # all R loop states must be stored simultaneously for the backward pass.
+    a_reason = est(R * B * T * D,
+                   "Reasoning loop states (lax.scan carry)",
+                   f"{R} loops × (B={B},T={T},D={D}) — not remated (scan carry)")
 
     total_act = a_embed + a_attn_kv + a_ffn + a_logits + a_reason
+    # worst_case = cost if neither remat nor chunked loss were used
+    worst_case = (a_embed
+                  + B * L * T * D * act_factor * 2   # all attn layers
+                  + B * L * T * ff * act_factor * 2   # all FFN layers
+                  + B * T * V * act_factor * 2         # full logits
+                  + a_reason)
     print(sep2)
-    note = "(full remat would save most of attention/FFN)" if not getattr(config, "gradient_checkpointing", False) else ""
-    print(f"  {'Total Activations (est.)':<40}  {_gb(total_act):7.3f} GB  {note}")
+    if use_remat:
+        saved_gb = _gb(worst_case - total_act)
+        print(f"  {'Total Activations (est., with remat)':<40}  {_gb(total_act):7.3f} GB"
+              f"  (gradient_checkpointing saves ~{saved_gb:.2f} GB vs no-remat)")
+    else:
+        saved_gb = _gb(B * (L - 1) * T * (D + ff) * act_factor * 2)
+        print(f"  {'Total Activations (est.)':<40}  {_gb(total_act):7.3f} GB"
+              f"  ⚠ use --gradient_checkpointing to save ~{saved_gb:.2f} GB")
 
     # ── 5. Grand total ────────────────────────────────────────────────────────
     grand_total = total_param_bytes + total_opt_bytes + data_bytes + total_act

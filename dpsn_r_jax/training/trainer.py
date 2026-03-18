@@ -421,7 +421,7 @@ def grad_accum_step(
     Returns:
         new_state, avg_loss (float), avg_mean_sigma (float)
     """
-    jax.debug.print("Tracing grad_accum_step for XLA...")
+    print("Compiling grad_accum_step for XLA...")
     dropout_rng, new_rng = random.split(state.rng)
     sigma_scale = state.sigma_anneal_fn(state.step)
 
