@@ -483,6 +483,13 @@ def grad_accum_step(
 
     # ── Accumulate gradients over all micro-batches ────────────────────────
     # Use jax.lax.scan so XLA sees a single kernel rather than N unrolled ones.
+    # ⚠ DO NOT add unroll=N here. With unroll=N, XLA duplicates the ENTIRE
+    # forward+backward graph N times in the HLO before running any optimization
+    # pass. For a 12-layer transformer this means ~25,000 HLO ops × N copies,
+    # causing XLA's super-linear optimization passes to consume 100s of GB of
+    # system RAM during compilation (observed: >330 GB at unroll=4, N=4).
+    # The original justification — overlapping FSDP AllGather syncs — is also
+    # moot since Bug #2 fix replicated the Controller (no dense collectives left).
     def scan_body(carry, micro_batch):
         acc_grads, acc_loss, acc_sigma = carry
         (loss, (indices, mean_sigma)), grads = grad_fn_micro(state.params, micro_batch)
@@ -497,10 +504,10 @@ def grad_accum_step(
     init_carry   = (zero_grads, jnp.float32(0.0), jnp.float32(0.0))
 
     (summed_grads, total_loss, total_sigma), all_indices = jax.lax.scan(
-        scan_body,                   # no jax.checkpoint needed; grad is taken inside!
+        scan_body,
         init_carry,
         micro_batches,               # (grad_accum_steps, micro_B, T)
-        unroll=4,                    # Let XLA overlap FSDP network syncs!
+        # unroll intentionally omitted — defaults to 1 (folded scan)
     )
 
     # Average over accumulation steps
