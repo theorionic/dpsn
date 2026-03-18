@@ -317,6 +317,7 @@ def _compute_micro_grads(
     Returns:
         grads, loss, mean_sigma, indices
     """
+    print("Compiling _compute_micro_grads to XLA...")
     def loss_fn(params):
         compute_params = (
             jax.tree_util.tree_map(lambda x: x.astype(jnp.bfloat16), params)
@@ -370,6 +371,7 @@ def _compute_micro_grads(
 )
 def _finalize_grad_accum(state, summed_grads, all_indices, new_rng, grad_accum_steps: int):
     """JIT: scale summed gradients by 1/N, then run the optimizer update."""
+    print("Compiling _finalize_grad_accum to XLA...")
     scale     = jnp.float32(1.0 / grad_accum_steps)
     avg_grads = jax.tree_util.tree_map(lambda g: g * scale, summed_grads)
     return _apply_optimizer_update(state, avg_grads, all_indices, new_rng)
