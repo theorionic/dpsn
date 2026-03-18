@@ -118,7 +118,15 @@ class DPSNR(nn.Module):
         halt_prob   = jnp.zeros((B, T, 1), dtype=hidden.dtype)
         halted_mask = jnp.zeros((B, T, 1), dtype=hidden.dtype)
 
-        # ── Warm-up calls: force Flax to trace all sub-modules before scan ────
+        # ── Warm-up calls: required for Flax to trace sub-modules before scan ──
+        # These dummy calls ensure Flax registers parameter bindings for all
+        # sub-modules (indexer, pool, retrieval_integrator, acc) BEFORE
+        # jax.lax.scan runs.  Without them, Dense layers inside the scan body
+        # hold a reference to an intermediate tracer created outside the scan,
+        # causing an UnexpectedTracerError.  The warm-up outputs are discarded;
+        # only the side-effect of Flax module tracing matters.
+        # NOTE: The Bug #5 fix in the diagnostic report (removing these calls)
+        # does NOT apply to the installed Flax version — keep them.
         _mu, _sigma = self.indexer(
             jnp.zeros((B, T, D)), sigma_max_scale=sigma_max_scale
         )

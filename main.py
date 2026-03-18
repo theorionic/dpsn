@@ -285,26 +285,24 @@ def main():
         Determines where a parameter should live based on its path in the PyTree.
         path: tuple of strings (e.g., ('params', 'pool', 'vectors'))
         param: the actual parameter array (for shape inspection if needed)
+
+        Strategy (Bug #2 Fix):
+          - Pool params → sharded across chips (model parallelism needed to break VRAM wall).
+          - Everything else → REPLICATED on every chip.
+
+        Rationale: The TinyController is small (<350 M params).  Sharding its dense
+        layers across 8 chips (FSDP/ZeRO-3) forces XLA to insert an AllGather before
+        EVERY matrix multiply on the forward pass AND an AllGather+ReduceScatter on the
+        backward pass.  On a small model the ICI latency of those collectives completely
+        dominates the tiny compute savings, tanking throughput.  Replicating the
+        Controller avoids all inter-chip communication for dense ops while still
+        sharding the massive pool across HBM.
         """
-        # If it's part of the massive pool, shard it!
-        # Path usually looks like ('params', 'pool', ...)
+        # Pool alone is sharded — this is the only thing that needs to break VRAM
         if "pool" in path:
-            # We shard the first dimension (total_vectors)
             return pool_sharding
 
-        # FSDP (ZeRO-3) for large dense weights/embeddings to distribute across TPU chips
-        if hasattr(param, "shape") and len(param.shape) >= 2:
-            num_devices = jax.device_count()
-            if param.shape[-1] % num_devices == 0:
-                spec = [None] * len(param.shape)
-                spec[-1] = "shard"
-                return NamedSharding(mesh, PartitionSpec(*spec))
-            elif param.shape[0] % num_devices == 0:
-                spec = [None] * len(param.shape)
-                spec[0] = "shard"
-                return NamedSharding(mesh, PartitionSpec(*spec))
-
-        # Biases, LayerNorms, and 1D vectors remain replicated as they take very little memory
+        # Replicate everything else (Controller, Indexer, ACC, LayerNorm, biases…)
         return replicated_sharding
 
     print(f"Distributed Mesh: {mesh}")
@@ -437,6 +435,22 @@ def main():
         learning_rate_fn=lr_schedule,
         sigma_anneal_fn=sigma_anneal_fn,
     )
+
+    # ── FIX DOUBLE COMPILATION ────────────────────────────────────────────────
+    # JAX jit caches based on PyTree structure AND Sharding. `step`, `rng`, and
+    # `opt_state.count` initialize as SingleDeviceSharding(CpuDevice(id=0)).
+    # The first grad_accum_step returns them upgraded to NamedSharding(mesh).
+    # Since Input != Output sharding, JAX forced a 20-minute recompile on Step 1.
+    # We fix this by proactively promoting all SingleDevice arrays to the Mesh.
+    replicated_sharding = NamedSharding(mesh, PartitionSpec())
+    
+    def bound_to_mesh(x):
+        if hasattr(x, "sharding") and not isinstance(x.sharding, NamedSharding):
+            return jax.device_put(x, replicated_sharding)
+        return x
+
+    state = jax.tree_util.tree_map(bound_to_mesh, state)
+
 
     # RESTORE CHECKPOINT IF REQUESTED
     if args.resume and checkpoint_manager:
@@ -707,7 +721,12 @@ def main():
         """Run training steps using the given data pipeline.
         Returns (state, global_step, epoch_loss, start_time, total_data_wait_time_interval, hit_max_steps).
         """
-        epoch_loss = 0
+        # Bug #1 Fix: accumulate loss as a JAX future (no blocking DtH transfer).
+        # We only call float() / block_until_ready() inside the LOG_INTERVAL block,
+        # keeping the TPU pipeline bubble-free between logging events.
+        epoch_loss = jnp.zeros((), dtype=jnp.float32)
+        last_loss = jnp.zeros((), dtype=jnp.float32)   # holds the last step's loss future
+        last_sigma = jnp.zeros((), dtype=jnp.float32)  # holds the last step's mean_sigma future
         hit_max_steps = False
 
         for step in range(steps_per_epoch):
@@ -754,17 +773,12 @@ def main():
                     loss_chunk_size=getattr(config, 'loss_chunk_size', 0),
                 )
 
-            epoch_loss += loss
+            # Bug #1 Fix: append JAX futures — NO float() / .item() here!
+            # These are enqueued as async device operations; the TPU keeps running.
+            epoch_loss = epoch_loss + loss
+            last_loss  = loss
+            last_sigma = mean_sigma
             global_step += 1
-
-            # TensorBoard logging
-            writer.add_scalar("Loss/train", float(loss), global_step)
-            writer.add_scalar("PPL/train", float(jnp.exp(loss)), global_step)
-            current_lr = state.learning_rate_fn(global_step)
-            writer.add_scalar("LR", current_lr, global_step)
-            writer.add_scalar("Routing/mean_sigma", float(mean_sigma), global_step)
-            sigma_scale = float(state.sigma_anneal_fn(global_step))
-            writer.add_scalar("Routing/sigma_scale", sigma_scale, global_step)
 
             # Save Checkpoint
             if (
@@ -777,7 +791,11 @@ def main():
                 checkpoint_manager.save(global_step, state)
 
             if step % LOG_INTERVAL == 0:
-                loss.block_until_ready()
+                # Bug #1 Fix: ONE blocking sync per LOG_INTERVAL steps.
+                # block_until_ready() stalls the host until the TPU has
+                # finished this step, then we do ALL float() conversions
+                # at once.  Between logging events the TPU runs freely.
+                last_loss.block_until_ready()
                 current_time = time.time()
                 elapsed = current_time - start_time
 
@@ -790,17 +808,27 @@ def main():
                 tokens_per_sec = (args.batch_size * config.max_seq_len) / avg_step_time
                 tflops = flops_per_step / active_tpu_time / 1e12
 
+                # All float() calls happen AFTER block_until_ready — single sync point
+                loss_val  = float(last_loss)
+                sigma_val = float(last_sigma)
+                ppl_val   = float(jnp.exp(last_loss))
+                sigma_scale_val = float(state.sigma_anneal_fn(global_step))
+                current_lr = float(state.learning_rate_fn(global_step))
+
+                writer.add_scalar("Loss/train", loss_val, global_step)
+                writer.add_scalar("PPL/train", ppl_val, global_step)
+                writer.add_scalar("LR", current_lr, global_step)
+                writer.add_scalar("Routing/mean_sigma", sigma_val, global_step)
+                writer.add_scalar("Routing/sigma_scale", sigma_scale_val, global_step)
                 writer.add_scalar("Perf/TPS", tokens_per_sec, global_step)
                 writer.add_scalar("Perf/TFLOPS", tflops, global_step)
                 writer.add_scalar("Perf/DataWaitTime_s", avg_data_wait, global_step)
 
-                ppl = jnp.exp(loss)
-                sigma_scale = float(state.sigma_anneal_fn(global_step))
-                precision_tag = "broad" if float(mean_sigma) > 1.0 else ("precise" if float(mean_sigma) < 0.1 else "narrowing")
+                precision_tag = "broad" if sigma_val > 1.0 else ("precise" if sigma_val < 0.1 else "narrowing")
                 print(
                     f"{file_label}Epoch {epoch + 1} | Step {step} | Global Step {global_step} | "
-                    f"Loss: {loss:.4f} | PPL: {ppl:.4f} | LR: {current_lr:.2e} | "
-                    f"sigma={float(mean_sigma):.3f} ({precision_tag}) | "
+                    f"Loss: {loss_val:.4f} | PPL: {ppl_val:.4f} | LR: {current_lr:.2e} | "
+                    f"sigma={sigma_val:.3f} ({precision_tag}) | "
                     f"TPS: {tokens_per_sec:.0f} | TFLOPS: {tflops:.4f} | DataWait: {avg_data_wait:.3f}s"
                 )
 

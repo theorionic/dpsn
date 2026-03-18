@@ -322,7 +322,15 @@ def train_step(state, batch, pad_token_id=0,
 
     # Clip to valid pool range (handles both 1D and 2D pool flat indices)
     pool_size   = pool_params.reshape(-1, pool_params.shape[-1]).shape[0]
-    safe_indices = jnp.clip(flat_touched, 0, pool_size - 1)
+    safe_indices_raw = jnp.clip(flat_touched, 0, pool_size - 1)
+
+    # ── Bug #3 Fix: Sort indices to enable coalesced HBM reads ────────────────
+    # XLA scatter/gather on unsorted indices results in random HBM accesses
+    # (irregular memory access pattern = throttled bandwidth).  Sorting once
+    # here (O(N log N) on a small index vector) unlocks sequential HBM reads
+    # in the subsequent gather and scatter, which is vastly cheaper at scale.
+    sort_order   = jnp.argsort(safe_indices_raw)
+    safe_indices = safe_indices_raw[sort_order]
 
     # Reshape pool for flat indexing (handles both 1D and 2D pool storage)
     pool_flat = pool_params.reshape(-1, pool_params.shape[-1])
@@ -363,7 +371,7 @@ def train_step(state, batch, pad_token_id=0,
 
     new_flat_params = traverse_util.flatten_dict(new_dense_params)
     new_flat_params[pool_key] = new_pool_params
-    new_params = core.freeze(traverse_util.unflatten_dict(new_flat_params))
+    new_params = traverse_util.unflatten_dict(new_flat_params)
 
     state = state.replace(
         step=state.step + 1,
@@ -413,7 +421,7 @@ def grad_accum_step(
     Returns:
         new_state, avg_loss (float), avg_mean_sigma (float)
     """
-    print("Compiling grad_accum_step for XLA...", flush=True)
+    jax.debug.print("Tracing grad_accum_step for XLA...")
     dropout_rng, new_rng = random.split(state.rng)
     sigma_scale = state.sigma_anneal_fn(state.step)
 
@@ -492,6 +500,7 @@ def grad_accum_step(
         scan_body,                   # no jax.checkpoint needed; grad is taken inside!
         init_carry,
         micro_batches,               # (grad_accum_steps, micro_B, T)
+        unroll=4,                    # Let XLA overlap FSDP network syncs!
     )
 
     # Average over accumulation steps
@@ -500,8 +509,9 @@ def grad_accum_step(
     avg_loss    = total_loss  * scale
     avg_sigma   = total_sigma * scale
 
-    # Use last micro-batch's indices for sparse pool update
-    indices = all_indices[-1]   # (heads*micro_B, max_loops)
+    # Use ALL micro-batch indices for the sparse pool update, not just the last one
+    # all_indices shape: (grad_accum_steps, heads*micro_B, max_loops)
+    indices = all_indices.reshape(-1, all_indices.shape[-1])
 
     # ── Optimizer update (identical to train_step) ────────────────────────
     pool_key      = ("pool", "params_storage")
@@ -525,7 +535,11 @@ def grad_accum_step(
         indices[:, :, None] + offsets[None, None, :]
     ).reshape(-1)
     pool_size     = pool_params.reshape(-1, pool_params.shape[-1]).shape[0]
-    safe_indices  = jnp.clip(flat_touched, 0, pool_size - 1)
+    safe_indices_raw = jnp.clip(flat_touched, 0, pool_size - 1)
+
+    # ── Bug #3 Fix: Sort indices to enable coalesced HBM reads ────────────────
+    sort_order   = jnp.argsort(safe_indices_raw)
+    safe_indices = safe_indices_raw[sort_order]
 
     pool_flat     = pool_params.reshape(-1, pool_params.shape[-1])
     pool_m_flat   = state.pool_m.reshape(-1, state.pool_m.shape[-1])
@@ -556,7 +570,7 @@ def grad_accum_step(
 
     new_flat_params          = traverse_util.flatten_dict(new_dense_params)
     new_flat_params[pool_key] = new_pool_params
-    new_params               = core.freeze(traverse_util.unflatten_dict(new_flat_params))
+    new_params               = traverse_util.unflatten_dict(new_flat_params)
 
     state = state.replace(
         step=state.step + 1,
