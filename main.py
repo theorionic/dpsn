@@ -804,11 +804,6 @@ def main():
             last_sigma = mean_sigma
             dispatch_time = time.time() - dispatch_start_time
 
-            if getattr(args, "profile_detailed", False):
-                exec_start = time.time()
-                loss.block_until_ready()
-                execution_time = time.time() - exec_start
-                print(f"⏱️ [Step {global_step}] Data Fetch: {current_data_wait_time*1000:>6.1f}ms | Host Dispatch: {dispatch_time*1000:>6.1f}ms | TPU Execution: {execution_time*1000:>6.1f}ms")
 
             global_step += 1
 
