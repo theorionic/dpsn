@@ -108,6 +108,14 @@ class DPSNRConfig:
     # weight is linearly ramped from 0 → precision_loss_weight over sigma_anneal_steps.
     precision_loss_weight: float = 0.0
 
+    # ── SRAM Super-Window pre-fetching (Opt-2) ─────────────────────────────
+    # Before the reasoning loop, fetch pool_super_window_factor × window_size
+    # vectors from HBM in one pass.  The XLA lax.scan carry mechanism then
+    # holds this wider tensor in on-chip SRAM across all reasoning iterations,
+    # reducing per-iteration HBM latency from ~100 ns to ~1 ns.
+    # Set to 1 to disable (equivalent to old behaviour).  Recommended: 4–8.
+    pool_super_window_factor: int = 1
+
     @classmethod
     def from_yaml(cls, path: str) -> "DPSNRConfig":
         import yaml

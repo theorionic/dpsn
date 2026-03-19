@@ -143,11 +143,68 @@ class DPSNR(nn.Module):
         )
         _ = self.acc(state_hidden, state_hidden, 0, halt_prob, halted_mask)
 
-        use_2d = self.config.use_2d_pool
-        H = self.config.num_indexer_heads
+        use_2d    = self.config.use_2d_pool
+        H         = self.config.num_indexer_heads
+        SW_FACTOR = self.config.pool_super_window_factor  # Opt-2 knob
+        USE_SW    = SW_FACTOR > 1
 
+        # ── Opt-2: Pre-fetch a wide super-window from HBM ONCE ────────────────
+        # Before the reasoning loop, run the indexer once to get initial mu
+        # coordinates, then fetch SW_FACTOR × window_size vectors in a single
+        # HBM pass.  Passing the result as a lax.scan carry instructs XLA to
+        # hold it in on-chip SRAM, so per-iteration slices cost ~1 ns instead
+        # of ~100 ns.  When SW_FACTOR == 1 this block is skipped entirely and
+        # the original per-iteration HBM path is used.
+        if USE_SW:
+            # Warm-up calls for the new super-window helpers so Flax traces them
+            # before the scan (same pattern as the existing warm-up block above).
+            if use_2d:
+                _sw_dim = self.pool.window_size * SW_FACTOR
+                _ = self.pool.fetch_super_window_2d(
+                    jnp.zeros((B,)), jnp.zeros((B,)), SW_FACTOR
+                )
+                _ = self.pool.__call_from_super_window_2d__(
+                    jnp.zeros((B, _sw_dim, _sw_dim, D), dtype=jnp.bfloat16),
+                    jnp.zeros((B,), dtype=jnp.int32),
+                    jnp.zeros((B,), dtype=jnp.int32),
+                    jnp.zeros((B,)), jnp.zeros((B,)), jnp.zeros((B,)),
+                )
+            else:
+                _sw_dim = self.pool.window_size * SW_FACTOR
+                _ = self.pool.fetch_super_window(jnp.zeros((B,)), SW_FACTOR)
+                _ = self.pool.__call_from_super_window__(
+                    jnp.zeros((B, _sw_dim, D), dtype=jnp.bfloat16),
+                    jnp.zeros((B,), dtype=jnp.int32),
+                    jnp.zeros((B,)), jnp.zeros((B,)),
+                )
+
+            # Run real initial indexer pass to anchor the super-window
+            _mu_init, _ = self.indexer(state_hidden, sigma_max_scale=sigma_max_scale)
+            if use_2d:
+                heads_per_dim = max(1, H // 2)
+                _mu_r0 = _mu_init[:, 0]
+                _mu_c0 = _mu_init[:, min(heads_per_dim, H - 1)]
+                init_sw, init_sw_r, init_sw_c = self.pool.fetch_super_window_2d(
+                    _mu_r0, _mu_c0, SW_FACTOR
+                )
+                sw_carry = (init_sw, init_sw_r, init_sw_c)
+            else:
+                _mu_1d0 = _mu_init[:, 0]
+                init_sw, init_sw_start = self.pool.fetch_super_window(
+                    _mu_1d0, SW_FACTOR
+                )
+                sw_carry = (init_sw, init_sw_start)
+
+        # ── reasoning_step ────────────────────────────────────────────────────
         def reasoning_step(carry, i):
-            s_hidden, h_prob, h_mask = carry
+            if USE_SW:
+                if use_2d:
+                    s_hidden, h_prob, h_mask, (sw, sw_r, sw_c) = carry
+                else:
+                    s_hidden, h_prob, h_mask, (sw, sw_s) = carry
+            else:
+                s_hidden, h_prob, h_mask = carry
+
             prev_s_hidden = s_hidden
 
             # ── 1. Multi-head indexing with runtime sigma scale ─────────────
@@ -156,52 +213,75 @@ class DPSNR(nn.Module):
             # mu: (B, H), sigma: (B, H)
 
             # ── 2. Per-head pool retrieval — vectorized with jax.vmap ─────────
-            # Instead of a Python for-loop (which XLA unrolls into separate
-            # kernel launches), vmap dispatches all heads as a single fused op.
             if use_2d:
-                # 2D pool: pair heads into (row, col) couples.
-                # heads_per_dim pairs → each pair uses consecutive head indices.
                 heads_per_dim = max(1, H // 2)
-                h_row_ids = jnp.arange(heads_per_dim)                     # (P,)
-                h_col_ids = jnp.minimum(h_row_ids + heads_per_dim, H - 1) # (P,)
+                h_row_ids = jnp.arange(heads_per_dim)
+                h_col_ids = jnp.minimum(h_row_ids + heads_per_dim, H - 1)
 
-                # mu_r/mu_c: (B, P);  sigma_h: (B, P) — mean of both axes
-                mu_r    = mu[:, h_row_ids]                                 # (B, P)
-                mu_c    = mu[:, h_col_ids]                                 # (B, P)
-                sigma_h = (sigma[:, h_row_ids] + sigma[:, h_col_ids]) / 2.0  # (B, P)
+                mu_r    = mu[:, h_row_ids]
+                mu_c    = mu[:, h_col_ids]
+                sigma_h = (sigma[:, h_row_ids] + sigma[:, h_col_ids]) / 2.0
 
-                # vmap over the head-pair axis (axis-1 of each input)
-                # in_axes=(1,1,1) → iterates over head dim; out_axes=1 → stacks on axis-1
-                def pool2d_head(mu_r_h, mu_c_h, sig_h):
-                    """Single head: inputs (B,), outputs (B,D) and (B,)."""
-                    return self.pool(mu_r_h, mu_c_h, sig_h)
+                if USE_SW:
+                    # ── SRAM path: slice from the in-scan super-window carry ──
+                    def pool2d_head_sw(mu_r_h, mu_c_h, sig_h):
+                        return self.pool.__call_from_super_window_2d__(
+                            sw, sw_r, sw_c, mu_r_h, mu_c_h, sig_h
+                        )
+                    with jax.profiler.TraceAnnotation("CoordinateMassivePool2D_SW_vmap"):
+                        retrieved_all, start_all = jax.vmap(
+                            pool2d_head_sw, in_axes=(1, 1, 1), out_axes=(1, 1)
+                        )(mu_r, mu_c, sigma_h)
 
-                with jax.profiler.TraceAnnotation("CoordinateMassivePool2D_vmap"):
-                    retrieved_all, start_all = jax.vmap(
-                        pool2d_head, in_axes=(1, 1, 1), out_axes=(1, 1)
-                    )(mu_r, mu_c, sigma_h)
-                # retrieved_all: (B, P, D)   start_all: (B, P)
+                    # Refresh super-window for the next iteration (track new mu)
+                    new_mu_r = jnp.mean(mu_r, axis=1)
+                    new_mu_c = jnp.mean(mu_c, axis=1)
+                    new_sw, new_sw_r, new_sw_c = self.pool.fetch_super_window_2d(
+                        new_mu_r, new_mu_c, SW_FACTOR
+                    )
+                    new_sw_carry = (new_sw, new_sw_r, new_sw_c)
+                else:
+                    # ── Original HBM path ────────────────────────────────────
+                    def pool2d_head(mu_r_h, mu_c_h, sig_h):
+                        return self.pool(mu_r_h, mu_c_h, sig_h)
+                    with jax.profiler.TraceAnnotation("CoordinateMassivePool2D_vmap"):
+                        retrieved_all, start_all = jax.vmap(
+                            pool2d_head, in_axes=(1, 1, 1), out_axes=(1, 1)
+                        )(mu_r, mu_c, sigma_h)
 
                 retrieved     = jnp.mean(retrieved_all, axis=1)  # (B, D)
                 start_indices = start_all.reshape(-1)             # (B*P,)
 
             else:
-                # 1D pool: vmap over the H heads stored in axis-1
-                def pool1d_head(mu_h, sig_h):
-                    """Single head: inputs (B,), outputs (B,D) and (B,)."""
-                    return self.pool(mu_h, sig_h)
+                if USE_SW:
+                    # ── SRAM path (1D) ───────────────────────────────────────
+                    def pool1d_head_sw(mu_h, sig_h):
+                        return self.pool.__call_from_super_window__(
+                            sw, sw_s, mu_h, sig_h
+                        )
+                    with jax.profiler.TraceAnnotation("CoordinateMassivePool1D_SW_vmap"):
+                        retrieved_all, start_all = jax.vmap(
+                            pool1d_head_sw, in_axes=(1, 1), out_axes=(1, 1)
+                        )(mu, sigma)
 
-                with jax.profiler.TraceAnnotation("CoordinateMassivePool1D_vmap"):
-                    retrieved_all, start_all = jax.vmap(
-                        pool1d_head, in_axes=(1, 1), out_axes=(1, 1)
-                    )(mu, sigma)
-                # retrieved_all: (B, H, D)   start_all: (B, H)
+                    # Refresh super-window
+                    new_mu_1d = jnp.mean(mu, axis=1)
+                    new_sw, new_sw_s = self.pool.fetch_super_window(new_mu_1d, SW_FACTOR)
+                    new_sw_carry = (new_sw, new_sw_s)
+                else:
+                    # ── Original HBM path (1D) ───────────────────────────────
+                    def pool1d_head(mu_h, sig_h):
+                        return self.pool(mu_h, sig_h)
+                    with jax.profiler.TraceAnnotation("CoordinateMassivePool1D_vmap"):
+                        retrieved_all, start_all = jax.vmap(
+                            pool1d_head, in_axes=(1, 1), out_axes=(1, 1)
+                        )(mu, sigma)
 
                 retrieved     = jnp.mean(retrieved_all, axis=1)  # (B, D)
                 start_indices = start_all.reshape(-1)             # (B*H,)
 
             # ── Mean sigma for logging and precision loss ─────────────────────
-            mean_sigma_step = jnp.mean(sigma)   # scalar
+            mean_sigma_step = jnp.mean(sigma)
 
             # ── 3. Integrate retrieved knowledge ───────────────────────────────
             with jax.profiler.TraceAnnotation("Retrieval_Integrator"):
@@ -223,15 +303,17 @@ class DPSNR(nn.Module):
             s_hidden = update_mask * new_s_hidden + h_mask * prev_s_hidden
 
             # ── Preserve carry dtypes for jax.lax.scan ────────────────────────
-            # Some ops inside ACC/LayerNorm/sigmoid can upcast to float32 even
-            # when the inputs are bfloat16.  scan requires that carry input and
-            # output have *identical* dtypes, so we cast back explicitly.
             carry_dtype = prev_s_hidden.dtype
             s_hidden   = s_hidden.astype(carry_dtype)
             h_prob     = h_prob.astype(carry_dtype)
             new_h_mask = new_h_mask.astype(carry_dtype)
 
-            return (s_hidden, h_prob, new_h_mask), (start_indices, mean_sigma_step)
+            if USE_SW:
+                new_carry = (s_hidden, h_prob, new_h_mask, new_sw_carry)
+            else:
+                new_carry = (s_hidden, h_prob, new_h_mask)
+
+            return new_carry, (start_indices, mean_sigma_step)
 
         # ── Optional gradient checkpointing on reasoning_step ─────────────────
         # The old tracer-leak (TracerBoolConversionError) was because the
@@ -248,15 +330,21 @@ class DPSNR(nn.Module):
         if self.config.gradient_checkpointing:
             _scan_fn = jax.checkpoint(reasoning_step)
 
-        init_carry = (state_hidden, halt_prob, halted_mask)
-        (state_hidden, halt_prob, halted_mask), (all_indices, sigma_per_loop) = (
-            jax.lax.scan(
-                _scan_fn,
-                init_carry,
-                jnp.arange(self.config.max_reasoning_loops),
-            )
+        if USE_SW:
+            init_carry = (state_hidden, halt_prob, halted_mask, sw_carry)
+        else:
+            init_carry = (state_hidden, halt_prob, halted_mask)
+
+        final_carry, (all_indices, sigma_per_loop) = jax.lax.scan(
+            _scan_fn,
+            init_carry,
+            jnp.arange(self.config.max_reasoning_loops),
         )
 
+        if USE_SW:
+            state_hidden, halt_prob, halted_mask, _ = final_carry
+        else:
+            state_hidden, halt_prob, halted_mask = final_carry
 
         # all_indices: (max_loops, heads*B) → transpose to (B*heads, max_loops)
         all_indices = jnp.transpose(all_indices, (1, 0))

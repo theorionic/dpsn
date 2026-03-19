@@ -11,3 +11,4 @@ wheels/
 checkpoints_*/
 debug_*/
 xla_log.txt
+*.zip

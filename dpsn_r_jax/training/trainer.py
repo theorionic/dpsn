@@ -56,8 +56,8 @@ def create_train_state(rng, config, learning_rate_fn=None):
     )
     opt_state = tx.init(dense_params)
 
-    pool_m = jnp.zeros_like(pool_params)
-    pool_v = jnp.zeros_like(pool_params)
+    pool_m = jnp.zeros_like(pool_params, dtype=jnp.float32)
+    pool_v = jnp.zeros_like(pool_params, dtype=jnp.float32)
 
     sigma_target_ratio = config.sigma_target / max(config.sigma_max, 1e-8)
     sigma_anneal_fn = _make_sigma_anneal_fn(
@@ -181,9 +181,13 @@ def _apply_optimizer_update(state, grads, indices, new_rng):
         p_slice, clipped_g_slice, m_slice, v_slice, state.step + 1, lr=current_lr
     )
 
-    new_pool_flat   = pool_flat.at[safe_indices].set(new_p_s)
-    new_pool_m_flat = pool_m_flat.at[safe_indices].set(new_m_s)
-    new_pool_v_flat = pool_v_flat.at[safe_indices].set(new_v_s)
+    # Cast back to the pool's native dtype (bfloat16 after Opt-1) before
+    # scattering — prevents a FutureWarning (→ error in future JAX) from
+    # an implicit float32 → bfloat16 narrowing inside lax.scatter.
+    pool_dtype      = pool_flat.dtype
+    new_pool_flat   = pool_flat.at[safe_indices].set(new_p_s.astype(pool_dtype))
+    new_pool_m_flat = pool_m_flat.at[safe_indices].set(new_m_s.astype(pool_m_flat.dtype))
+    new_pool_v_flat = pool_v_flat.at[safe_indices].set(new_v_s.astype(pool_v_flat.dtype))
 
     new_pool_params = new_pool_flat.reshape(pool_params.shape)
     new_pool_m      = new_pool_m_flat.reshape(state.pool_m.shape)
