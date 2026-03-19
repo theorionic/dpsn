@@ -15,9 +15,6 @@ class TrainState(train_state.TrainState):
     pool_m: jnp.ndarray
     pool_v: jnp.ndarray
     window_size: int = struct.field(pytree_node=False)
-    learning_rate_fn: Callable[[int], float] = struct.field(pytree_node=False)
-    # sigma_anneal_fn(step) -> float in (0, 1]: multiplier applied to sigma_max.
-    sigma_anneal_fn: Callable[[int], float] = struct.field(pytree_node=False)
 
 
 def _make_sigma_anneal_fn(sigma_anneal_steps: int, sigma_target_ratio: float):
@@ -128,7 +125,7 @@ def chunked_lm_loss(hidden, labels, decode_fn, pad_token_id, chunk_size):
 # its callers.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _apply_optimizer_update(state, grads, indices, new_rng):
+def _apply_optimizer_update(state, grads, indices, new_rng, current_lr):
     """Dense AdamW update + sparse Adam pool update, returns new_state."""
     pool_key = ("pool", "params_storage")
     flat_params = traverse_util.flatten_dict(state.params)
@@ -172,7 +169,6 @@ def _apply_optimizer_update(state, grads, indices, new_rng):
     m_slice = pool_m_flat[safe_indices]
     v_slice = pool_v_flat[safe_indices]
 
-    current_lr      = state.learning_rate_fn(state.step + 1)
     pool_grad_norm  = jnp.sqrt(jnp.sum(pool_grads ** 2) + 1e-9)
     pool_grad_scale = jnp.minimum(1.0, 1.0 / pool_grad_norm)
     clipped_g_slice = g_slice * pool_grad_scale
@@ -220,14 +216,13 @@ def _apply_optimizer_update(state, grads, indices, new_rng):
     donate_argnums=(0,),
 )
 def train_step(
-    state, batch, pad_token_id=0,
+    state, batch, current_lr, sigma_scale, pad_token_id=0,
     precision_loss_weight=0.0, sigma_anneal_steps=0,
     use_bf16=False, loss_chunk_size=0,
 ):
     """Single training step. Returns (new_state, loss, mean_sigma)."""
     print("Compiling train_step for XLA...", flush=True)
     dropout_rng, new_rng = random.split(state.rng)
-    sigma_scale = state.sigma_anneal_fn(state.step)
 
     if sigma_anneal_steps > 0 and precision_loss_weight > 0.0:
         ramp = jnp.minimum(1.0, (state.step + 1) / sigma_anneal_steps)
@@ -281,7 +276,7 @@ def train_step(
             loss_fn, has_aux=True
         )(state.params)
 
-    new_state = _apply_optimizer_update(state, grads, indices, new_rng)
+    new_state = _apply_optimizer_update(state, grads, indices, new_rng, current_lr)
     return new_state, loss, mean_sigma
 
 
@@ -307,6 +302,8 @@ def train_step(
 def grad_accum_step(
     state,
     micro_batches,
+    current_lr,
+    sigma_scale,
     pad_token_id=0,
     precision_loss_weight=0.0,
     sigma_anneal_steps=0,
@@ -317,7 +314,6 @@ def grad_accum_step(
     """Gradient accumulation via fully JIT-compiled jax.lax.scan."""
     print("Compiling grad_accum_step for XLA...", flush=True)
     dropout_rng, new_rng = random.split(state.rng)
-    sigma_scale = state.sigma_anneal_fn(state.step)
 
     if sigma_anneal_steps > 0 and precision_loss_weight > 0.0:
         ramp = jnp.minimum(1.0, (state.step + 1) / jnp.float32(sigma_anneal_steps))
@@ -406,5 +402,5 @@ def grad_accum_step(
     # flatten indices from (grad_accum_steps, micro_B, max_loops) to (B, max_loops)
     all_indices = jnp.reshape(all_indices, (-1, all_indices.shape[-1]))
 
-    new_state = _apply_optimizer_update(state, avg_grads, all_indices, new_rng)
+    new_state = _apply_optimizer_update(state, avg_grads, all_indices, new_rng, current_lr)
     return new_state, avg_loss, avg_sigma

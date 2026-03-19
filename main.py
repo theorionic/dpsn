@@ -450,8 +450,6 @@ def main():
         pool_m=pool_m,
         pool_v=pool_v,
         window_size=config.max_k,
-        learning_rate_fn=lr_schedule,
-        sigma_anneal_fn=sigma_anneal_fn,
     )
 
     # ── FIX DOUBLE COMPILATION ────────────────────────────────────────────────
@@ -769,6 +767,9 @@ def main():
 
             dispatch_start_time = time.time()
 
+            current_lr_val = jnp.float32(lr_schedule(global_step))
+            sigma_scale_val = jnp.float32(sigma_anneal_fn(global_step))
+
             if _grad_accum > 1:
                 # ── Gradient accumulation path ────────────────────────────────
                 # Caller splits (B, T) batch into (_grad_accum, micro_B, T) and
@@ -779,7 +780,7 @@ def main():
                     _grad_accum, micro_batch_size, config.max_seq_len
                 )
                 state, loss, mean_sigma = grad_accum_step(
-                    state, micro_batches,
+                    state, micro_batches, current_lr_val, sigma_scale_val,
                     pad_token_id=config.pad_token_id,
                     precision_loss_weight=getattr(config, 'precision_loss_weight', 0.0),
                     sigma_anneal_steps=getattr(config, 'sigma_anneal_steps', 0),
@@ -790,7 +791,7 @@ def main():
             else:
                 # ── Standard single-step path ─────────────────────────────────
                 state, loss, mean_sigma = distributed_train_step(
-                    state, batch, config.pad_token_id,
+                    state, batch, current_lr_val, sigma_scale_val, config.pad_token_id,
                     precision_loss_weight=getattr(config, 'precision_loss_weight', 0.0),
                     sigma_anneal_steps=getattr(config, 'sigma_anneal_steps', 0),
                     use_bf16=getattr(config, 'use_bf16', False),
@@ -844,8 +845,8 @@ def main():
                 loss_val  = float(last_loss)
                 sigma_val = float(last_sigma)
                 ppl_val   = float(jnp.exp(last_loss))
-                sigma_scale_val = float(state.sigma_anneal_fn(global_step))
-                current_lr = float(state.learning_rate_fn(global_step))
+                sigma_scale_val = float(sigma_anneal_fn(global_step))
+                current_lr = float(lr_schedule(global_step))
 
                 writer.add_scalar("Loss/train", loss_val, global_step)
                 writer.add_scalar("PPL/train", ppl_val, global_step)
