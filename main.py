@@ -294,8 +294,6 @@ def main():
     # 3. Other Params: Replicated (None)
 
     batch_sharding = NamedSharding(mesh, PartitionSpec("shard", None))
-    # Pool is usually (num_vectors, dim), we split num_vectors
-    pool_sharding = NamedSharding(mesh, PartitionSpec("shard", None))
     replicated_sharding = NamedSharding(mesh, PartitionSpec())
 
     def get_sharding_rule(path, param):
@@ -316,9 +314,13 @@ def main():
         Controller avoids all inter-chip communication for dense ops while still
         sharding the massive pool across HBM.
         """
-        # Pool alone is sharded — this is the only thing that needs to break VRAM
+        # Pool alone is sharded — this is the only thing that needs to break VRAM.
+        # PartitionSpec must match the array rank exactly:
+        #   1D pool: (num_vectors, dim)       → PartitionSpec("shard", None)
+        #   2D pool: (grid_rows, grid_cols, dim) → PartitionSpec("shard", None, None)
         if "pool" in path:
-            return pool_sharding
+            spec = PartitionSpec(*("shard",) + (None,) * (param.ndim - 1))
+            return NamedSharding(mesh, spec)
 
         # Replicate everything else (Controller, Indexer, ACC, LayerNorm, biases…)
         return replicated_sharding
@@ -432,8 +434,21 @@ def main():
     )
     opt_state = tx.init(dense_params)
 
-    pool_m = jnp.zeros_like(pool_params)
-    pool_v = jnp.zeros_like(pool_params)
+    # Allocate Adam moments for the pool directly sharded across chips.
+    # We must NOT use jnp.zeros_like here: if pool_params somehow landed on a
+    # single device (e.g. due to a PartitionSpec rank mismatch on older JAX),
+    # zeros_like would try to create the full tensor (4.5 GB for xxl) on that
+    # one chip and OOM.  Using jit+out_shardings forces XLA to allocate each
+    # shard directly on its target device without ever forming the full array.
+    _pool_moment_sharding = NamedSharding(
+        mesh, PartitionSpec(*("shard",) + (None,) * (pool_params.ndim - 1))
+    )
+    _make_pool_zeros = jax.jit(
+        lambda: jnp.zeros(pool_params.shape, dtype=pool_params.dtype),
+        out_shardings=_pool_moment_sharding,
+    )
+    pool_m = _make_pool_zeros()
+    pool_v = _make_pool_zeros()
 
     sigma_target_ratio = config.sigma_target / max(config.sigma_max, 1e-8)
     sigma_anneal_fn = _make_sigma_anneal_fn(
