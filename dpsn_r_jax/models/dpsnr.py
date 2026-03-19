@@ -11,6 +11,10 @@ from dpsn_r_jax.models.memory import (
 import jax.profiler
 from dpsn_r_jax.models.reasoning import AdaptiveComputeController
 
+# Set to True to print per-loop reasoning stats to stdout (via jax.debug.print).
+# Works inside JIT/lax.scan. Disable for production to avoid print overhead.
+DEBUG_REASONING_LOOPS: bool = False
+
 
 class DPSNR(nn.Module):
     config: DPSNRConfig
@@ -282,6 +286,20 @@ class DPSNR(nn.Module):
 
             # ── Mean sigma for logging and precision loss ─────────────────────
             mean_sigma_step = jnp.mean(sigma)
+
+            if DEBUG_REASONING_LOOPS:
+                halt_rate = jnp.mean(h_mask)
+                retrieved_norm = jnp.sqrt(jnp.mean(retrieved ** 2))
+                hidden_norm = jnp.sqrt(jnp.mean(s_hidden ** 2))
+                jax.debug.print(
+                    "[ReasoningLoop] loop={i} | mean_sigma={sigma:.4f} | "
+                    "halt_rate={halt:.3f} | retrieved_l2={ret:.4f} | hidden_l2={hid:.4f}",
+                    i=i,
+                    sigma=mean_sigma_step,
+                    halt=halt_rate,
+                    ret=retrieved_norm,
+                    hid=hidden_norm,
+                )
 
             # ── 3. Integrate retrieved knowledge ───────────────────────────────
             with jax.profiler.TraceAnnotation("Retrieval_Integrator"):

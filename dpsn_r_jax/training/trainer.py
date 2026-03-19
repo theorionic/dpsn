@@ -139,55 +139,57 @@ def _apply_optimizer_update(state, grads, indices, new_rng, current_lr):
     dense_grads  = traverse_util.unflatten_dict(dense_flat_grads)
     dense_params = traverse_util.unflatten_dict(dense_flat_params)
 
-    updates, new_opt_state = state.tx.update(dense_grads, state.opt_state, dense_params)
-    new_dense_params = optax.apply_updates(dense_params, updates)
-
     import jax.profiler
 
+    # ── Dense AdamW update ─────────────────────────────────────────────────
+    with jax.profiler.TraceAnnotation("Optimizer_Dense_AdamW"):
+        updates, new_opt_state = state.tx.update(dense_grads, state.opt_state, dense_params)
+        new_dense_params = optax.apply_updates(dense_params, updates)
+
     # ── Sparse Adam pool update ────────────────────────────────────────────
-    with jax.profiler.TraceAnnotation("Sparse_Adam_HBM_Operations"):
+    with jax.profiler.TraceAnnotation("Optimizer_Sparse_Adam_Pool"):
         W            = state.window_size
-    offsets      = jnp.arange(W)
-    flat_touched = (
-        indices[:, :, None] + offsets[None, None, :]
-    ).reshape(-1)
+        offsets      = jnp.arange(W)
+        flat_touched = (
+            indices[:, :, None] + offsets[None, None, :]
+        ).reshape(-1)
 
-    pool_size        = pool_params.reshape(-1, pool_params.shape[-1]).shape[0]
-    safe_indices_raw = jnp.clip(flat_touched, 0, pool_size - 1)
+        pool_size        = pool_params.reshape(-1, pool_params.shape[-1]).shape[0]
+        safe_indices_raw = jnp.clip(flat_touched, 0, pool_size - 1)
 
-    # Sort for coalesced HBM reads (Bug #3 fix)
-    sort_order   = jnp.argsort(safe_indices_raw)
-    safe_indices = safe_indices_raw[sort_order]
+        # Sort for coalesced HBM reads (Bug #3 fix)
+        sort_order   = jnp.argsort(safe_indices_raw)
+        safe_indices = safe_indices_raw[sort_order]
 
-    pool_flat       = pool_params.reshape(-1, pool_params.shape[-1])
-    pool_m_flat     = state.pool_m.reshape(-1, state.pool_m.shape[-1])
-    pool_v_flat     = state.pool_v.reshape(-1, state.pool_v.shape[-1])
-    pool_grads_flat = pool_grads.reshape(-1, pool_grads.shape[-1])
+        pool_flat       = pool_params.reshape(-1, pool_params.shape[-1])
+        pool_m_flat     = state.pool_m.reshape(-1, state.pool_m.shape[-1])
+        pool_v_flat     = state.pool_v.reshape(-1, state.pool_v.shape[-1])
+        pool_grads_flat = pool_grads.reshape(-1, pool_grads.shape[-1])
 
-    p_slice = pool_flat[safe_indices]
-    g_slice = pool_grads_flat[safe_indices]
-    m_slice = pool_m_flat[safe_indices]
-    v_slice = pool_v_flat[safe_indices]
+        p_slice = pool_flat[safe_indices]
+        g_slice = pool_grads_flat[safe_indices]
+        m_slice = pool_m_flat[safe_indices]
+        v_slice = pool_v_flat[safe_indices]
 
-    pool_grad_norm  = jnp.sqrt(jnp.sum(pool_grads ** 2) + 1e-9)
-    pool_grad_scale = jnp.minimum(1.0, 1.0 / pool_grad_norm)
-    clipped_g_slice = g_slice * pool_grad_scale
+        pool_grad_norm  = jnp.sqrt(jnp.sum(pool_grads ** 2) + 1e-9)
+        pool_grad_scale = jnp.minimum(1.0, 1.0 / pool_grad_norm)
+        clipped_g_slice = g_slice * pool_grad_scale
 
-    new_p_s, new_m_s, new_v_s = sparse_adam_update(
-        p_slice, clipped_g_slice, m_slice, v_slice, state.step + 1, lr=current_lr
-    )
+        new_p_s, new_m_s, new_v_s = sparse_adam_update(
+            p_slice, clipped_g_slice, m_slice, v_slice, state.step + 1, lr=current_lr
+        )
 
-    # Cast back to the pool's native dtype (bfloat16 after Opt-1) before
-    # scattering — prevents a FutureWarning (→ error in future JAX) from
-    # an implicit float32 → bfloat16 narrowing inside lax.scatter.
-    pool_dtype      = pool_flat.dtype
-    new_pool_flat   = pool_flat.at[safe_indices].set(new_p_s.astype(pool_dtype))
-    new_pool_m_flat = pool_m_flat.at[safe_indices].set(new_m_s.astype(pool_m_flat.dtype))
-    new_pool_v_flat = pool_v_flat.at[safe_indices].set(new_v_s.astype(pool_v_flat.dtype))
+        # Cast back to the pool's native dtype (bfloat16 after Opt-1) before
+        # scattering — prevents a FutureWarning (→ error in future JAX) from
+        # an implicit float32 → bfloat16 narrowing inside lax.scatter.
+        pool_dtype      = pool_flat.dtype
+        new_pool_flat   = pool_flat.at[safe_indices].set(new_p_s.astype(pool_dtype))
+        new_pool_m_flat = pool_m_flat.at[safe_indices].set(new_m_s.astype(pool_m_flat.dtype))
+        new_pool_v_flat = pool_v_flat.at[safe_indices].set(new_v_s.astype(pool_v_flat.dtype))
 
-    new_pool_params = new_pool_flat.reshape(pool_params.shape)
-    new_pool_m      = new_pool_m_flat.reshape(state.pool_m.shape)
-    new_pool_v      = new_pool_v_flat.reshape(state.pool_v.shape)
+        new_pool_params = new_pool_flat.reshape(pool_params.shape)
+        new_pool_m      = new_pool_m_flat.reshape(state.pool_m.shape)
+        new_pool_v      = new_pool_v_flat.reshape(state.pool_v.shape)
 
     new_flat_params           = traverse_util.flatten_dict(new_dense_params)
     new_flat_params[pool_key] = new_pool_params
@@ -236,34 +238,38 @@ def train_step(
             if use_bf16 else params
         )
         if loss_chunk_size > 0:
-            state_hidden, (_, indices, mean_sigma) = state.apply_fn(
-                {"params": compute_params}, batch,
-                deterministic=False, sigma_max_scale=sigma_scale,
-                rngs={"dropout": dropout_rng},
-                method=lambda mod, *a, **kw: mod.encode_to_hidden(*a, **kw),
-            )
+            with jax.profiler.TraceAnnotation("Forward_encode_to_hidden"):
+                state_hidden, (_, indices, mean_sigma) = state.apply_fn(
+                    {"params": compute_params}, batch,
+                    deterministic=False, sigma_max_scale=sigma_scale,
+                    rngs={"dropout": dropout_rng},
+                    method=lambda mod, *a, **kw: mod.encode_to_hidden(*a, **kw),
+                )
             def decode_fn(chunk_h):
                 return state.apply_fn(
                     {"params": compute_params}, chunk_h,
                     method=lambda mod, h: mod.controller.decode(h),
                 )
-            lm_loss = chunked_lm_loss(
-                state_hidden, batch, decode_fn, pad_token_id, loss_chunk_size
-            ).astype(jnp.float32)
+            with jax.profiler.TraceAnnotation("Forward_chunked_lm_loss"):
+                lm_loss = chunked_lm_loss(
+                    state_hidden, batch, decode_fn, pad_token_id, loss_chunk_size
+                ).astype(jnp.float32)
         else:
-            logits, (_, indices, mean_sigma) = state.apply_fn(
-                {"params": compute_params}, batch,
-                deterministic=False, sigma_max_scale=sigma_scale,
-                rngs={"dropout": dropout_rng},
-            )
-            logits = logits.astype(jnp.float32)
-            shift_logits = logits[:, :-1, :]
-            shift_labels = batch[:, 1:]
-            lm_loss = optax.softmax_cross_entropy_with_integer_labels(
-                shift_logits, shift_labels
-            )
-            mask = (shift_labels != pad_token_id).astype(jnp.float32)
-            lm_loss = (lm_loss * mask).sum() / (mask.sum() + 1e-9)
+            with jax.profiler.TraceAnnotation("Forward_full_model"):
+                logits, (_, indices, mean_sigma) = state.apply_fn(
+                    {"params": compute_params}, batch,
+                    deterministic=False, sigma_max_scale=sigma_scale,
+                    rngs={"dropout": dropout_rng},
+                )
+            with jax.profiler.TraceAnnotation("Forward_lm_loss"):
+                logits = logits.astype(jnp.float32)
+                shift_logits = logits[:, :-1, :]
+                shift_labels = batch[:, 1:]
+                lm_loss = optax.softmax_cross_entropy_with_integer_labels(
+                    shift_logits, shift_labels
+                )
+                mask = (shift_labels != pad_token_id).astype(jnp.float32)
+                lm_loss = (lm_loss * mask).sum() / (mask.sum() + 1e-9)
 
         return (
             lm_loss + effective_precision_weight * jnp.float32(mean_sigma),
@@ -328,34 +334,38 @@ def grad_accum_step(
             if use_bf16 else params
         )
         if loss_chunk_size > 0:
-            state_hidden, (_, indices, mean_sigma) = state.apply_fn(
-                {"params": compute_params}, micro_batch,
-                deterministic=False, sigma_max_scale=sigma_scale,
-                rngs={"dropout": step_rng},
-                method=lambda mod, *a, **kw: mod.encode_to_hidden(*a, **kw),
-            )
+            with jax.profiler.TraceAnnotation("Forward_encode_to_hidden"):
+                state_hidden, (_, indices, mean_sigma) = state.apply_fn(
+                    {"params": compute_params}, micro_batch,
+                    deterministic=False, sigma_max_scale=sigma_scale,
+                    rngs={"dropout": step_rng},
+                    method=lambda mod, *a, **kw: mod.encode_to_hidden(*a, **kw),
+                )
             def decode_fn(chunk_h):
                 return state.apply_fn(
                     {"params": compute_params}, chunk_h,
                     method=lambda mod, h: mod.controller.decode(h),
                 )
-            lm_loss = chunked_lm_loss(
-                state_hidden, micro_batch, decode_fn, pad_token_id, loss_chunk_size
-            ).astype(jnp.float32)
+            with jax.profiler.TraceAnnotation("Forward_chunked_lm_loss"):
+                lm_loss = chunked_lm_loss(
+                    state_hidden, micro_batch, decode_fn, pad_token_id, loss_chunk_size
+                ).astype(jnp.float32)
         else:
-            logits, (_, indices, mean_sigma) = state.apply_fn(
-                {"params": compute_params}, micro_batch,
-                deterministic=False, sigma_max_scale=sigma_scale,
-                rngs={"dropout": step_rng},
-            )
-            logits = logits.astype(jnp.float32)
-            shift_logits = logits[:, :-1, :]
-            shift_labels = micro_batch[:, 1:]
-            per_token = optax.softmax_cross_entropy_with_integer_labels(
-                shift_logits, shift_labels
-            )
-            mask = (shift_labels != pad_token_id).astype(jnp.float32)
-            lm_loss = (per_token * mask).sum() / (mask.sum() + 1e-9)
+            with jax.profiler.TraceAnnotation("Forward_full_model"):
+                logits, (_, indices, mean_sigma) = state.apply_fn(
+                    {"params": compute_params}, micro_batch,
+                    deterministic=False, sigma_max_scale=sigma_scale,
+                    rngs={"dropout": step_rng},
+                )
+            with jax.profiler.TraceAnnotation("Forward_lm_loss"):
+                logits = logits.astype(jnp.float32)
+                shift_logits = logits[:, :-1, :]
+                shift_labels = micro_batch[:, 1:]
+                per_token = optax.softmax_cross_entropy_with_integer_labels(
+                    shift_logits, shift_labels
+                )
+                mask = (shift_labels != pad_token_id).astype(jnp.float32)
+                lm_loss = (per_token * mask).sum() / (mask.sum() + 1e-9)
 
         return (
             lm_loss + effective_precision_weight * jnp.float32(mean_sigma),
@@ -404,3 +414,45 @@ def grad_accum_step(
 
     new_state = _apply_optimizer_update(state, avg_grads, all_indices, new_rng, current_lr)
     return new_state, avg_loss, avg_sigma
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# forward_only_step — forward pass only, no grad, no optimizer update.
+# Used by the host-side component timer in main.py to measure forward-pass
+# wall time independently of backward + optimizer time.
+# NOTE: no donate_argnums so state is preserved for the real training step.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@functools.partial(
+    jax.jit,
+    static_argnames=["use_bf16", "loss_chunk_size"],
+)
+def forward_only_step(state, batch, sigma_scale, use_bf16=False, loss_chunk_size=0):
+    """Forward pass only (no grad, no optimizer) — for component timing.
+
+    Returns (output, aux) where output is either state_hidden (chunked path)
+    or logits (full path).  Caller should call jax.block_until_ready(output)
+    to force synchronization before measuring elapsed time.
+    """
+    dropout_rng, _ = random.split(state.rng)
+    compute_params = (
+        jax.tree_util.tree_map(lambda x: x.astype(jnp.bfloat16), state.params)
+        if use_bf16 else state.params
+    )
+    if loss_chunk_size > 0:
+        with jax.profiler.TraceAnnotation("Profile_Forward_encode_to_hidden"):
+            state_hidden, aux = state.apply_fn(
+                {"params": compute_params}, batch,
+                deterministic=True, sigma_max_scale=sigma_scale,
+                rngs={"dropout": dropout_rng},
+                method=lambda mod, *a, **kw: mod.encode_to_hidden(*a, **kw),
+            )
+        return state_hidden, aux
+    else:
+        with jax.profiler.TraceAnnotation("Profile_Forward_full"):
+            logits, aux = state.apply_fn(
+                {"params": compute_params}, batch,
+                deterministic=True, sigma_max_scale=sigma_scale,
+                rngs={"dropout": dropout_rng},
+            )
+        return logits, aux

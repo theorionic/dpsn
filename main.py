@@ -637,7 +637,7 @@ def main():
                        loss_chunk_size=getattr(config, 'loss_chunk_size', 0))
     print_tpu_memory("after model init (before first train_step compile)")
 
-    from dpsn_r_jax.training.trainer import train_step, grad_accum_step
+    from dpsn_r_jax.training.trainer import train_step, grad_accum_step, forward_only_step
     from dpsn_r_jax.utils.metrics import summarise_flops
 
     # ── Choose training function based on gradient accumulation ──────────────
@@ -740,6 +740,10 @@ def main():
         )
 
     LOG_INTERVAL = 200  # sync + log every N steps; lower = more block_until_ready stalls
+    # Component timing: run forward_only_step every TIMING_INTERVAL steps and
+    # compare to the avg step time to estimate forward vs backward+optimizer split.
+    # Set to 0 to disable.  First run is skipped (includes JIT compilation).
+    TIMING_INTERVAL = LOG_INTERVAL * 5
 
     tokens_per_sec = 0.0
     tflops = 0.0
@@ -759,6 +763,8 @@ def main():
         last_loss = jnp.zeros((), dtype=jnp.float32)   # holds the last step's loss future
         last_sigma = jnp.zeros((), dtype=jnp.float32)  # holds the last step's mean_sigma future
         hit_max_steps = False
+        last_batch = None          # saved for component timing
+        _timing_compiled = False   # skip first timing call (includes JIT compile)
 
         for step in range(steps_per_epoch):
             if args.max_steps and global_step >= args.max_steps:
@@ -780,6 +786,7 @@ def main():
             current_data_wait_time = time.time() - data_start_time
             total_data_wait_time_interval += current_data_wait_time
 
+            last_batch = batch   # save for component timing
             dispatch_start_time = time.time()
 
             current_lr_val = jnp.float32(lr_schedule(global_step))
@@ -879,6 +886,54 @@ def main():
                     f"sigma={sigma_val:.3f} ({precision_tag}) | "
                     f"TPS: {tokens_per_sec:.0f} | TFLOPS: {tflops:.4f} | DataWait: {avg_data_wait:.3f}s"
                 )
+
+            # ── Component timing: forward vs backward+optimizer split ─────────
+            # Runs a no-grad forward pass (forward_only_step) every TIMING_INTERVAL
+            # steps, syncs with block_until_ready, and compares to the avg full-step
+            # time to estimate the forward vs backward+optimizer time split.
+            # First invocation is skipped because it includes JIT compile time.
+            if (
+                TIMING_INTERVAL > 0
+                and last_batch is not None
+                and global_step > 0
+                and global_step % TIMING_INTERVAL == 0
+            ):
+                _sigma_for_timing = jnp.float32(sigma_anneal_fn(global_step))
+                _fwd_t0 = time.time()
+                _fwd_out, _ = forward_only_step(
+                    state, last_batch,
+                    sigma_scale=_sigma_for_timing,
+                    use_bf16=getattr(config, 'use_bf16', False),
+                    loss_chunk_size=getattr(config, 'loss_chunk_size', 0),
+                )
+                jax.block_until_ready(_fwd_out)
+                _fwd_ms = (time.time() - _fwd_t0) * 1000.0
+
+                if not _timing_compiled:
+                    # First call includes JIT compilation — record but label clearly
+                    _timing_compiled = True
+                    print(
+                        f"\n[TIMING] Step {global_step} | First timing call includes JIT compile "
+                        f"— forward_only compile+exec: {_fwd_ms:.1f}ms (not representative)"
+                    )
+                else:
+                    # avg_step_time is in seconds (computed earlier in this block)
+                    _total_ms = avg_step_time * 1000.0
+                    _bwd_opt_ms = max(0.0, _total_ms - _fwd_ms)
+                    _fwd_pct   = 100.0 * _fwd_ms   / (_total_ms + 1e-6)
+                    _bwd_pct   = 100.0 * _bwd_opt_ms / (_total_ms + 1e-6)
+                    print(
+                        f"\n[TIMING] Step {global_step} Component Breakdown\n"
+                        f"  Forward  (controller+reasoning+decode): {_fwd_ms:7.1f}ms  ({_fwd_pct:.0f}%)\n"
+                        f"  Backward + Optimizer (est.):            {_bwd_opt_ms:7.1f}ms  ({_bwd_pct:.0f}%)\n"
+                        f"  Total step (avg over {LOG_INTERVAL} steps):       {_total_ms:7.1f}ms\n"
+                        f"  [Use --profile_dir to get per-layer XLA trace for "
+                        f"controller/reasoning/pool breakdown]"
+                    )
+                    writer.add_scalar("Timing/Forward_ms",          _fwd_ms,    global_step)
+                    writer.add_scalar("Timing/Backward_Optim_ms",   _bwd_opt_ms, global_step)
+                    writer.add_scalar("Timing/Total_step_ms",        _total_ms,  global_step)
+                    writer.add_scalar("Timing/Forward_pct",          _fwd_pct,   global_step)
 
             # Periodic Generation
             if (
