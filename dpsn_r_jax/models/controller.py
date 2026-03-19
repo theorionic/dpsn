@@ -1,7 +1,7 @@
 import jax.numpy as jnp
 import flax.linen as nn
 from dpsn_r_jax.config import DPSNRConfig
-from dpsn_r_jax.models.layers import TinyTransformerLayer
+from dpsn_r_jax.models.layers import TinyTransformerLayer, _use_pallas
 
 
 class TinyController(nn.Module):
@@ -28,6 +28,7 @@ class TinyController(nn.Module):
                 self.config.controller_num_heads,
                 ff_dim,
                 self.config.dropout,
+                self.config.use_flash_attention,
             )
             for _ in range(self.config.controller_num_layers)
         ]
@@ -49,12 +50,17 @@ class TinyController(nn.Module):
 
         x = embed + pos_embed
 
-        mask = nn.make_causal_mask(input_ids)
-        # mask is (1, 1, T, T) bool usually? make_causal_mask returns (1, 1, T, T)
-        mask = jnp.where(mask, 0, -1e4)
+        # When Pallas flash_attention is active it handles causality internally
+        # via causal=True, so no external bias mask is needed.  Build it only
+        # for the standard fallback path.
+        if _use_pallas(self.config.use_flash_attention, T):
+            mask = None
+        else:
+            mask = nn.make_causal_mask(input_ids)
+            mask = jnp.where(mask, 0, -1e4)
 
         for layer in self.layers:
-            # Pass mask and deterministic AS POSITIONAL arguments 
+            # Pass mask and deterministic AS POSITIONAL arguments
             # so that static_argnums=(2,) in nn.remat catches deterministic.
             x = layer(x, mask, deterministic)
 

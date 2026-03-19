@@ -108,6 +108,13 @@ class DPSNRConfig:
     # weight is linearly ramped from 0 → precision_loss_weight over sigma_anneal_steps.
     precision_loss_weight: float = 0.0
 
+    # ── Flash Attention (Pallas TPU kernel) ────────────────────────────────
+    # When True, FlashCausalSelfAttention uses jax.experimental.pallas
+    # flash_attention instead of Flax's nn.dot_product_attention.
+    # Requirements: TPU backend, seq_len >= 128 and divisible by 128.
+    # Falls back to standard attention automatically if conditions aren't met.
+    use_flash_attention: bool = True
+
     # ── SRAM Super-Window pre-fetching (Opt-2) ─────────────────────────────
     # Before the reasoning loop, fetch pool_super_window_factor × window_size
     # vectors from HBM in one pass.  The XLA lax.scan carry mechanism then
@@ -138,7 +145,8 @@ def get_model_config(name: str) -> DPSNRConfig:
     - tiny: ~6M params (Debug/CPU)
     - base: ~125M params (TPU v3-8 / GPU)
     - large: ~350M params (TPU Pod Slice)
-    - xl: ~1B params (Large TPU Pod - Massive Pool)
+    - xl: ~1.5B params (Large TPU Pod - Massive Pool)
+    - xxl: ~2.8B params (TPU v5e-8) — 2D pool mandatory at this scale
 
     Precision-routing variants (same param count, better pool addressing):
     - precise_tiny:  tiny  + 2D pool + sigma annealing (for quick experiments)
@@ -266,6 +274,62 @@ def get_model_config(name: str) -> DPSNRConfig:
             sigma_target=0.05,
             # Precision loss: small penalty on broad sigma
             precision_loss_weight=0.01,
+        )
+
+    elif name == "xxl":
+        # ~2.82B total parameters — designed for TPU v5e-8 (16 GB/chip × 8 chips)
+        #
+        # Parameter breakdown:
+        #   Pool  : 1536 × 1536 × 1024 = 2,415,919,104  (~2.42B)  — stored bfloat16
+        #   Controller : hidden=1024, 24 layers, 16 heads  (~405M)
+        #   Total                                          (~2.82B)
+        #
+        # Per-chip HBM estimate (8 chips):
+        #   Controller params + Adam m/v (replicated) : ~4.86 GB/chip
+        #   Pool params + Adam m/v (sharded)          : ~3.02 GB/chip
+        #   Static total                              : ~7.88 GB/chip
+        #   Available for activations                 : ~7 GB/chip
+        #   → batch=4/chip (32 total) is comfortable with flash-attn + grad-ckpt
+        #
+        # 2D pool is NOT optional here:
+        #   1D addressing would need 1/2,400,000 coordinate precision (unlearnable).
+        #   2D addressing needs only 1/1536 per axis — well within gradient descent.
+        #
+        # Recommended training settings:
+        #   batch_size=32 (4/chip), gradient_checkpointing=True,
+        #   use_bf16=True, loss_chunk_size=128
+        return DPSNRConfig(
+            vocab_size=50304,              # 393 × 128, MXU-aligned (GPT-2 vocab)
+            controller_hidden_dim=1024,
+            controller_num_layers=24,
+            controller_num_heads=16,
+            controller_ff_multiplier=4.0,
+            max_seq_len=2048,
+            # 2D pool: 1536 × 1536 × 1024 ≈ 2.42B params (stored in bfloat16)
+            # Coordinate precision: 1/1536 per axis — fully learnable
+            use_2d_pool=True,
+            pool_grid_rows=1536,
+            pool_grid_cols=1536,
+            pool_hidden_dim=1024,
+            pool_total_vectors=1536 * 1536,  # 2,359,296 — kept for compatibility
+            max_reasoning_loops=8,
+            min_reasoning_loops=2,
+            # Multi-head indexer: 4 concurrent pool queries per reasoning step
+            num_indexer_heads=4,
+            sigma_min=0.005,
+            sigma_max=5.0,
+            max_k=64,
+            # Sigma annealing: broad → precise over 100k steps
+            sigma_anneal_steps=100_000,
+            sigma_target=0.02,
+            precision_loss_weight=0.01,
+            # Memory optimisations — all required for v5e-8
+            gradient_checkpointing=True,
+            use_bf16=True,
+            loss_chunk_size=128,
+            use_flash_attention=True,
+            pool_super_window_factor=2,
+            learning_rate=1e-4,
         )
 
     else:
