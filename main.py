@@ -440,8 +440,12 @@ def main():
     # zeros_like would try to create the full tensor (4.5 GB for xxl) on that
     # one chip and OOM.  Using jit+out_shardings forces XLA to allocate each
     # shard directly on its target device without ever forming the full array.
+    _num_shards = jax.device_count()
     _pool_moment_sharding = NamedSharding(
-        mesh, PartitionSpec(*("shard",) + (None,) * (pool_params.ndim - 1))
+        mesh,
+        PartitionSpec(*("shard",) + (None,) * (pool_params.ndim - 1))
+        if pool_params.shape[0] % _num_shards == 0
+        else PartitionSpec(*((None,) * pool_params.ndim))  # replicated: dim0 not divisible
     )
     _make_pool_zeros = jax.jit(
         lambda: jnp.zeros(pool_params.shape, dtype=pool_params.dtype),
