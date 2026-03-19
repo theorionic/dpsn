@@ -165,7 +165,7 @@ def parse_args():
         "--config",
         type=str,
         default="tiny",
-        choices=["tiny", "base", "large", "xl"],
+        choices=["tiny", "base", "large", "xl", "precise_tiny", "precise_large", "xxl"],
         help="Model configuration size",
     )
     parser.add_argument(

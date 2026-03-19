@@ -78,7 +78,7 @@ def main():
         "--config",
         type=str,
         default="base",
-        choices=["tiny", "base", "large", "xl", "precise_tiny", "precise_large"],
+        choices=["tiny", "base", "large", "xl", "precise_tiny", "precise_large", "xxl"],
         help="Model configuration size (precise_* variants enable 2D pool + sigma annealing)",
     )
     parser.add_argument(
