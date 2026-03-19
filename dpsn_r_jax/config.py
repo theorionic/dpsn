@@ -247,6 +247,7 @@ def get_model_config(name: str) -> DPSNRConfig:
             sigma_target=0.05,
             # Precision loss: penalise large sigma (ramped in over annealing period)
             precision_loss_weight=0.01,
+            use_flash_attention=True,
         )
 
     elif name == "precise_large":
@@ -274,6 +275,7 @@ def get_model_config(name: str) -> DPSNRConfig:
             sigma_target=0.05,
             # Precision loss: small penalty on broad sigma
             precision_loss_weight=0.01,
+            use_flash_attention=True,
         )
 
     elif name == "xxl":
