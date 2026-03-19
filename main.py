@@ -234,6 +234,24 @@ def main():
         default=0.1,
         help="Fraction of RAM cache to prefill before training starts (0.0-1.0)",
     )
+    parser.add_argument(
+        "--profile_dir",
+        type=str,
+        default=None,
+        help="Directory to save detailed TensorBoard XLA traces. E.g., /tmp/tensorboard",
+    )
+    parser.add_argument(
+        "--profile_steps",
+        type=int,
+        nargs=2,
+        default=[10, 20],
+        help="Start step and end step for XLA profiling. Default: 10 20",
+    )
+    parser.add_argument(
+        "--profile_detailed",
+        action="store_true",
+        help="Force synchronizations to print exact ms timings for Fetch, Dispatch, and TPU Execution every step.",
+    )
 
     args = parser.parse_args()
 
@@ -735,6 +753,10 @@ def main():
                 hit_max_steps = True
                 break
 
+            if args.profile_dir and global_step == args.profile_steps[0]:
+                print(f"\n[PROFILER] 🟢 STARTING JAX XLA PROFILER AT STEP {global_step} 🟢")
+                jax.profiler.start_trace(args.profile_dir)
+
             data_start_time = time.time()
             try:
                 batch = dataset_pipeline.get_batch(args.batch_size)
@@ -744,6 +766,8 @@ def main():
                 raise
             current_data_wait_time = time.time() - data_start_time
             total_data_wait_time_interval += current_data_wait_time
+
+            dispatch_start_time = time.time()
 
             if _grad_accum > 1:
                 # ── Gradient accumulation path ────────────────────────────────
@@ -778,7 +802,20 @@ def main():
             epoch_loss = epoch_loss + loss
             last_loss  = loss
             last_sigma = mean_sigma
+            dispatch_time = time.time() - dispatch_start_time
+
+            if getattr(args, "profile_detailed", False):
+                exec_start = time.time()
+                loss.block_until_ready()
+                execution_time = time.time() - exec_start
+                print(f"⏱️ [Step {global_step}] Data Fetch: {current_data_wait_time*1000:>6.1f}ms | Host Dispatch: {dispatch_time*1000:>6.1f}ms | TPU Execution: {execution_time*1000:>6.1f}ms")
+
             global_step += 1
+
+            if args.profile_dir and global_step == args.profile_steps[1]:
+                print(f"\n[PROFILER] 🛑 STOPPING JAX XLA PROFILER AT STEP {global_step} 🛑")
+                jax.profiler.stop_trace()
+                print(f"Profile saved to {args.profile_dir}. View using: tensorboard --logdir={args.profile_dir}\n")
 
             # Save Checkpoint
             if (

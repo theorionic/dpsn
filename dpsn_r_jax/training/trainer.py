@@ -145,8 +145,11 @@ def _apply_optimizer_update(state, grads, indices, new_rng):
     updates, new_opt_state = state.tx.update(dense_grads, state.opt_state, dense_params)
     new_dense_params = optax.apply_updates(dense_params, updates)
 
+    import jax.profiler
+
     # ── Sparse Adam pool update ────────────────────────────────────────────
-    W            = state.window_size
+    with jax.profiler.TraceAnnotation("Sparse_Adam_HBM_Operations"):
+        W            = state.window_size
     offsets      = jnp.arange(W)
     flat_touched = (
         indices[:, :, None] + offsets[None, None, :]
@@ -268,9 +271,11 @@ def train_step(
             (indices, mean_sigma),
         )
 
-    (loss, (indices, mean_sigma)), grads = jax.value_and_grad(
-        loss_fn, has_aux=True
-    )(state.params)
+    import jax.profiler
+    with jax.profiler.TraceAnnotation("Loss_and_Backprop"):
+        (loss, (indices, mean_sigma)), grads = jax.value_and_grad(
+            loss_fn, has_aux=True
+        )(state.params)
 
     new_state = _apply_optimizer_update(state, grads, indices, new_rng)
     return new_state, loss, mean_sigma

@@ -8,6 +8,7 @@ from dpsn_r_jax.models.memory import (
     CoordinateMassivePool2D,
     LearnedIndexer,
 )
+import jax.profiler
 from dpsn_r_jax.models.reasoning import AdaptiveComputeController
 
 
@@ -109,7 +110,8 @@ class DPSNR(nn.Module):
         """
         # 1. Encode
         # MUST pass deterministic as a positional argument so static_argnums=(1,) catches it!
-        hidden = self.controller(input_ids, deterministic)
+        with jax.profiler.TraceAnnotation("TinyController_Forward"):
+            hidden = self.controller(input_ids, deterministic)
 
         # 2. Reasoning Loop
         state_hidden = hidden
@@ -149,7 +151,8 @@ class DPSNR(nn.Module):
             prev_s_hidden = s_hidden
 
             # ── 1. Multi-head indexing with runtime sigma scale ─────────────
-            mu, sigma = self.indexer(s_hidden, sigma_max_scale=sigma_max_scale)
+            with jax.profiler.TraceAnnotation("LearnedIndexer_Forward"):
+                mu, sigma = self.indexer(s_hidden, sigma_max_scale=sigma_max_scale)
             # mu: (B, H), sigma: (B, H)
 
             # ── 2. Per-head pool retrieval — vectorized with jax.vmap ─────────
@@ -173,9 +176,10 @@ class DPSNR(nn.Module):
                     """Single head: inputs (B,), outputs (B,D) and (B,)."""
                     return self.pool(mu_r_h, mu_c_h, sig_h)
 
-                retrieved_all, start_all = jax.vmap(
-                    pool2d_head, in_axes=(1, 1, 1), out_axes=(1, 1)
-                )(mu_r, mu_c, sigma_h)
+                with jax.profiler.TraceAnnotation("CoordinateMassivePool2D_vmap"):
+                    retrieved_all, start_all = jax.vmap(
+                        pool2d_head, in_axes=(1, 1, 1), out_axes=(1, 1)
+                    )(mu_r, mu_c, sigma_h)
                 # retrieved_all: (B, P, D)   start_all: (B, P)
 
                 retrieved     = jnp.mean(retrieved_all, axis=1)  # (B, D)
@@ -187,9 +191,10 @@ class DPSNR(nn.Module):
                     """Single head: inputs (B,), outputs (B,D) and (B,)."""
                     return self.pool(mu_h, sig_h)
 
-                retrieved_all, start_all = jax.vmap(
-                    pool1d_head, in_axes=(1, 1), out_axes=(1, 1)
-                )(mu, sigma)
+                with jax.profiler.TraceAnnotation("CoordinateMassivePool1D_vmap"):
+                    retrieved_all, start_all = jax.vmap(
+                        pool1d_head, in_axes=(1, 1), out_axes=(1, 1)
+                    )(mu, sigma)
                 # retrieved_all: (B, H, D)   start_all: (B, H)
 
                 retrieved     = jnp.mean(retrieved_all, axis=1)  # (B, D)
@@ -199,18 +204,20 @@ class DPSNR(nn.Module):
             mean_sigma_step = jnp.mean(sigma)   # scalar
 
             # ── 3. Integrate retrieved knowledge ───────────────────────────────
-            retrieved_expanded = jnp.expand_dims(retrieved, 1).repeat(T, axis=1)
-            combined = jnp.concatenate([s_hidden, retrieved_expanded], axis=-1)
-            integrated = self.retrieval_integrator(combined)
+            with jax.profiler.TraceAnnotation("Retrieval_Integrator"):
+                retrieved_expanded = jnp.expand_dims(retrieved, 1).repeat(T, axis=1)
+                combined = jnp.concatenate([s_hidden, retrieved_expanded], axis=-1)
+                integrated = self.retrieval_integrator(combined)
 
             # ── 4. ACC: accumulate state and decide whether to halt ────────────
-            new_s_hidden, h_prob, new_h_mask = self.acc(
-                s_hidden,
-                s_hidden + integrated,
-                i,
-                h_prob,
-                h_mask,
-            )
+            with jax.profiler.TraceAnnotation("AdaptiveComputeController"):
+                new_s_hidden, h_prob, new_h_mask = self.acc(
+                    s_hidden,
+                    s_hidden + integrated,
+                    i,
+                    h_prob,
+                    h_mask,
+                )
 
             update_mask = 1.0 - h_mask
             s_hidden = update_mask * new_s_hidden + h_mask * prev_s_hidden
