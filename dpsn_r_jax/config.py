@@ -114,7 +114,7 @@ class DPSNRConfig:
     # holds this wider tensor in on-chip SRAM across all reasoning iterations,
     # reducing per-iteration HBM latency from ~100 ns to ~1 ns.
     # Set to 1 to disable (equivalent to old behaviour).  Recommended: 4–8.
-    pool_super_window_factor: int = 1
+    pool_super_window_factor: int = 8
 
     @classmethod
     def from_yaml(cls, path: str) -> "DPSNRConfig":
