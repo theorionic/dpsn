@@ -316,10 +316,16 @@ def main():
         """
         # Pool alone is sharded — this is the only thing that needs to break VRAM.
         # PartitionSpec must match the array rank exactly:
-        #   1D pool: (num_vectors, dim)       → PartitionSpec("shard", None)
+        #   1D pool: (num_vectors, dim)         → PartitionSpec("shard", None)
         #   2D pool: (grid_rows, grid_cols, dim) → PartitionSpec("shard", None, None)
+        # Guard: only shard if dim 0 is divisible by the device count, otherwise
+        # replicate (e.g. precise_tiny has a 10×10 pool on 8 devices: 10 % 8 ≠ 0).
         if "pool" in path:
-            spec = PartitionSpec(*("shard",) + (None,) * (param.ndim - 1))
+            n_dev = jax.device_count()
+            if param.shape[0] % n_dev == 0:
+                spec = PartitionSpec(*("shard",) + (None,) * (param.ndim - 1))
+            else:
+                spec = PartitionSpec(*((None,) * param.ndim))  # fully replicated
             return NamedSharding(mesh, spec)
 
         # Replicate everything else (Controller, Indexer, ACC, LayerNorm, biases…)
