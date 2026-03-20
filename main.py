@@ -341,6 +341,11 @@ def main():
     # Here we define a single axis name 'shard'.
     mesh = Mesh(devices, axis_names=("shard",))
 
+    # Register the mesh so FlashCausalSelfAttention can wrap splash_attention
+    # in shard_map for multi-device TPU runs (avoids GSPMD auto-partition error).
+    from dpsn_r_jax.models.layers import set_mesh as _set_mesh
+    _set_mesh(mesh)
+
     # Sharding Rules:
     # 1. Batch: Split along 'shard' axis (Data Parallelism)
     # 2. Pool Params: Split along 'shard' axis (Model Parallelism)

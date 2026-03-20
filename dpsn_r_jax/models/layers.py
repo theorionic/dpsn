@@ -1,8 +1,10 @@
 import math
+import functools
 
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
+from jax.sharding import PartitionSpec
 
 # ---------------------------------------------------------------------------
 # Pallas TPU Splash Attention
@@ -28,15 +30,42 @@ except Exception:
     MultiHeadMask = None
     BlockSizes = None
 
+try:
+    from jax.experimental.shard_map import shard_map as _shard_map
+    _SHARD_MAP_AVAILABLE = True
+except Exception:
+    _shard_map = None
+    _SHARD_MAP_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
+# Mesh registration
+#
+# Call set_mesh(mesh) once from main.py after the device mesh is created.
+# FlashCausalSelfAttention reads _MESH at call time so that splash attention
+# can be wrapped in shard_map on multi-device runs.
+# ---------------------------------------------------------------------------
+_MESH = None
+
+
+def set_mesh(mesh):
+    """Register the device mesh so splash attention can use shard_map."""
+    global _MESH
+    _MESH = mesh
+
 
 def _use_pallas(flag: bool, seq_len: int) -> bool:
-    """Return True only when all conditions for Pallas splash_attention are met."""
-    return (
-        flag
-        and _SPLASH_FA_AVAILABLE
-        and seq_len >= 128
-        and seq_len % 128 == 0
-    )
+    """Return True only when all conditions for Pallas splash_attention are met.
+
+    On multi-device runs we wrap the kernel in shard_map (see set_mesh / _MESH).
+    shard_map requires the mesh to be registered via set_mesh() before the first
+    compiled call, otherwise we fall back to JAX-native attention.
+    """
+    if not (flag and _SPLASH_FA_AVAILABLE and seq_len >= 128 and seq_len % 128 == 0):
+        return False
+    if jax.device_count() > 1 and (not _SHARD_MAP_AVAILABLE or _MESH is None):
+        # Multi-device requires shard_map + a registered mesh.
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +215,27 @@ class FlashCausalSelfAttention(nn.Module):
                 ),
             )
 
-            y = jax.vmap(_splash_mha)(q, k, v)    # (B, H, T, D)
+            if jax.device_count() > 1 and _MESH is not None:
+                # Multi-device: shard_map explicitly partitions the batch across
+                # devices so GSPMD never tries to auto-partition the Mosaic kernel.
+                # Each device receives its local slice (local_B, H, T, D) and runs
+                # jax.vmap over local_B independently.
+                _axis = _MESH.axis_names[0]
+                _splash_fn = functools.partial(
+                    _shard_map,
+                    mesh=_MESH,
+                    in_specs=(
+                        PartitionSpec(_axis, None, None, None),
+                        PartitionSpec(_axis, None, None, None),
+                        PartitionSpec(_axis, None, None, None),
+                    ),
+                    out_specs=PartitionSpec(_axis, None, None, None),
+                    check_rep=False,
+                )(lambda q_, k_, v_: jax.vmap(_splash_mha)(q_, k_, v_))
+                y = _splash_fn(q, k, v)
+            else:
+                y = jax.vmap(_splash_mha)(q, k, v)    # single-device
+
             y = jnp.transpose(y, (0, 2, 1, 3))    # (B, T, H, D)
 
         else:
