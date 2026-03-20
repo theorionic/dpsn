@@ -1,39 +1,56 @@
 import math
 
+import jax
 import jax.numpy as jnp
 import flax.linen as nn
 
 # ---------------------------------------------------------------------------
-# Pallas TPU Flash Attention — imported once at module load.
-# Falls back gracefully if the Pallas kernel isn't available (CPU / GPU env).
-# The module ships inside the standard jaxlib wheel but the kernel only
-# executes on TPU; importing on GPU/CPU succeeds but calling it raises.
-# We therefore gate on both the import AND the runtime platform.
+# Pallas TPU Splash Attention — imported once at module load.
+#
+# Splash attention replaces the older flash_attention because:
+#   - flash_attention uses Mosaic/Pallas kernels that cannot be automatically
+#     partitioned across multiple devices (raises NotImplementedError).
+#   - splash_attention supports multi-device via jax.vmap over the batch axis:
+#     each device runs the kernel independently on its local batch shard,
+#     which is exactly how data-parallel XLA SPMD works.
+#
+# Falls back to standard nn.dot_product_attention on CPU/GPU.
 # ---------------------------------------------------------------------------
-import jax as _jax
-
 try:
-    from jax.experimental.pallas.ops.tpu.flash_attention import (
-        flash_attention as pallas_flash_attention,
+    from jax.experimental.pallas.ops.tpu.splash_attention import (
+        make_splash_mha_single_device,
     )
-    _PALLAS_FA_AVAILABLE = _jax.devices()[0].platform == "tpu"
-except Exception:  # ImportError or missing XLA plugin
-    _PALLAS_FA_AVAILABLE = False
+    from jax.experimental.pallas.ops.tpu.splash_attention.splash_attention_mask import (
+        CausalMask,
+        MultiHeadMask,
+    )
+    from jax.experimental.pallas.ops.tpu.splash_attention.splash_attention_kernel import (
+        BlockSizes,
+    )
+    _SPLASH_FA_AVAILABLE = jax.devices()[0].platform == "tpu"
+except Exception:
+    _SPLASH_FA_AVAILABLE = False
+    make_splash_mha_single_device = None
+    CausalMask = None
+    MultiHeadMask = None
+    BlockSizes = None
 
 
 def _use_pallas(flag: bool, seq_len: int) -> bool:
-    """Return True only when all conditions for Pallas flash_attention are met.
+    """Return True only when all conditions for Pallas splash_attention are met.
 
-    Pallas flash_attention requires:
+    Splash attention requires:
       - the flag to be explicitly set
-      - TPU backend at runtime (module is present in all wheels, but the
-        kernel only lowers on TPU)
-      - seq_len >= 128 (MIN_BLOCK_SIZE)
+      - TPU backend at runtime
+      - seq_len >= 128 (minimum block size)
       - seq_len divisible by 128 (block tiling constraint)
+
+    Multi-device is supported: splash_attention runs per-sample via jax.vmap,
+    so each device processes its local batch shard independently.
     """
     return (
         flag
-        and _PALLAS_FA_AVAILABLE
+        and _SPLASH_FA_AVAILABLE
         and seq_len >= 128
         and seq_len % 128 == 0
     )
@@ -61,23 +78,41 @@ class FlashCausalSelfAttention(nn.Module):
 
         if _use_pallas(self.use_flash_attention, T):
             # ----------------------------------------------------------------
-            # Pallas TPU Flash Attention path
-            # Expected shape: (B, H, T, D)
-            # causal=True handles the autoregressive mask internally — no
-            # external bias needed.  sm_scale is 1/sqrt(head_dim) per the
-            # standard scaled dot-product attention formula.
+            # Pallas TPU Splash Attention path — multi-device compatible.
+            #
+            # Splash attention has no batch dimension: inputs are (H, T, D).
+            # We use jax.vmap to map over the batch axis so each sample in
+            # the local device shard is processed independently.
+            #
+            # Mask: MultiHeadMask wrapping one CausalMask per head.
+            #   Created at trace time (T and num_heads are concrete in JIT).
+            #
+            # Scaling: splash_attention has no sm_scale argument.
+            #   Pre-scale q by 1/sqrt(head_dim) before calling the kernel.
             # ----------------------------------------------------------------
             q = jnp.transpose(q, (0, 2, 1, 3))   # (B, H, T, D)
             k = jnp.transpose(k, (0, 2, 1, 3))
             v = jnp.transpose(v, (0, 2, 1, 3))
 
-            sm_scale = 1.0 / math.sqrt(head_dim)
-            y = pallas_flash_attention(q, k, v, causal=True, sm_scale=sm_scale)
+            # Pre-scale q (equivalent to sm_scale in flash_attention)
+            q = q * (1.0 / math.sqrt(head_dim))
 
-            y = jnp.transpose(y, (0, 2, 1, 3))   # (B, T, H, D)
+            # Build kernel at trace time — T and num_heads are static shapes
+            _causal_mask = MultiHeadMask(
+                masks=[CausalMask((T, T)) for _ in range(self.num_heads)]
+            )
+            _block = min(128, T)
+            _splash_mha = make_splash_mha_single_device(
+                mask=_causal_mask,
+                block_sizes=BlockSizes(block_q=_block, block_kv=_block),
+            )
+
+            # vmap over batch: (B, H, T, D) → runs (H, T, D) per sample
+            y = jax.vmap(_splash_mha)(q, k, v)    # (B, H, T, D)
+            y = jnp.transpose(y, (0, 2, 1, 3))    # (B, T, H, D)
         else:
             # ----------------------------------------------------------------
-            # Standard Flax dot-product attention fallback
+            # Standard Flax dot-product attention fallback.
             # Used on CPU/GPU, or when seq_len < 128 / not a multiple of 128.
             # The causal mask is passed as a bias from the controller.
             # ----------------------------------------------------------------

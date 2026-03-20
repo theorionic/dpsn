@@ -41,6 +41,16 @@ class ComponentTimer:
         with self._lock:
             self._enabled = True
             self._marks = []
+        if jax.device_count() > 1:
+            print(
+                f"[ComponentTimer] WARNING: running on {jax.device_count()} devices. "
+                "jax.debug.callback (Mosaic/Pallas) cannot be auto-partitioned on TPU "
+                "multi-device — ctimer.mark() calls are disabled.\n"
+                "  Per-iteration stats (jax.debug.print) still work.\n"
+                "  For full per-component XLA traces use: --profile_dir /path/to/dir\n"
+                "  Then view with: tensorboard --logdir /path/to/dir",
+                flush=True,
+            )
 
     def disable(self):
         with self._lock:
@@ -80,10 +90,13 @@ class ComponentTimer:
 
         Safe inside jax.lax.scan: fires once per scan iteration.
         Safe with jax.checkpoint: fires on the forward pass only.
+
+        NOTE: no-op on multi-device (>1 device) because jax.debug.callback
+        uses Mosaic/Pallas kernels on TPU which cannot be auto-partitioned.
+        On multi-device setups use --profile_dir for per-component XLA traces.
         """
-        # ordered=True is NOT supported on multi-device JIT (raises OrderedDebugEffect).
-        # ordered=False works on any number of devices; timestamps are still accurate
-        # because time.perf_counter() is called inside the callback at execution time.
+        if jax.device_count() > 1:
+            return
         jax.debug.callback(self._make_cb(tag), trigger_array, ordered=False)
 
     # ── Host-side reporting (call AFTER jax.block_until_ready) ───────────────

@@ -196,7 +196,7 @@ def get_model_config(name: str) -> DPSNRConfig:
             controller_hidden_dim=768,
             controller_num_layers=12,
             controller_num_heads=12,
-            max_seq_len=1024,
+            max_seq_len=4096,
             pool_total_vectors=262144,  # 2^18 vectors (~200M params in pool)
             pool_hidden_dim=768,
             max_reasoning_loops=6,
@@ -209,7 +209,7 @@ def get_model_config(name: str) -> DPSNRConfig:
             controller_hidden_dim=1024,
             controller_num_layers=16,
             controller_num_heads=16,
-            max_seq_len=2048,
+            max_seq_len=8192,
             pool_total_vectors=1048576,  # 2^20 vectors (~1.1B params in pool)
             pool_hidden_dim=1024,
             max_reasoning_loops=8,
@@ -257,7 +257,7 @@ def get_model_config(name: str) -> DPSNRConfig:
             controller_hidden_dim=768,
             controller_num_layers=12,
             controller_num_heads=12,
-            max_seq_len=1024,
+            max_seq_len=4096,
             pool_total_vectors=262144,
             pool_hidden_dim=768,
             max_reasoning_loops=6,
@@ -306,7 +306,7 @@ def get_model_config(name: str) -> DPSNRConfig:
             controller_num_layers=24,
             controller_num_heads=16,
             controller_ff_multiplier=4.0,
-            max_seq_len=2048,
+            max_seq_len=8192,
             # 2D pool: 1536 × 1536 × 1024 ≈ 2.42B params (stored in bfloat16)
             # Coordinate precision: 1/1536 per axis — fully learnable
             use_2d_pool=True,
