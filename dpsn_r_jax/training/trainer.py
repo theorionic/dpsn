@@ -80,43 +80,60 @@ import functools
 
 
 def chunked_lm_loss(hidden, labels, decode_fn, pad_token_id, chunk_size):
-    """LM loss without ever materialising the full (B, T, V) logits tensor."""
+    """LM loss chunked along the *sequence* (T) dimension.
+
+    Why T, not B:
+      Full logits shape is (B, T, V).  For xxl with T=8192 and V=50257 even
+      B=1 gives 1×8192×50257×4 = 1.6 GB.  Chunking along T reduces peak to
+      B × chunk_size × V.  With chunk_size=128 that is ~51 MB/device — a 64×
+      reduction vs. materialising the full tensor.
+
+      The old code chunked along B: with loss_chunk_size=128 and B<128 it
+      padded the batch UP to 128, making memory usage worse, not better.
+    """
     B, T, D = hidden.shape
 
-    remainder = B % chunk_size
+    # Shift once before chunking: predict token i+1 from position i.
+    h   = hidden[:, :-1, :]   # (B, T-1, D)
+    tgt = labels[:, 1:]       # (B, T-1)
+    T1  = T - 1
+
+    # Pad T1 to a multiple of chunk_size so lax.scan sees equal-sized slices.
+    remainder = T1 % chunk_size
     if remainder != 0:
-        pad = chunk_size - remainder
-        hidden = jnp.concatenate(
-            [hidden, jnp.zeros((pad, T, D), dtype=hidden.dtype)], axis=0
+        pad_len = chunk_size - remainder
+        h   = jnp.concatenate(
+            [h,   jnp.zeros((B, pad_len, D),              dtype=h.dtype)],   axis=1
         )
-        labels = jnp.concatenate(
-            [labels, jnp.zeros((pad, T), dtype=labels.dtype)], axis=0
+        tgt = jnp.concatenate(
+            [tgt, jnp.full((B, pad_len), pad_token_id,    dtype=tgt.dtype)], axis=1
         )
-        B_padded = B + pad
+        T1_padded = T1 + pad_len
     else:
-        B_padded = B
+        T1_padded = T1
 
-    n_chunks      = B_padded // chunk_size
-    hidden_chunks = hidden.reshape(n_chunks, chunk_size, T, D)
-    labels_chunks = labels.reshape(n_chunks, chunk_size, T)
+    n_chunks = T1_padded // chunk_size
 
-    def scan_body(carry, chunk):
-        chunk_h, chunk_l = chunk
-        chunk_logits = decode_fn(chunk_h).astype(jnp.float32)
-        shift_logits = chunk_logits[:, :-1, :]
-        shift_labels = chunk_l[:, 1:]
-        per_token_loss = optax.softmax_cross_entropy_with_integer_labels(
-            shift_logits, shift_labels
-        )
-        mask = (shift_labels != pad_token_id).astype(jnp.float32)
-        return carry, (per_token_loss * mask, mask)
+    # Reshape for lax.scan — leading axis must be the scan axis (n_chunks).
+    # h_chunks:   (n_chunks, B, chunk_size, D)
+    # tgt_chunks: (n_chunks, B, chunk_size)
+    h_chunks   = h.reshape(B, n_chunks, chunk_size, D).transpose(1, 0, 2, 3)
+    tgt_chunks = tgt.reshape(B, n_chunks, chunk_size).transpose(1, 0, 2)
+
+    def scan_body(carry, x):
+        chunk_h, chunk_tgt = x                                 # (B, chunk_size, D/int)
+        logits = decode_fn(chunk_h).astype(jnp.float32)       # (B, chunk_size, V)
+        loss   = optax.softmax_cross_entropy_with_integer_labels(logits, chunk_tgt)
+        mask   = (chunk_tgt != pad_token_id).astype(jnp.float32)
+        return carry, (loss * mask, mask)
 
     _, (weighted_losses, masks) = jax.lax.scan(
         jax.checkpoint(scan_body),
         None,
-        (hidden_chunks, labels_chunks),
+        (h_chunks, tgt_chunks),
     )
-    return weighted_losses.sum() / (masks.sum() + 1e-9)
+    # weighted_losses / masks: (n_chunks, B, chunk_size)
+    return weighted_losses.sum() / jnp.maximum(masks.sum(), 1.0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
