@@ -230,7 +230,6 @@ class DPSNR(nn.Module):
             jax.debug.print(
                 "[ReasoningLoop] ── iter={i} ── (jax.debug.print works inside lax.scan)",
                 i=i,
-                ordered=True,
             )
 
             # ── 1. Multi-head indexing with runtime sigma scale ─────────────
@@ -330,7 +329,6 @@ class DPSNR(nn.Module):
                     halt=halt_rate,
                     ret=retrieved_norm,
                     hid=hidden_norm,
-                    ordered=True,
                 )
 
             # ── 3. Integrate retrieved knowledge ───────────────────────────────

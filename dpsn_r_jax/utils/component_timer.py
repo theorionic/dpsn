@@ -81,7 +81,10 @@ class ComponentTimer:
         Safe inside jax.lax.scan: fires once per scan iteration.
         Safe with jax.checkpoint: fires on the forward pass only.
         """
-        jax.debug.callback(self._make_cb(tag), trigger_array, ordered=True)
+        # ordered=True is NOT supported on multi-device JIT (raises OrderedDebugEffect).
+        # ordered=False works on any number of devices; timestamps are still accurate
+        # because time.perf_counter() is called inside the callback at execution time.
+        jax.debug.callback(self._make_cb(tag), trigger_array, ordered=False)
 
     # ── Host-side reporting (call AFTER jax.block_until_ready) ───────────────
 
