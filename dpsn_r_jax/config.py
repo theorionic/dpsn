@@ -324,13 +324,16 @@ def get_model_config(name: str) -> DPSNRConfig:
             controller_ff_multiplier=4.0,
             max_seq_len=8192,
             attn_window_size=512,   # 512/8192 = 6% local; pool handles the rest
-            # 2D pool: 1536 × 1536 × 1024 ≈ 2.42B params (stored in bfloat16)
-            # Coordinate precision: 1/1536 per axis — fully learnable
+            # 2D pool: 768 × 768 × 1024 ≈ 605M params (stored in bfloat16)
+            # Reduced from 1536×1536 to fit pool-gradient (f32) on single device:
+            #   1536²×1024×4 = 9.6 GB — exceeds 15.75 GB HBM when unsharded by GSPMD.
+            #   768²×1024×4  = 2.4 GB — fits with room for params + activations.
+            # Coordinate precision: 1/768 per axis — still fully learnable.
             use_2d_pool=True,
-            pool_grid_rows=1536,
-            pool_grid_cols=1536,
+            pool_grid_rows=768,
+            pool_grid_cols=768,
             pool_hidden_dim=1024,
-            pool_total_vectors=1536 * 1536,  # 2,359,296 — kept for compatibility
+            pool_total_vectors=768 * 768,  # 589,824 — kept for compatibility
             max_reasoning_loops=8,
             min_reasoning_loops=2,
             # Multi-head indexer: 4 concurrent pool queries per reasoning step
