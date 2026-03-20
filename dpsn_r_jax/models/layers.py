@@ -176,7 +176,14 @@ class FlashCausalSelfAttention(nn.Module):
             _block = min(128, T)
             _splash_mha = make_splash_mha_single_device(
                 mask=_splash_mask,
-                block_sizes=BlockSizes(block_q=_block, block_kv=_block),
+                block_sizes=BlockSizes(
+                    block_q=_block,
+                    block_kv=_block,
+                    block_q_dkv=_block,
+                    block_kv_dkv=_block,
+                    block_q_dq=_block,
+                    block_kv_dq=_block,
+                ),
             )
 
             y = jax.vmap(_splash_mha)(q, k, v)    # (B, H, T, D)
