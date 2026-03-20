@@ -5,16 +5,7 @@ import jax.numpy as jnp
 import flax.linen as nn
 
 # ---------------------------------------------------------------------------
-# Pallas TPU Splash Attention — imported once at module load.
-#
-# Splash attention replaces the older flash_attention because:
-#   - flash_attention uses Mosaic/Pallas kernels that cannot be automatically
-#     partitioned across multiple devices (raises NotImplementedError).
-#   - splash_attention supports multi-device via jax.vmap over the batch axis:
-#     each device runs the kernel independently on its local batch shard,
-#     which is exactly how data-parallel XLA SPMD works.
-#
-# Falls back to standard nn.dot_product_attention on CPU/GPU.
+# Pallas TPU Splash Attention
 # ---------------------------------------------------------------------------
 try:
     from jax.experimental.pallas.ops.tpu.splash_attention import (
@@ -22,6 +13,7 @@ try:
     )
     from jax.experimental.pallas.ops.tpu.splash_attention.splash_attention_mask import (
         CausalMask,
+        LocalMask,
         MultiHeadMask,
     )
     from jax.experimental.pallas.ops.tpu.splash_attention.splash_attention_kernel import (
@@ -32,22 +24,13 @@ except Exception:
     _SPLASH_FA_AVAILABLE = False
     make_splash_mha_single_device = None
     CausalMask = None
+    LocalMask = None
     MultiHeadMask = None
     BlockSizes = None
 
 
 def _use_pallas(flag: bool, seq_len: int) -> bool:
-    """Return True only when all conditions for Pallas splash_attention are met.
-
-    Splash attention requires:
-      - the flag to be explicitly set
-      - TPU backend at runtime
-      - seq_len >= 128 (minimum block size)
-      - seq_len divisible by 128 (block tiling constraint)
-
-    Multi-device is supported: splash_attention runs per-sample via jax.vmap,
-    so each device processes its local batch shard independently.
-    """
+    """Return True only when all conditions for Pallas splash_attention are met."""
     return (
         flag
         and _SPLASH_FA_AVAILABLE
@@ -56,14 +39,88 @@ def _use_pallas(flag: bool, seq_len: int) -> bool:
     )
 
 
+# ---------------------------------------------------------------------------
+# Rotary Position Embeddings (RoPE)
+#
+# Why RoPE instead of learned absolute embeddings:
+#   - Encodes *relative* distances between tokens into the QK dot product.
+#   - Generalises beyond the training context length (no hard cap).
+#   - No extra parameters — positions are baked into Q and K via rotation.
+#   - Now the universal standard: LLaMA, Gemma, Mistral, GPT-NeoX all use it.
+#
+# Implementation follows the original Su et al. (2021) paper.
+# cos/sin tables are computed at trace time (T and head_dim are static in JIT)
+# so there is zero runtime overhead beyond the two elementwise multiplies.
+# ---------------------------------------------------------------------------
+
+def _rotate_half(x):
+    """Rotate the last dimension: [x1, x2] → [-x2, x1]."""
+    half = x.shape[-1] // 2
+    x1, x2 = x[..., :half], x[..., half:]
+    return jnp.concatenate([-x2, x1], axis=-1)
+
+
+def _precompute_rope(seq_len: int, head_dim: int, base: float = 10000.0):
+    """Compute RoPE cos/sin tables.
+
+    Returns:
+        cos, sin — each shape (1, T, 1, head_dim), ready to broadcast with
+                   q/k of shape (B, T, H, head_dim).
+    """
+    half = head_dim // 2
+    # Inverse frequencies: θ_i = 1 / (base^(2i/d))
+    inv_freq = 1.0 / (
+        base ** (jnp.arange(0, half, dtype=jnp.float32) / half)
+    )
+    t = jnp.arange(seq_len, dtype=jnp.float32)
+    # Outer product: (T, half)
+    freqs = jnp.outer(t, inv_freq)
+    # Duplicate along head_dim to match full head_dim via rotation trick
+    cos = jnp.concatenate([jnp.cos(freqs), jnp.cos(freqs)], axis=-1)  # (T, D)
+    sin = jnp.concatenate([jnp.sin(freqs), jnp.sin(freqs)], axis=-1)  # (T, D)
+    # Add B and H broadcast dims: (1, T, 1, D)
+    return cos[None, :, None, :], sin[None, :, None, :]
+
+
+def _apply_rope(q, k, cos, sin):
+    """Apply rotary embeddings to q and k (shape: B, T, H, D)."""
+    q = q * cos + _rotate_half(q) * sin
+    k = k * cos + _rotate_half(k) * sin
+    return q, k
+
+
+# ---------------------------------------------------------------------------
+# Sliding window causal mask (fallback path — standard attention)
+# ---------------------------------------------------------------------------
+
+def _make_sliding_window_causal_bias(seq_len: int, window_size: int):
+    """Additive attention bias for causal sliding window attention.
+
+    Each token i attends to: positions [max(0, i-window_size+1), i].
+    Returns shape (T, T) with 0.0 where attention is allowed, -1e4 elsewhere.
+    """
+    i = jnp.arange(seq_len)[:, None]   # (T, 1)
+    j = jnp.arange(seq_len)[None, :]   # (1, T)
+    # causal: j <= i  |  window: j >= i - window_size + 1
+    in_window = (j <= i) & (j >= i - window_size + 1)
+    return jnp.where(in_window, 0.0, -1e4).astype(jnp.float32)  # (T, T)
+
+
+# ---------------------------------------------------------------------------
+# Attention layer
+# ---------------------------------------------------------------------------
+
 class FlashCausalSelfAttention(nn.Module):
     hidden_dim: int
     num_heads: int
     dropout_rate: float = 0.0
     use_flash_attention: bool = False
+    # 0 = full causal attention; >0 = sliding window of this many tokens.
+    # Set to ~512 for large context models — the pool handles long-range memory.
+    window_size: int = 0
 
     @nn.compact
-    def __call__(self, x, mask=None, deterministic=True):
+    def __call__(self, x, deterministic=True):
         B, T, _ = x.shape
         head_dim = self.hidden_dim // self.num_heads
 
@@ -71,51 +128,75 @@ class FlashCausalSelfAttention(nn.Module):
         qkv = nn.Dense(3 * self.hidden_dim, use_bias=False)(x)
         q, k, v = jnp.split(qkv, 3, axis=-1)
 
-        # -> (B, T, H, D)
+        # Reshape: (B, T, H*D) → (B, T, H, D)
         q = q.reshape(B, T, self.num_heads, head_dim)
         k = k.reshape(B, T, self.num_heads, head_dim)
         v = v.reshape(B, T, self.num_heads, head_dim)
 
+        # ── Apply RoPE to Q and K (B, T, H, D) ──────────────────────────────
+        # Computed at trace time: T and head_dim are static shapes in JIT.
+        cos, sin = _precompute_rope(T, head_dim)
+        q, k = _apply_rope(q, k, cos, sin)
+
         if _use_pallas(self.use_flash_attention, T):
             # ----------------------------------------------------------------
-            # Pallas TPU Splash Attention path — multi-device compatible.
+            # Pallas TPU Splash Attention — multi-device compatible.
             #
-            # Splash attention has no batch dimension: inputs are (H, T, D).
-            # We use jax.vmap to map over the batch axis so each sample in
-            # the local device shard is processed independently.
+            # Shape contract: splash expects (H, T, D) per sample.
+            # We vmap over the batch axis so each device's local shard is
+            # processed independently.
             #
-            # Mask: MultiHeadMask wrapping one CausalMask per head.
-            #   Created at trace time (T and num_heads are concrete in JIT).
+            # Mask:
+            #   window_size > 0 → LocalMask (causal sliding window)
+            #     LocalMask(shape, window_size=(left, right)) where right=0
+            #     means no future tokens → already causal, no need for
+            #     LogicalAnd with CausalMask.
+            #   window_size = 0 → full CausalMask
             #
-            # Scaling: splash_attention has no sm_scale argument.
-            #   Pre-scale q by 1/sqrt(head_dim) before calling the kernel.
+            # Scale: pre-scale q by 1/√head_dim (splash has no sm_scale arg).
             # ----------------------------------------------------------------
             q = jnp.transpose(q, (0, 2, 1, 3))   # (B, H, T, D)
             k = jnp.transpose(k, (0, 2, 1, 3))
             v = jnp.transpose(v, (0, 2, 1, 3))
 
-            # Pre-scale q (equivalent to sm_scale in flash_attention)
             q = q * (1.0 / math.sqrt(head_dim))
 
-            # Build kernel at trace time — T and num_heads are static shapes
-            _causal_mask = MultiHeadMask(
-                masks=[CausalMask((T, T)) for _ in range(self.num_heads)]
+            if self.window_size > 0:
+                _per_head_mask = LocalMask(
+                    (T, T),
+                    window_size=(self.window_size - 1, 0),
+                    offset=0,
+                )
+            else:
+                _per_head_mask = CausalMask((T, T))
+
+            _splash_mask = MultiHeadMask(
+                masks=[_per_head_mask] * self.num_heads
             )
             _block = min(128, T)
             _splash_mha = make_splash_mha_single_device(
-                mask=_causal_mask,
+                mask=_splash_mask,
                 block_sizes=BlockSizes(block_q=_block, block_kv=_block),
             )
 
-            # vmap over batch: (B, H, T, D) → runs (H, T, D) per sample
             y = jax.vmap(_splash_mha)(q, k, v)    # (B, H, T, D)
             y = jnp.transpose(y, (0, 2, 1, 3))    # (B, T, H, D)
+
         else:
             # ----------------------------------------------------------------
             # Standard Flax dot-product attention fallback.
-            # Used on CPU/GPU, or when seq_len < 128 / not a multiple of 128.
-            # The causal mask is passed as a bias from the controller.
+            # Used on CPU/GPU or when seq_len constraints aren't met.
+            # Mask is built here — causal or causal sliding window.
             # ----------------------------------------------------------------
+            if self.window_size > 0:
+                bias = _make_sliding_window_causal_bias(T, self.window_size)
+                # Expand to (1, 1, T, T) for broadcasting with (B, H, T, T)
+                bias = bias[None, None, :, :]
+            else:
+                # Full causal mask as additive bias
+                causal = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
+                bias = jnp.where(causal, 0.0, -1e4)[None, None, :, :]
+
             dropout_rng = (
                 self.make_rng("dropout")
                 if not deterministic and self.dropout_rate > 0
@@ -125,7 +206,7 @@ class FlashCausalSelfAttention(nn.Module):
                 q,
                 k,
                 v,
-                bias=mask,
+                bias=bias,
                 dropout_rate=self.dropout_rate,
                 deterministic=deterministic,
                 dropout_rng=dropout_rng,
@@ -163,16 +244,18 @@ class TinyTransformerLayer(nn.Module):
     ff_dim: int
     dropout_rate: float = 0.0
     use_flash_attention: bool = False
+    window_size: int = 0
 
     @nn.compact
-    def __call__(self, x, mask=None, deterministic=True):
+    def __call__(self, x, deterministic=True):
         norm1 = nn.LayerNorm()(x)
         attn_out = FlashCausalSelfAttention(
             self.hidden_dim,
             self.num_heads,
             self.dropout_rate,
             self.use_flash_attention,
-        )(norm1, mask=mask, deterministic=deterministic)
+            self.window_size,
+        )(norm1, deterministic=deterministic)
         x = x + attn_out
 
         norm2 = nn.LayerNorm()(x)

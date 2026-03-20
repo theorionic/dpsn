@@ -108,12 +108,25 @@ class DPSNRConfig:
     # weight is linearly ramped from 0 → precision_loss_weight over sigma_anneal_steps.
     precision_loss_weight: float = 0.0
 
-    # ── Flash Attention (Pallas TPU kernel) ────────────────────────────────
-    # When True, FlashCausalSelfAttention uses jax.experimental.pallas
-    # flash_attention instead of Flax's nn.dot_product_attention.
+    # ── Splash Attention (Pallas TPU kernel) ───────────────────────────────
+    # When True, FlashCausalSelfAttention uses splash_attention (Pallas TPU)
+    # instead of Flax's nn.dot_product_attention.
     # Requirements: TPU backend, seq_len >= 128 and divisible by 128.
     # Falls back to standard attention automatically if conditions aren't met.
     use_flash_attention: bool = True
+
+    # ── Sliding Window (Local) Attention ───────────────────────────────────
+    # Each token attends to only the nearest `attn_window_size` past tokens
+    # instead of the full sequence.  0 = full causal attention.
+    #
+    # Why: the controller is architecturally a *local context encoder* —
+    # long-range reasoning is handled by the pool + reasoning loop.
+    # Full O(T²) attention at T=8192 is wasteful and contradicts this design.
+    # With window=512 the controller is O(T × 512) — 16× cheaper at T=8192.
+    #
+    # The pool's reasoning loop captures everything beyond the window, so
+    # nothing is lost semantically.
+    attn_window_size: int = 0
 
     # ── SRAM Super-Window pre-fetching (Opt-2) ─────────────────────────────
     # Before the reasoning loop, fetch pool_super_window_factor × window_size
@@ -201,6 +214,7 @@ def get_model_config(name: str) -> DPSNRConfig:
             pool_hidden_dim=768,
             max_reasoning_loops=6,
             learning_rate=3e-4,
+            attn_window_size=512,   # O(T×512) vs O(T²); pool handles long-range
         )
 
     elif name == "xl":
@@ -214,6 +228,7 @@ def get_model_config(name: str) -> DPSNRConfig:
             pool_hidden_dim=1024,
             max_reasoning_loops=8,
             learning_rate=2e-4,
+            attn_window_size=512,   # 512/8192 = 6% local; pool handles the rest
         )
 
     # ── Precision Routing Variants ─────────────────────────────────────────────
@@ -262,6 +277,7 @@ def get_model_config(name: str) -> DPSNRConfig:
             pool_hidden_dim=768,
             max_reasoning_loops=6,
             learning_rate=3e-4,
+            attn_window_size=512,
             num_indexer_heads=4,
             sigma_min=0.01,
             sigma_max=5.0,
@@ -307,6 +323,7 @@ def get_model_config(name: str) -> DPSNRConfig:
             controller_num_heads=16,
             controller_ff_multiplier=4.0,
             max_seq_len=8192,
+            attn_window_size=512,   # 512/8192 = 6% local; pool handles the rest
             # 2D pool: 1536 × 1536 × 1024 ≈ 2.42B params (stored in bfloat16)
             # Coordinate precision: 1/1536 per axis — fully learnable
             use_2d_pool=True,

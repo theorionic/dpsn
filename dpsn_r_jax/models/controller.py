@@ -11,16 +11,17 @@ class TinyController(nn.Module):
         self.embedding = nn.Embed(
             self.config.vocab_size, self.config.controller_hidden_dim
         )
-        self.pos_encoding = nn.Embed(
-            self.config.max_seq_len, self.config.controller_hidden_dim
-        )
+        # NOTE: No learned positional embedding — positions are encoded via
+        # RoPE (Rotary Position Embeddings) inside FlashCausalSelfAttention.
+        # RoPE encodes relative distances between tokens and generalises beyond
+        # the training context length, unlike the old nn.Embed approach.
 
         ff_dim = int(
             self.config.controller_hidden_dim * self.config.controller_ff_multiplier
         )
         layer_cls = TinyTransformerLayer
         if self.config.gradient_checkpointing:
-            layer_cls = nn.remat(TinyTransformerLayer, static_argnums=(3,))
+            layer_cls = nn.remat(TinyTransformerLayer, static_argnums=(1,))
 
         self.layers = [
             layer_cls(
@@ -29,6 +30,7 @@ class TinyController(nn.Module):
                 ff_dim,
                 self.config.dropout,
                 self.config.use_flash_attention,
+                self.config.attn_window_size,
             )
             for _ in range(self.config.controller_num_layers)
         ]
@@ -41,28 +43,12 @@ class TinyController(nn.Module):
         return self.encode(input_ids, deterministic)
 
     def encode(self, input_ids, deterministic=True):
-        B, T = input_ids.shape
-
-        embed = self.embedding(input_ids)
-
-        pos_ids = jnp.arange(T)[None, :]
-        pos_embed = self.pos_encoding(pos_ids)
-
-        x = embed + pos_embed
-
-        # When Pallas flash_attention is active it handles causality internally
-        # via causal=True, so no external bias mask is needed.  Build it only
-        # for the standard fallback path.
-        if _use_pallas(self.config.use_flash_attention, T):
-            mask = None
-        else:
-            mask = nn.make_causal_mask(input_ids)
-            mask = jnp.where(mask, 0, -1e4)
+        x = self.embedding(input_ids)   # (B, T, D) — no pos_embed added
 
         for layer in self.layers:
-            # Pass mask and deterministic AS POSITIONAL arguments
-            # so that static_argnums=(2,) in nn.remat catches deterministic.
-            x = layer(x, mask, deterministic)
+            # deterministic is the only extra arg; pass positionally so
+            # static_argnums=(1,) in nn.remat catches it correctly.
+            x = layer(x, deterministic)
 
         return x
 
