@@ -167,19 +167,28 @@ class FlashCausalSelfAttention(nn.Module):
         cos, sin = _precompute_rope(T, head_dim)
         q, k = _apply_rope(q, k, cos, sin)
 
-        if _use_pallas(self.use_flash_attention, T):
+        # Decide which attention path to take.
+        # shard_map requires B to be divisible by device_count — if it isn't
+        # (e.g. dummy batch=1 during jax.eval_shape) we fall back to standard
+        # dot-product attention so the shape-inference pass doesn't crash.
+        _ndev = jax.device_count()
+        _use_splash = (
+            _use_pallas(self.use_flash_attention, T)
+            and (_ndev == 1 or (_MESH is not None and B % _ndev == 0))
+        )
+
+        if _use_splash:
             # ----------------------------------------------------------------
-            # Pallas TPU Splash Attention — multi-device compatible.
+            # Pallas TPU Splash Attention
             #
             # Shape contract: splash expects (H, T, D) per sample.
-            # We vmap over the batch axis so each device's local shard is
-            # processed independently.
+            # Single-device: jax.vmap over B.
+            # Multi-device:  shard_map splits B across devices, then jax.vmap
+            #                over the local slice — GSPMD never sees the Mosaic
+            #                kernel and cannot try to auto-partition it.
             #
             # Mask:
             #   window_size > 0 → LocalMask (causal sliding window)
-            #     LocalMask(shape, window_size=(left, right)) where right=0
-            #     means no future tokens → already causal, no need for
-            #     LogicalAnd with CausalMask.
             #   window_size = 0 → full CausalMask
             #
             # Scale: pre-scale q by 1/√head_dim (splash has no sm_scale arg).
@@ -215,11 +224,7 @@ class FlashCausalSelfAttention(nn.Module):
                 ),
             )
 
-            if jax.device_count() > 1 and _MESH is not None:
-                # Multi-device: shard_map explicitly partitions the batch across
-                # devices so GSPMD never tries to auto-partition the Mosaic kernel.
-                # Each device receives its local slice (local_B, H, T, D) and runs
-                # jax.vmap over local_B independently.
+            if _ndev > 1:
                 _axis = _MESH.axis_names[0]
                 _splash_fn = functools.partial(
                     _shard_map,
@@ -234,30 +239,25 @@ class FlashCausalSelfAttention(nn.Module):
                 )(lambda q_, k_, v_: jax.vmap(_splash_mha)(q_, k_, v_))
                 y = _splash_fn(q, k, v)
             else:
-                y = jax.vmap(_splash_mha)(q, k, v)    # single-device
+                y = jax.vmap(_splash_mha)(q, k, v)
 
             y = jnp.transpose(y, (0, 2, 1, 3))    # (B, T, H, D)
 
         else:
             # ----------------------------------------------------------------
             # Standard Flax dot-product attention fallback.
-            # Used on CPU/GPU or when seq_len constraints aren't met.
-            # Mask is built here — causal or causal sliding window.
+            # Used on CPU/GPU, when seq_len constraints aren't met, or when
+            # batch size isn't divisible by device count (e.g. eval_shape).
             # ----------------------------------------------------------------
             if self.window_size > 0:
                 bias = _make_sliding_window_causal_bias(T, self.window_size)
-                # Expand to (1, 1, T, T) for broadcasting with (B, H, T, T)
                 bias = bias[None, None, :, :]
             else:
-                # Full causal mask as additive bias
                 causal = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
                 bias = jnp.where(causal, 0.0, -1e4)[None, None, :, :]
 
-            # Pass dropout_rate=0.0 to nn.dot_product_attention to avoid its
-            # internal `if not deterministic:` Python branch, which raises
-            # TracerBoolConversionError when deterministic is a traced JAX value.
-            # Attention-weight dropout is omitted; the output nn.Dropout below
-            # covers regularisation on the projected output instead.
+            # Pass dropout_rate=0.0 to avoid Flax's internal `if not deterministic:`
+            # Python branch (TracerBoolConversionError with gradient checkpointing).
             y = nn.dot_product_attention(
                 q,
                 k,
