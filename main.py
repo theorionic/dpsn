@@ -872,8 +872,15 @@ def main():
                     f"device count ({jax.device_count()}). "
                     f"Increase --batch_size or decrease --grad_accum_steps."
                 )
+                # batch arrives as (B, T) with PartitionSpec("shard", None).
+                # .reshape() propagates that sharding to the output — dim 0
+                # becomes accum_steps (e.g. 4) which is < device_count (8)
+                # → IndivisibleError even before device_put runs.
+                # Fix: strip the shard axis first (replicate), then reshape,
+                # then place the shard on dim 1 (micro_batch_size, divisible by 8).
+                _batch_rep = jax.device_put(batch, replicated_sharding)
                 micro_batches = jax.device_put(
-                    batch.reshape(_grad_accum, micro_batch_size, config.max_seq_len),
+                    _batch_rep.reshape(_grad_accum, micro_batch_size, config.max_seq_len),
                     NamedSharding(mesh, PartitionSpec(None, "shard", None)),
                 )
                 state, loss, mean_sigma = grad_accum_step(
