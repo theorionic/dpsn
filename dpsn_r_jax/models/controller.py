@@ -21,7 +21,13 @@ class TinyController(nn.Module):
         )
         layer_cls = TinyTransformerLayer
         if self.config.gradient_checkpointing:
-            layer_cls = nn.remat(TinyTransformerLayer, static_argnums=(1,))
+            # Flax remat counts the module instance as arg 0, so:
+            #   arg 0 = module instance
+            #   arg 1 = x  (JAX array — traced normally)
+            #   arg 2 = deterministic  (Python bool — must be static)
+            # Without static_argnums=(2,), deterministic becomes a JAX tracer
+            # and `if not deterministic:` raises TracerBoolConversionError.
+            layer_cls = nn.remat(TinyTransformerLayer, static_argnums=(2,))
 
         self.layers = [
             layer_cls(

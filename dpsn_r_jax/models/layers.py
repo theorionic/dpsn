@@ -197,26 +197,24 @@ class FlashCausalSelfAttention(nn.Module):
                 causal = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
                 bias = jnp.where(causal, 0.0, -1e4)[None, None, :, :]
 
-            dropout_rng = (
-                self.make_rng("dropout")
-                if not deterministic and self.dropout_rate > 0
-                else None
-            )
+            # Pass dropout_rate=0.0 to nn.dot_product_attention to avoid its
+            # internal `if not deterministic:` Python branch, which raises
+            # TracerBoolConversionError when deterministic is a traced JAX value.
+            # Attention-weight dropout is omitted; the output nn.Dropout below
+            # covers regularisation on the projected output instead.
             y = nn.dot_product_attention(
                 q,
                 k,
                 v,
                 bias=bias,
-                dropout_rate=self.dropout_rate,
-                deterministic=deterministic,
-                dropout_rng=dropout_rng,
+                dropout_rate=0.0,
+                deterministic=True,
             )
 
         y = y.reshape(B, T, self.hidden_dim)
         y = nn.Dense(self.hidden_dim, use_bias=False)(y)
-
-        if not deterministic:
-            y = nn.Dropout(self.dropout_rate)(y, deterministic=deterministic)
+        # nn.Dropout handles deterministic internally — no Python if-branch needed.
+        y = nn.Dropout(self.dropout_rate)(y, deterministic=deterministic)
 
         return y
 
@@ -230,11 +228,9 @@ class TinyFFN(nn.Module):
     def __call__(self, x, deterministic=True):
         x = nn.Dense(self.ff_dim)(x)
         x = nn.gelu(x)
-        if not deterministic:
-            x = nn.Dropout(self.dropout_rate)(x, deterministic=deterministic)
+        x = nn.Dropout(self.dropout_rate)(x, deterministic=deterministic)
         x = nn.Dense(self.hidden_dim)(x)
-        if not deterministic:
-            x = nn.Dropout(self.dropout_rate)(x, deterministic=deterministic)
+        x = nn.Dropout(self.dropout_rate)(x, deterministic=deterministic)
         return x
 
 
