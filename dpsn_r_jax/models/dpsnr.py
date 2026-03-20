@@ -10,6 +10,7 @@ from dpsn_r_jax.models.memory import (
 )
 import jax.profiler
 from dpsn_r_jax.models.reasoning import AdaptiveComputeController
+from dpsn_r_jax.utils.component_timer import ctimer
 
 # Set to True to print per-loop reasoning stats to stdout (via jax.debug.print).
 # Works inside JIT/lax.scan. Disable for production to avoid print overhead.
@@ -81,12 +82,17 @@ class DPSNR(nn.Module):
             aux:          (max_loops, all_indices, mean_sigma)
                           mean_sigma is logged and used for precision loss.
         """
+        # ── Timing mark: encode (controller + reasoning loop) starting ────────
+        ctimer.mark("00_encode_start", input_ids.astype(jnp.float32))
+
         state_hidden, all_indices, mean_sigma = self._encode_hidden(
             input_ids, deterministic, sigma_max_scale
         )
 
         # 3. Decode — the expensive (B, T, V) step
         logits = self.controller.decode(state_hidden)
+        # ── Timing mark: LM-head decode done (full forward complete) ─────────
+        ctimer.mark("09_decode_done", logits)
 
         return logits, (self.config.max_reasoning_loops, all_indices, mean_sigma)
 
@@ -116,6 +122,10 @@ class DPSNR(nn.Module):
         # MUST pass deterministic as a positional argument so static_argnums=(1,) catches it!
         with jax.profiler.TraceAnnotation("TinyController_Forward"):
             hidden = self.controller(input_ids, deterministic)
+        # ── Timing mark: TinyController finished ─────────────────────────────
+        # jax.debug.callback fires at actual XLA execution time (not trace time).
+        # 'hidden' is the trigger array — sequences the mark AFTER the controller.
+        ctimer.mark("01_controller_done", hidden)
 
         # 2. Reasoning Loop
         state_hidden = hidden
@@ -146,6 +156,8 @@ class DPSNR(nn.Module):
             jnp.zeros((B, T, D + self.config.controller_hidden_dim))
         )
         _ = self.acc(state_hidden, state_hidden, 0, halt_prob, halted_mask)
+        # ── Timing mark: warm-up tracing finished, reasoning scan about to start ─
+        ctimer.mark("02_warmup_done__scan_starting", state_hidden)
 
         use_2d    = self.config.use_2d_pool
         H         = self.config.num_indexer_heads
@@ -211,10 +223,22 @@ class DPSNR(nn.Module):
 
             prev_s_hidden = s_hidden
 
+            # ── Timing mark: start of this reasoning iteration ────────────────
+            # 'i' is a JAX traced scalar — use jax.debug.print to show it in console.
+            # ctimer.mark fires once per scan iteration.
+            ctimer.mark("03_iter_start", s_hidden)
+            jax.debug.print(
+                "[ReasoningLoop] ── iter={i} ── (jax.debug.print works inside lax.scan)",
+                i=i,
+                ordered=True,
+            )
+
             # ── 1. Multi-head indexing with runtime sigma scale ─────────────
             with jax.profiler.TraceAnnotation("LearnedIndexer_Forward"):
                 mu, sigma = self.indexer(s_hidden, sigma_max_scale=sigma_max_scale)
             # mu: (B, H), sigma: (B, H)
+            # ── Timing mark: indexer done ─────────────────────────────────────
+            ctimer.mark("04_indexer_done", mu)
 
             # ── 2. Per-head pool retrieval — vectorized with jax.vmap ─────────
             if use_2d:
@@ -284,21 +308,29 @@ class DPSNR(nn.Module):
                 retrieved     = jnp.mean(retrieved_all, axis=1)  # (B, D)
                 start_indices = start_all.reshape(-1)             # (B*H,)
 
+            # ── Timing mark: pool retrieval done ─────────────────────────────
+            ctimer.mark("05_pool_retrieval_done", retrieved)
+
             # ── Mean sigma for logging and precision loss ─────────────────────
             mean_sigma_step = jnp.mean(sigma)
 
-            if DEBUG_REASONING_LOOPS:
-                halt_rate = jnp.mean(h_mask)
+            # ── Per-iteration diagnostic print (always on when ctimer enabled,
+            #    or when DEBUG_REASONING_LOOPS is True).
+            #    jax.debug.print is the ONLY way to print tensor values inside
+            #    jax.jit / jax.lax.scan — normal print() runs at trace time only.
+            if DEBUG_REASONING_LOOPS or ctimer.enabled:
+                halt_rate      = jnp.mean(h_mask)
                 retrieved_norm = jnp.sqrt(jnp.mean(retrieved ** 2))
-                hidden_norm = jnp.sqrt(jnp.mean(s_hidden ** 2))
+                hidden_norm    = jnp.sqrt(jnp.mean(s_hidden ** 2))
                 jax.debug.print(
-                    "[ReasoningLoop] loop={i} | mean_sigma={sigma:.4f} | "
+                    "[ReasoningLoop] iter={i} | sigma={sigma:.4f} | "
                     "halt_rate={halt:.3f} | retrieved_l2={ret:.4f} | hidden_l2={hid:.4f}",
                     i=i,
                     sigma=mean_sigma_step,
                     halt=halt_rate,
                     ret=retrieved_norm,
                     hid=hidden_norm,
+                    ordered=True,
                 )
 
             # ── 3. Integrate retrieved knowledge ───────────────────────────────
@@ -306,6 +338,8 @@ class DPSNR(nn.Module):
                 retrieved_expanded = jnp.expand_dims(retrieved, 1).repeat(T, axis=1)
                 combined = jnp.concatenate([s_hidden, retrieved_expanded], axis=-1)
                 integrated = self.retrieval_integrator(combined)
+            # ── Timing mark: retrieval integrator done ────────────────────────
+            ctimer.mark("06_integrator_done", integrated)
 
             # ── 4. ACC: accumulate state and decide whether to halt ────────────
             with jax.profiler.TraceAnnotation("AdaptiveComputeController"):
@@ -325,6 +359,11 @@ class DPSNR(nn.Module):
             s_hidden   = s_hidden.astype(carry_dtype)
             h_prob     = h_prob.astype(carry_dtype)
             new_h_mask = new_h_mask.astype(carry_dtype)
+
+            # ── Timing mark: full reasoning iteration done ────────────────────
+            # This fires once per lax.scan iteration → per-iteration cost visible
+            # in ctimer.print_summary() as repeated "07_acc_iter_done[N]" rows.
+            ctimer.mark("07_acc_iter_done", s_hidden)
 
             if USE_SW:
                 new_carry = (s_hidden, h_prob, new_h_mask, new_sw_carry)
@@ -363,6 +402,9 @@ class DPSNR(nn.Module):
             state_hidden, halt_prob, halted_mask, _ = final_carry
         else:
             state_hidden, halt_prob, halted_mask = final_carry
+
+        # ── Timing mark: all reasoning loop iterations complete ───────────────
+        ctimer.mark("08_all_reasoning_loops_done", state_hidden)
 
         # all_indices: (max_loops, heads*B) → transpose to (B*heads, max_loops)
         all_indices = jnp.transpose(all_indices, (1, 0))

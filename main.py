@@ -252,8 +252,61 @@ def main():
         action="store_true",
         help="Force synchronizations to print exact ms timings for Fetch, Dispatch, and TPU Execution every step.",
     )
+    parser.add_argument(
+        "--profile_components",
+        action="store_true",
+        help=(
+            "Print per-component wall-clock timing breakdown every LOG_INTERVAL steps. "
+            "Shows how the 1.3s step time is split across: "
+            "TinyController / LearnedIndexer / CoordinateMassivePool / "
+            "RetrievalIntegrator / AdaptiveComputeController / LM-head decode. "
+            "Uses jax.debug.callback(ordered=True) so it works inside jit+lax.scan. "
+            "Implies --profile_detailed (forces block_until_ready for accurate totals). "
+            "Use for diagnosis only — adds ~1-2ms host overhead per step."
+        ),
+    )
+    parser.add_argument(
+        "--profile_components_interval",
+        type=int,
+        default=None,
+        help="Print component breakdown every N steps (default: same as LOG_INTERVAL=200).",
+    )
+    parser.add_argument(
+        "--xla_cache_dir",
+        type=str,
+        default=None,
+        help="Directory to persist JAX/XLA JIT compilation cache. "
+             "First run compiles and saves artifacts; subsequent runs skip recompilation. "
+             "Cache is hardware- and JAX-version-specific.",
+    )
 
     args = parser.parse_args()
+
+    # ── Component timing setup ───────────────────────────────────────────────
+    # Import the singleton that dpsnr.py's jax.debug.callbacks write into.
+    from dpsn_r_jax.utils.component_timer import ctimer as _ctimer
+    if args.profile_components:
+        _ctimer.enable()
+        print(
+            "[COMPONENT TIMER] Enabled — will print internal model timing every "
+            f"{args.profile_components_interval or 'LOG_INTERVAL'} steps.\n"
+            "  Marks captured: encode_start → controller → warmup → "
+            "reasoning_loop×N(indexer→pool→integrator→acc) → decode\n"
+            "  jax.debug.print fires inside lax.scan to show per-iter stats.\n"
+        )
+
+    # ── JAX/XLA Persistent Compilation Cache ────────────────────────────────
+    if args.xla_cache_dir:
+        os.makedirs(args.xla_cache_dir, exist_ok=True)
+        jax.config.update("jax_compilation_cache_dir", args.xla_cache_dir)
+        print(f"[XLA CACHE] Persistent JIT cache ENABLED → {args.xla_cache_dir}")
+        print(f"[XLA CACHE] First run: compiles + saves artifacts (slow). "
+              f"Subsequent runs: loads from cache (fast).")
+        print(f"[XLA CACHE] Cache is specific to this JAX version + hardware topology. "
+              f"Clear the dir after upgrading JAX or changing device count.")
+    else:
+        print("[XLA CACHE] No --xla_cache_dir set — recompiling from scratch every run. "
+              "Pass --xla_cache_dir /tmp/xla_cache to skip recompilation on restarts.")
 
     # Initialize TensorBoard writer
     log_dir = None
@@ -837,6 +890,41 @@ def main():
             last_sigma = mean_sigma
             dispatch_time = time.time() - dispatch_start_time
 
+            # ── Detailed per-step timing breakdown (--profile_detailed) ──────
+            # Forces a host/device sync every step — this WILL reduce throughput
+            # but gives exact latency for every phase. Use only for diagnosis.
+            #
+            # Phases:
+            #   DataFetch    = time blocked waiting for the data pipeline to
+            #                  return a batch (CPU workers / prefetch queue).
+            #   HostDispatch = time for Python/XLA to trace & enqueue the JIT
+            #                  computation on the accelerator (should be ~1-5ms;
+            #                  high values indicate Python overhead or re-tracing).
+            #   TPU-Exec     = actual accelerator compute time measured by
+            #                  blocking until the loss scalar is ready.  Low
+            #                  TFLOPS usually means this is dominated by memory
+            #                  bandwidth (pool scatter/gather) rather than FLOPs.
+            if args.profile_detailed:
+                _sync_t0 = time.time()
+                jax.block_until_ready(loss)
+                tpu_exec_ms = (time.time() - _sync_t0) * 1000.0
+
+                data_ms     = current_data_wait_time * 1000.0
+                dispatch_ms = dispatch_time          * 1000.0
+                total_ms    = data_ms + dispatch_ms + tpu_exec_ms
+                _step_tag   = int(global_step) + 1  # +1: global_step increments below
+
+                bottleneck = "DATA" if data_ms > tpu_exec_ms else "COMPUTE"
+                print(
+                    f"[STEP {_step_tag:>6}] "
+                    f"DataFetch={data_ms:7.2f}ms  "
+                    f"HostDispatch={dispatch_ms:6.2f}ms  "
+                    f"TPU-Exec={tpu_exec_ms:8.2f}ms  "
+                    f"StepTotal={total_ms:8.2f}ms  "
+                    f"Loss={float(loss):.4f}  "
+                    f"[bottleneck={bottleneck}]",
+                    flush=True,
+                )
 
             global_step += 1
 
@@ -944,6 +1032,37 @@ def main():
                     writer.add_scalar("Timing/Backward_Optim_ms",   _bwd_opt_ms, global_step)
                     writer.add_scalar("Timing/Total_step_ms",        _total_ms,  global_step)
                     writer.add_scalar("Timing/Forward_pct",          _fwd_pct,   global_step)
+
+            # ── Internal component timing (--profile_components) ─────────────
+            # Prints the per-stage breakdown captured by jax.debug.callback marks
+            # inside dpsnr.py: controller → warmup → reasoning_loop×N
+            # (indexer → pool → integrator → acc) → decode.
+            # block_until_ready() ensures all callbacks have fired before we print.
+            _comp_interval = args.profile_components_interval or LOG_INTERVAL
+            if (
+                args.profile_components
+                and global_step > 1          # skip step 0 (includes JIT compile)
+                and global_step % _comp_interval == 0
+            ):
+                # Re-run a clean forward pass so ctimer marks come from a steady
+                # state step (not mixed with the backward pass ops).
+                _ctimer.reset()
+                _sigma_comp = jnp.float32(sigma_anneal_fn(global_step))
+                _comp_out, _ = forward_only_step(
+                    state, last_batch,
+                    sigma_scale=_sigma_comp,
+                    use_bf16=getattr(config, 'use_bf16', False),
+                    loss_chunk_size=getattr(config, 'loss_chunk_size', 0),
+                )
+                # block_until_ready: flush all jax.debug.callbacks before printing
+                jax.block_until_ready(_comp_out)
+                _comp_fwd_ms = (_fwd_ms if 'last_batch' in dir() and _timing_compiled
+                                else 0.0)
+                _ctimer.print_summary(
+                    step=int(global_step),
+                    total_step_ms=avg_step_time * 1000.0,
+                )
+                _ctimer.reset()  # clear for next interval
 
             # Periodic Generation
             if (
