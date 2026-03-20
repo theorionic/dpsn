@@ -861,8 +861,20 @@ def main():
                 # hands it to the JIT-compiled grad_accum_step.
                 micro_batch_size = args.batch_size // _grad_accum
                 # Stack micro-batches: (accum, micro_B, T)
-                micro_batches = batch.reshape(
-                    _grad_accum, micro_batch_size, config.max_seq_len
+                # batch arrives as (B, T) with PartitionSpec("shard", None).
+                # After reshape to (accum, micro_B, T), dim 0 = accum_steps (e.g. 4)
+                # which is smaller than device count (e.g. 8) → IndivisibleError.
+                # Fix: explicitly reshard so the "shard" axis moves to dim 1
+                # (the micro-batch dim).  micro_batch_size must be divisible by
+                # device count; the assertion below catches mis-configurations.
+                assert micro_batch_size % jax.device_count() == 0, (
+                    f"micro_batch_size ({micro_batch_size}) must be divisible by "
+                    f"device count ({jax.device_count()}). "
+                    f"Increase --batch_size or decrease --grad_accum_steps."
+                )
+                micro_batches = jax.device_put(
+                    batch.reshape(_grad_accum, micro_batch_size, config.max_seq_len),
+                    NamedSharding(mesh, PartitionSpec(None, "shard", None)),
                 )
                 state, loss, mean_sigma = grad_accum_step(
                     state, micro_batches, current_lr_val, sigma_scale_val,
