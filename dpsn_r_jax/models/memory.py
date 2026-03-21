@@ -3,6 +3,7 @@ import jax.numpy as jnp
 import flax.linen as nn
 from jax import lax
 from dpsn_r_jax.config import PoolConfig
+from dpsn_r_jax.kernels import pool_retrieve_1d_pallas, pool_retrieve_2d_pallas
 
 
 class LearnedIndexer(nn.Module):
@@ -217,9 +218,13 @@ class CoordinateMassivePool(nn.Module):
 
     # ── Internal shared retrieval routine ────────────────────────────────────
     def _retrieve(self, storage, mu, sigma):
-        """Gaussian-weighted fetch from ``storage`` (any slice of params_storage)."""
+        """Gaussian-weighted fetch from ``storage`` (any slice of params_storage).
+
+        Uses the fused Pallas kernel on TPU (or interpret mode) to avoid
+        materialising the intermediate (B, W, D) selected-vectors buffer and
+        (B, W) Gaussian-weights buffer in HBM.  Falls back to pure JAX on GPU/CPU.
+        """
         Total = self.config.total_vectors
-        D     = self.config.hidden_dim
         W     = self.window_size
 
         center_idx    = mu * (Total - 1)
@@ -227,21 +232,8 @@ class CoordinateMassivePool(nn.Module):
             center_idx - W // 2, 0, Total - W
         ).astype(jnp.int32)
 
-        def slice_fn(start):
-            return lax.dynamic_slice(storage, (start, 0), (W, D))
-
-        selected = jax.vmap(slice_fn)(start_indices)  # (B, W, D) bf16
-
-        relative_indices = jnp.arange(W)[None, :] + start_indices[:, None]
-        distances        = relative_indices - center_idx[:, None]
-
-        weights = (
-            jnp.exp(-(distances ** 2) / (2 * (sigma[:, None] + 1e-6) ** 2)) + 1e-6
-        )
-        weights = weights / jnp.sum(weights, axis=-1, keepdims=True)
-
-        aggregated = jnp.einsum(
-            "bw,bwd->bd", weights, selected.astype(jnp.float32)
+        aggregated = pool_retrieve_1d_pallas(
+            storage, mu, sigma, start_indices, W=W, Total=Total
         )
         return aggregated, start_indices
 
@@ -315,26 +307,18 @@ class CoordinateMassivePool2D(nn.Module):
         c_center = mu_col * (C - 1)                                  # (B,)
         c_start  = jnp.clip(c_center - W // 2, 0, C - W).astype(jnp.int32)
 
-        # ── Fetch W×W sub-grid for each sample (HBM path) ───────────────────
-        # Use params_storage.shape[-1] (local feature count) rather than
-        # self.hidden_dim (global count).  When the pool is feature-sharded
-        # across tp chips, params_storage is (rows, cols, hidden_dim/tp) on
-        # each chip.  Slicing with the local size avoids an implicit all-gather
-        # before the dynamic_slice; XLA GSPMD inserts a small all-gather on the
-        # (B, local_D) aggregated output instead (much cheaper).
-        local_D = self.params_storage.shape[-1]
-
-        def fetch_window(r_s, c_s):
-            # Slice a (W, W, local_D) sub-grid starting at (r_s, c_s, 0)
-            return lax.dynamic_slice(
-                self.params_storage, (r_s, c_s, 0), (W, W, local_D)
-            ).astype(jnp.bfloat16)                                    # (W, W, local_D)
-
-        windows = jax.vmap(fetch_window)(r_start, c_start)           # (B, W, W, D)
-
-        aggregated, flat_start = self._weight_and_aggregate(
-            windows, r_start, c_start, r_center, c_center, sigma
+        # Route through the fused Pallas kernel: avoids materialising the
+        # (B, W, W, D) windows buffer and the (B, W, W) Gaussian weight matrix.
+        # Falls back to pure JAX on non-TPU backends automatically.
+        aggregated = pool_retrieve_2d_pallas(
+            self.params_storage,
+            r_start, c_start,
+            r_center.astype(jnp.float32),
+            c_center.astype(jnp.float32),
+            sigma.astype(jnp.float32),
+            W=W, R=R, C=C,
         )
+        flat_start = r_start * C + c_start
         return aggregated, flat_start
 
     # ── Super-window helpers for 2D pool (Opt-2 support) ─────────────────────
@@ -417,29 +401,53 @@ class CoordinateMassivePool2D(nn.Module):
     def _weight_and_aggregate(
         self, windows, r_start, c_start, r_center, c_center, sigma
     ):
-        """Apply 2D Gaussian weights over a (B, W, W, D) window tensor."""
+        """Apply 2D Gaussian weights over a (B, W, W, D) window tensor.
+
+        NOTE: this path is only reached by the super-window variants
+        (__call_from_super_window_2d__) where the window is already in SRAM.
+        The standard __call__ path is routed through pool_retrieve_2d_pallas
+        which skips materialising the (B, W, W, D) buffer entirely.
+        """
         W = self.window_size
         C = self.cols
 
-        r_idx  = jnp.arange(W)[None, :] + r_start[:, None]         # (B, W)
-        c_idx  = jnp.arange(W)[None, :] + c_start[:, None]         # (B, W)
+        r_idx  = jnp.arange(W)[None, :] + r_start[:, None]
+        c_idx  = jnp.arange(W)[None, :] + c_start[:, None]
 
-        r_dist = r_idx - r_center[:, None]                           # (B, W)
-        c_dist = c_idx - c_center[:, None]                           # (B, W)
+        r_dist = r_idx - r_center[:, None]
+        c_dist = c_idx - c_center[:, None]
 
         sigma_sq = (sigma + 1e-6) ** 2
-        r_w = jnp.exp(-r_dist ** 2 / (2 * sigma_sq[:, None]))       # (B, W)
-        c_w = jnp.exp(-c_dist ** 2 / (2 * sigma_sq[:, None]))       # (B, W)
+        r_w = jnp.exp(-r_dist ** 2 / (2 * sigma_sq[:, None]))
+        c_w = jnp.exp(-c_dist ** 2 / (2 * sigma_sq[:, None]))
 
-        # Outer product → 2D weight matrix
-        w_2d = jnp.einsum("bi,bj->bij", r_w, c_w) + 1e-6            # (B, W, W)
+        w_2d = jnp.einsum("bi,bj->bij", r_w, c_w) + 1e-6
         w_2d = w_2d / jnp.sum(w_2d, axis=(-2, -1), keepdims=True)
 
-        # Weighted sum — cast windows to float32 for numerical precision
         aggregated = jnp.einsum(
             "bij,bijd->bd", w_2d, windows.astype(jnp.float32)
-        )                                                             # (B, D)
+        )
 
-        # Flat index for sparse Adam
-        flat_start = r_start * C + c_start                           # (B,)
+        flat_start = r_start * C + c_start
+        return aggregated, flat_start
+
+    def _retrieve_2d(self, mu_row, mu_col, sigma):
+        """Fused 2-D retrieve via Pallas kernel (used by __call__)."""
+        R, C = self.rows, self.cols
+        W    = self.window_size
+
+        r_center = mu_row * (R - 1)
+        c_center = mu_col * (C - 1)
+        r_start  = jnp.clip(r_center - W // 2, 0, R - W).astype(jnp.int32)
+        c_start  = jnp.clip(c_center - W // 2, 0, C - W).astype(jnp.int32)
+
+        aggregated = pool_retrieve_2d_pallas(
+            self.params_storage,
+            r_start, c_start,
+            r_center.astype(jnp.float32),
+            c_center.astype(jnp.float32),
+            sigma.astype(jnp.float32),
+            W=W, R=R, C=C,
+        )
+        flat_start = r_start * C + c_start
         return aggregated, flat_start

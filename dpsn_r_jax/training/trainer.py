@@ -8,6 +8,7 @@ import flax.core as core
 from typing import Any, Callable
 from dpsn_r_jax.models.dpsnr import DPSNR
 from dpsn_r_jax.training.sparse_adam import sparse_adam_update
+from dpsn_r_jax.kernels import sparse_adam_pallas
 
 
 class TrainState(train_state.TrainState):
@@ -189,11 +190,13 @@ def _apply_optimizer_update(state, grads, indices, new_rng, current_lr):
         v_slice = pool_v_flat[safe_indices]
 
         pool_grad_norm  = jnp.sqrt(jnp.sum(pool_grads ** 2) + 1e-9)
-        pool_grad_scale = jnp.minimum(1.0, 1.0 / pool_grad_norm)
-        clipped_g_slice = g_slice * pool_grad_scale
+        pool_grad_scale = jnp.minimum(jnp.float32(1.0), jnp.float32(1.0) / pool_grad_norm)
 
-        new_p_s, new_m_s, new_v_s = sparse_adam_update(
-            p_slice, clipped_g_slice, m_slice, v_slice, state.step + 1, lr=current_lr
+        new_p_s, new_m_s, new_v_s = sparse_adam_pallas(
+            p_slice, g_slice, m_slice, v_slice,
+            lr=current_lr,
+            step=state.step + 1,
+            grad_scale=pool_grad_scale,
         )
 
         # Cast back to the pool's native dtype (bfloat16 after Opt-1) before
