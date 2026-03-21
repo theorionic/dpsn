@@ -857,8 +857,10 @@ def main():
             last_batch = batch   # save for component timing
             dispatch_start_time = time.time()
 
-            current_lr_val = jnp.float32(lr_schedule(global_step))
-            sigma_scale_val = jnp.float32(sigma_anneal_fn(global_step))
+            # .astype() stays on-device — no D2H sync.
+            # jnp.float32(jax_scalar) calls __float__ → np.asarray → D2H stall.
+            current_lr_val = lr_schedule(global_step).astype(jnp.float32)
+            sigma_scale_val = sigma_anneal_fn(global_step).astype(jnp.float32)
 
             if _grad_accum > 1:
                 # ── Gradient accumulation path ────────────────────────────────
