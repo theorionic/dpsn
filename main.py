@@ -1,5 +1,7 @@
 import argparse
 import os
+import signal
+import sys
 import time
 import warnings
 
@@ -900,6 +902,9 @@ def main():
         _timing_compiled = False   # skip first timing call (includes JIT compile)
 
         for step in range(steps_per_epoch):
+            if _stop_requested[0]:
+                break
+
             if args.max_steps and global_step >= args.max_steps:
                 print(f"Reached max_steps ({args.max_steps}). Stopping training.")
                 hit_max_steps = True
@@ -1216,6 +1221,18 @@ def main():
 
         return state, global_step, epoch_loss, start_time, total_data_wait_time_interval, hit_max_steps
 
+    # ── Graceful interrupt handler ────────────────────────────────────────────
+    # Ctrl+C sets the flag; the inner step loop checks it and breaks cleanly,
+    # letting the current JAX dispatch finish before we save the checkpoint.
+    _stop_requested = [False]
+
+    def _sigint_handler(signum, frame):
+        if not _stop_requested[0]:
+            print("\n[Interrupted] Ctrl+C received — finishing current step then saving checkpoint...")
+            _stop_requested[0] = True
+
+    signal.signal(signal.SIGINT, _sigint_handler)
+
     start_time = time.time()
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1288,10 +1305,10 @@ def main():
                 del pipeline, bg_source, grain_source, single_loader
                 gc.collect()
 
-                if hit_max_steps:
+                if hit_max_steps or _stop_requested[0]:
                     break
 
-            if hit_max_steps:
+            if hit_max_steps or _stop_requested[0]:
                 break
 
             if epoch_steps > 0:
@@ -1319,7 +1336,7 @@ def main():
                 )
             )
 
-            if hit_max_steps:
+            if hit_max_steps or _stop_requested[0]:
                 break
 
             avg_loss = epoch_loss / steps_per_epoch
@@ -1340,6 +1357,17 @@ def main():
             _inner = getattr(dataset, 'data_source', dataset)
             if hasattr(_inner, 'stop'):
                 _inner.stop()
+
+    # ── Interrupted: save checkpoint and exit cleanly ─────────────────────────
+    if _stop_requested[0]:
+        if checkpoint_manager:
+            print(f"[Interrupted] Saving checkpoint at step {global_step}...")
+            checkpoint_manager.save(global_step, state)
+            print(f"[Interrupted] Checkpoint saved. Exiting.")
+        else:
+            print("[Interrupted] No checkpoint_dir configured — checkpoint not saved. Exiting.")
+        writer.close()
+        sys.exit(0)
 
     # Generation Test
     print("\nVerifying model generation...")
