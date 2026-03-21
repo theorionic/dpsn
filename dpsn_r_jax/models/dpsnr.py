@@ -227,10 +227,6 @@ class DPSNR(nn.Module):
             # 'i' is a JAX traced scalar — use jax.debug.print to show it in console.
             # ctimer.mark fires once per scan iteration.
             ctimer.mark("03_iter_start", s_hidden)
-            jax.debug.print(
-                "[ReasoningLoop] ── iter={i} ── (jax.debug.print works inside lax.scan)",
-                i=i,
-            )
 
             # ── 1. Multi-head indexing with runtime sigma scale ─────────────
             with jax.profiler.TraceAnnotation("LearnedIndexer_Forward"):
