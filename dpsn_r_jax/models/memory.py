@@ -303,10 +303,8 @@ class CoordinateMassivePool2D(nn.Module):
             aggregated:   (B, D)  weighted knowledge vector
             flat_indices: (B,)    flattened window start index (for sparse Adam)
         """
-        B   = mu_row.shape[0]
         R   = self.rows
         C   = self.cols
-        D   = self.hidden_dim
         W   = self.window_size    # window half-size per axis
 
         # ── Row axis ──────────────────────────────────────────────────────────
@@ -318,11 +316,19 @@ class CoordinateMassivePool2D(nn.Module):
         c_start  = jnp.clip(c_center - W // 2, 0, C - W).astype(jnp.int32)
 
         # ── Fetch W×W sub-grid for each sample (HBM path) ───────────────────
+        # Use params_storage.shape[-1] (local feature count) rather than
+        # self.hidden_dim (global count).  When the pool is feature-sharded
+        # across tp chips, params_storage is (rows, cols, hidden_dim/tp) on
+        # each chip.  Slicing with the local size avoids an implicit all-gather
+        # before the dynamic_slice; XLA GSPMD inserts a small all-gather on the
+        # (B, local_D) aggregated output instead (much cheaper).
+        local_D = self.params_storage.shape[-1]
+
         def fetch_window(r_s, c_s):
-            # Slice a (W, W, D) sub-grid starting at (r_s, c_s, 0)
+            # Slice a (W, W, local_D) sub-grid starting at (r_s, c_s, 0)
             return lax.dynamic_slice(
-                self.params_storage, (r_s, c_s, 0), (W, W, D)
-            ).astype(jnp.bfloat16)                                    # (W, W, D)
+                self.params_storage, (r_s, c_s, 0), (W, W, local_D)
+            ).astype(jnp.bfloat16)                                    # (W, W, local_D)
 
         windows = jax.vmap(fetch_window)(r_start, c_start)           # (B, W, W, D)
 
@@ -347,7 +353,6 @@ class CoordinateMassivePool2D(nn.Module):
         """
         R   = self.rows
         C   = self.cols
-        D   = self.hidden_dim
         W   = self.window_size
         SW  = W * super_window_factor
 
@@ -356,9 +361,11 @@ class CoordinateMassivePool2D(nn.Module):
         sw_r_start = jnp.clip(r_center - SW // 2, 0, R - SW).astype(jnp.int32)
         sw_c_start = jnp.clip(c_center - SW // 2, 0, C - SW).astype(jnp.int32)
 
+        local_D = self.params_storage.shape[-1]  # hidden_dim / tp_size on feature-sharded pool
+
         def _fetch(r_s, c_s):
             return lax.dynamic_slice(
-                self.params_storage, (r_s, c_s, 0), (SW, SW, D)
+                self.params_storage, (r_s, c_s, 0), (SW, SW, local_D)
             ).astype(jnp.bfloat16)
 
         super_window = jax.vmap(_fetch)(sw_r_start, sw_c_start)  # (B, SW, SW, D)

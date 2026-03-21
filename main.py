@@ -272,6 +272,20 @@ def main():
         help="Print component breakdown every N steps (default: same as LOG_INTERVAL=200).",
     )
     parser.add_argument(
+        "--tp_size",
+        type=int,
+        default=1,
+        help=(
+            "Tensor-parallel size for pool feature sharding. "
+            "Must divide device_count evenly. "
+            "tp_size=1 (default): 1-D data-parallel mesh, original behaviour. "
+            "tp_size=4 on v5e-8: 2×4 mesh (dp=2, tp=4) — pool features split "
+            "4-way across TP chips, batch split 2-way across DP groups. "
+            "Eliminates the 1.2 GB pool all-gather in the forward pass and "
+            "reduces pool gradient all-reduce from 1.2 GB → 300 MB."
+        ),
+    )
+    parser.add_argument(
         "--xla_cache_dir",
         type=str,
         default=None,
@@ -333,13 +347,38 @@ def main():
         config.loss_chunk_size = args.loss_chunk_size
 
     # Create device mesh - handles 1 to N devices automatically
-    devices = mesh_utils.create_device_mesh((jax.device_count(),))
-    # We use 'data' axis for data parallelism and 'pool' axis for model parallelism of the pool
-    # Since we have a 1D mesh, we map 'data' to the single axis
-    # For complex setups on 2D meshes (e.g. 4x8), this would need adjustment,
-    # but for 1D array of devices, we use the single axis for both or mix them.
-    # Here we define a single axis name 'shard'.
-    mesh = Mesh(devices, axis_names=("shard",))
+    _tp_size = args.tp_size
+    _n_dev   = jax.device_count()
+    assert _n_dev % _tp_size == 0, (
+        f"--tp_size {_tp_size} must divide device_count {_n_dev} evenly."
+    )
+    _dp_size = _n_dev // _tp_size
+
+    if _tp_size == 1:
+        # ── 1-D mesh (original behaviour) ────────────────────────────────────
+        # Single "shard" axis used for data parallelism.
+        # Pool params are row-sharded along "shard".
+        devices = mesh_utils.create_device_mesh((_n_dev,))
+        mesh = Mesh(devices, axis_names=("shard",))
+        _dp_axis = "shard"   # batch sharding axis
+        _tp_axis = "shard"   # pool feature sharding axis (same → row-shard)
+        _pool_spec_fn = lambda ndim: PartitionSpec(*("shard",) + (None,) * (ndim - 1))
+    else:
+        # ── 2-D mesh (dp × tp) ───────────────────────────────────────────────
+        # dp axis: data parallelism (batch split).
+        # tp axis: tensor/feature parallelism for pool (feature-dim split).
+        #
+        # Example for v5e-8 with --tp_size 4:
+        #   mesh shape (2, 4) → dp=2, tp=4
+        #   batch=24 → 12 samples per dp group
+        #   pool bf16[768,768,1024] → 768×768×256 per tp chip (300 MB vs 1.2 GB)
+        #   pool forward: each chip slices its 256-feature sub-block — no all-gather
+        #   pool grad all-reduce: 300 MB within dp group (vs 1.2 GB with 1-D mesh)
+        devices = mesh_utils.create_device_mesh((_tp_size, _dp_size))
+        mesh = Mesh(devices, axis_names=("tp", "dp"))
+        _dp_axis = "dp"
+        _tp_axis = "tp"
+        _pool_spec_fn = lambda ndim: PartitionSpec(*((None,) * (ndim - 1) + ("tp",)))
 
     # Register the mesh so FlashCausalSelfAttention can wrap splash_attention
     # in shard_map for multi-device TPU runs (avoids GSPMD auto-partition error).
@@ -351,46 +390,56 @@ def main():
     # 2. Pool Params: Split along 'shard' axis (Model Parallelism)
     # 3. Other Params: Replicated (None)
 
-    batch_sharding = NamedSharding(mesh, PartitionSpec("shard", None))
+    batch_sharding = NamedSharding(mesh, PartitionSpec(_dp_axis, None))
     replicated_sharding = NamedSharding(mesh, PartitionSpec())
 
     def get_sharding_rule(path, param):
         """
         Determines where a parameter should live based on its path in the PyTree.
-        path: tuple of strings (e.g., ('params', 'pool', 'vectors'))
-        param: the actual parameter array (for shape inspection if needed)
 
-        Strategy (Bug #2 Fix):
-          - Pool params → sharded across chips (model parallelism needed to break VRAM wall).
-          - Everything else → REPLICATED on every chip.
+        Strategy:
+          tp_size=1 (1-D mesh, "shard"):
+            Pool → row-sharded PartitionSpec("shard", None, None)
+            Rest → replicated
 
-        Rationale: The TinyController is small (<350 M params).  Sharding its dense
-        layers across 8 chips (FSDP/ZeRO-3) forces XLA to insert an AllGather before
-        EVERY matrix multiply on the forward pass AND an AllGather+ReduceScatter on the
-        backward pass.  On a small model the ICI latency of those collectives completely
-        dominates the tiny compute savings, tanking throughput.  Replicating the
-        Controller avoids all inter-chip communication for dense ops while still
-        sharding the massive pool across HBM.
+          tp_size>1 (2-D mesh, "dp" × "tp"):
+            Pool → feature-sharded PartitionSpec(None, None, "tp")
+              Each chip holds (rows, cols, hidden_dim/tp_size).
+              lax.dynamic_slice in memory.py uses params_storage.shape[-1]
+              (the local feature count), so no all-gather is needed before
+              the slice.  XLA GSPMD auto-inserts a small all-gather on the
+              (B, local_D) pool output to assemble the full (B, hidden_dim).
+              Pool gradient all-reduce: (rows, cols, hidden_dim/tp_size) within
+              the dp group — tp_size× smaller than the 1-D mesh case.
+            Rest → replicated (controller weights small enough to replicate)
         """
-        # Pool alone is sharded — this is the only thing that needs to break VRAM.
-        # PartitionSpec must match the array rank exactly:
-        #   1D pool: (num_vectors, dim)         → PartitionSpec("shard", None)
-        #   2D pool: (grid_rows, grid_cols, dim) → PartitionSpec("shard", None, None)
-        # Guard: only shard if dim 0 is divisible by the device count, otherwise
-        # replicate (e.g. precise_tiny has a 10×10 pool on 8 devices: 10 % 8 ≠ 0).
         if "pool" in path:
-            n_dev = jax.device_count()
-            if param.shape[0] % n_dev == 0:
-                spec = PartitionSpec(*("shard",) + (None,) * (param.ndim - 1))
+            if _tp_size == 1:
+                # 1-D mesh: shard along first dim (row-sharding), guard divisibility
+                if param.shape[0] % _n_dev == 0:
+                    spec = PartitionSpec(*("shard",) + (None,) * (param.ndim - 1))
+                else:
+                    spec = PartitionSpec(*((None,) * param.ndim))
             else:
-                spec = PartitionSpec(*((None,) * param.ndim))  # fully replicated
+                # 2-D mesh: shard along LAST dim (feature-sharding) on tp axis
+                # Guard: hidden_dim must be divisible by tp_size
+                if param.shape[-1] % _tp_size == 0:
+                    spec = _pool_spec_fn(param.ndim)
+                else:
+                    spec = PartitionSpec(*((None,) * param.ndim))  # fallback replicated
             return NamedSharding(mesh, spec)
 
         # Replicate everything else (Controller, Indexer, ACC, LayerNorm, biases…)
         return replicated_sharding
 
     print(f"Distributed Mesh: {mesh}")
-    print(f"Sharding Strategy: Pool -> Sharded, Rest -> Replicated")
+    if _tp_size == 1:
+        print(f"Sharding Strategy: 1-D mesh — Pool row-sharded, Rest replicated")
+    else:
+        print(
+            f"Sharding Strategy: 2-D mesh dp={_dp_size}×tp={_tp_size} — "
+            f"Pool feature-sharded (last dim / {_tp_size}), Rest replicated"
+        )
 
     if args.hf_dataset:
         config.hf_dataset_name = args.hf_dataset
@@ -505,12 +554,21 @@ def main():
     # one chip and OOM.  Using jit+out_shardings forces XLA to allocate each
     # shard directly on its target device without ever forming the full array.
     _num_shards = jax.device_count()
-    _pool_moment_sharding = NamedSharding(
-        mesh,
-        PartitionSpec(*("shard",) + (None,) * (pool_params.ndim - 1))
-        if pool_params.shape[0] % _num_shards == 0
-        else PartitionSpec(*((None,) * pool_params.ndim))  # replicated: dim0 not divisible
-    )
+    if _tp_size == 1:
+        # 1-D mesh: moments sharded along first dim, same as pool params
+        _moment_spec = (
+            PartitionSpec(*("shard",) + (None,) * (pool_params.ndim - 1))
+            if pool_params.shape[0] % _num_shards == 0
+            else PartitionSpec(*((None,) * pool_params.ndim))
+        )
+    else:
+        # 2-D mesh: moments sharded along last dim (tp axis), same as pool params
+        _moment_spec = (
+            _pool_spec_fn(pool_params.ndim)
+            if pool_params.shape[-1] % _tp_size == 0
+            else PartitionSpec(*((None,) * pool_params.ndim))
+        )
+    _pool_moment_sharding = NamedSharding(mesh, _moment_spec)
     _make_pool_zeros = jax.jit(
         lambda: jnp.zeros(pool_params.shape, dtype=pool_params.dtype),
         out_shardings=_pool_moment_sharding,
@@ -868,27 +926,28 @@ def main():
                 # hands it to the JIT-compiled grad_accum_step.
                 micro_batch_size = args.batch_size // _grad_accum
                 # Stack micro-batches: (accum, micro_B, T)
-                # batch arrives as (B, T) with PartitionSpec("shard", None).
+                # batch arrives as (B, T) sharded along the dp axis.
                 # After reshape to (accum, micro_B, T), dim 0 = accum_steps (e.g. 4)
                 # which is smaller than device count (e.g. 8) → IndivisibleError.
-                # Fix: explicitly reshard so the "shard" axis moves to dim 1
+                # Fix: explicitly reshard so the dp axis moves to dim 1
                 # (the micro-batch dim).  micro_batch_size must be divisible by
-                # device count; the assertion below catches mis-configurations.
+                # dp device count; the assertion below catches mis-configurations.
                 assert micro_batch_size % jax.device_count() == 0, (
                     f"micro_batch_size ({micro_batch_size}) must be divisible by "
                     f"device count ({jax.device_count()}). "
                     f"Increase --batch_size or decrease --grad_accum_steps."
                 )
-                # batch arrives as (B, T) with PartitionSpec("shard", None).
+                # batch arrives sharded along the dp axis.
                 # .reshape() propagates that sharding to the output — dim 0
                 # becomes accum_steps (e.g. 4) which is < device_count (8)
                 # → IndivisibleError even before device_put runs.
-                # Fix: strip the shard axis first (replicate), then reshape,
-                # then place the shard on dim 1 (micro_batch_size, divisible by 8).
+                # Fix: strip the dp axis first (replicate), then reshape,
+                # then place the dp shard on dim 1 (micro_batch_size must be
+                # divisible by dp device count).
                 _batch_rep = jax.device_put(batch, replicated_sharding)
                 micro_batches = jax.device_put(
                     _batch_rep.reshape(_grad_accum, micro_batch_size, config.max_seq_len),
-                    NamedSharding(mesh, PartitionSpec(None, "shard", None)),
+                    NamedSharding(mesh, PartitionSpec(None, _dp_axis, None)),
                 )
                 state, loss, mean_sigma = grad_accum_step(
                     state, micro_batches, current_lr_val, sigma_scale_val,

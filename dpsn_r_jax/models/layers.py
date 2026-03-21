@@ -225,7 +225,12 @@ class FlashCausalSelfAttention(nn.Module):
             )
 
             if _ndev > 1:
-                _axis = _MESH.axis_names[0]
+                # Attention shards along the DATA-PARALLEL axis (batch dim).
+                # On a 1-D mesh axis_names = ("shard",) → _axis = "shard".
+                # On a 2-D mesh axis_names = ("tp", "dp") → _axis = "dp".
+                # We always want the last axis name as the DP axis because
+                # main.py creates 2-D meshes as Mesh(devices, ("tp", "dp")).
+                _axis = _MESH.axis_names[-1]
                 _splash_fn = functools.partial(
                     _shard_map,
                     mesh=_MESH,
