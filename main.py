@@ -253,6 +253,12 @@ def main():
         help="Force synchronizations to print exact ms timings for Fetch, Dispatch, and TPU Execution every step.",
     )
     parser.add_argument(
+        "--log_interval",
+        type=int,
+        default=50,
+        help="Log metrics to TensorBoard and print to stdout every N steps (default: 50).",
+    )
+    parser.add_argument(
         "--profile_components",
         action="store_true",
         help=(
@@ -865,7 +871,7 @@ def main():
             prefetch_depth=_prefetch_depth,
         )
 
-    LOG_INTERVAL = 50   # sync + log every N steps; lower = more block_until_ready stalls
+    LOG_INTERVAL = args.log_interval  # sync + log every N steps; lower = more block_until_ready stalls
     # Component timing: run forward_only_step every TIMING_INTERVAL steps and
     # compare to the avg step time to estimate forward vs backward+optimizer split.
     # Set to 0 to disable.  First run is skipped (includes JIT compilation).
@@ -886,8 +892,9 @@ def main():
         # We only call float() / block_until_ready() inside the LOG_INTERVAL block,
         # keeping the TPU pipeline bubble-free between logging events.
         epoch_loss = jnp.zeros((), dtype=jnp.float32)
-        last_loss = jnp.zeros((), dtype=jnp.float32)   # holds the last step's loss future
-        last_sigma = jnp.zeros((), dtype=jnp.float32)  # holds the last step's mean_sigma future
+        last_loss = jnp.zeros((), dtype=jnp.float32)       # holds the last step's loss future
+        last_sigma = jnp.zeros((), dtype=jnp.float32)      # holds the last step's mean_sigma future
+        last_grad_norm = jnp.zeros((), dtype=jnp.float32)  # holds the last step's pool grad norm
         hit_max_steps = False
         last_batch = None          # saved for component timing
         _timing_compiled = False   # skip first timing call (includes JIT compile)
@@ -949,7 +956,7 @@ def main():
                     _batch_rep.reshape(_grad_accum, micro_batch_size, config.max_seq_len),
                     NamedSharding(mesh, PartitionSpec(None, _dp_axis, None)),
                 )
-                state, loss, mean_sigma = grad_accum_step(
+                state, loss, mean_sigma, pool_grad_norm = grad_accum_step(
                     state, micro_batches, current_lr_val, sigma_scale_val,
                     pad_token_id=config.pad_token_id,
                     precision_loss_weight=getattr(config, 'precision_loss_weight', 0.0),
@@ -960,7 +967,7 @@ def main():
                 )
             else:
                 # ── Standard single-step path ─────────────────────────────────
-                state, loss, mean_sigma = distributed_train_step(
+                state, loss, mean_sigma, pool_grad_norm = distributed_train_step(
                     state, batch, current_lr_val, sigma_scale_val, config.pad_token_id,
                     precision_loss_weight=getattr(config, 'precision_loss_weight', 0.0),
                     sigma_anneal_steps=getattr(config, 'sigma_anneal_steps', 0),
@@ -970,9 +977,10 @@ def main():
 
             # Bug #1 Fix: append JAX futures — NO float() / .item() here!
             # These are enqueued as async device operations; the TPU keeps running.
-            epoch_loss = epoch_loss + loss
-            last_loss  = loss
-            last_sigma = mean_sigma
+            epoch_loss     = epoch_loss + loss
+            last_loss      = loss
+            last_sigma     = mean_sigma
+            last_grad_norm = pool_grad_norm
             dispatch_time = time.time() - dispatch_start_time
 
             # ── Detailed per-step timing breakdown (--profile_detailed) ──────
@@ -1053,6 +1061,7 @@ def main():
                 ppl_val   = float(jnp.exp(last_loss))
                 sigma_scale_val = float(sigma_anneal_fn(global_step))
                 current_lr = float(lr_schedule(global_step))
+                grad_norm_val = float(last_grad_norm)
 
                 writer.add_scalar("Loss/train", loss_val, global_step)
                 writer.add_scalar("PPL/train", ppl_val, global_step)
@@ -1063,12 +1072,26 @@ def main():
                 writer.add_scalar("Perf/SPS", steps_per_sec, global_step)
                 writer.add_scalar("Perf/TFLOPS", tflops, global_step)
                 writer.add_scalar("Perf/DataWaitTime_s", avg_data_wait, global_step)
+                writer.add_scalar("GradNorm/pool", grad_norm_val, global_step)
+
+                # TPU memory utilization — aggregate across all devices
+                _mem_in_use = _mem_limit = 0
+                for _dev in jax.devices():
+                    try:
+                        _ms = _dev.memory_stats()
+                        _mem_in_use += _ms.get("bytes_in_use", 0)
+                        _mem_limit   += _ms.get("bytes_limit", 0)
+                    except Exception:
+                        pass
+                if _mem_limit > 0:
+                    writer.add_scalar("HW/TPU_mem_pct", _mem_in_use / _mem_limit * 100, global_step)
+                    writer.add_scalar("HW/TPU_mem_GB",  _mem_in_use / 1e9, global_step)
 
                 precision_tag = "broad" if sigma_val > 1.0 else ("precise" if sigma_val < 0.1 else "narrowing")
                 print(
                     f"{file_label}Epoch {epoch + 1} | Step {step} | Global Step {global_step} | "
                     f"Loss: {loss_val:.4f} | PPL: {ppl_val:.4f} | LR: {current_lr:.2e} | "
-                    f"sigma={sigma_val:.3f} ({precision_tag}) | "
+                    f"sigma={sigma_val:.3f} ({precision_tag}) | GradNorm: {grad_norm_val:.4f} | "
                     f"TPS: {tokens_per_sec:.0f} | SPS: {steps_per_sec:.3f} | "
                     f"TFLOPS: {tflops:.4f} | DataWait: {avg_data_wait:.3f}s"
                 )

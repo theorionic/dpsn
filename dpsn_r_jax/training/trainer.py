@@ -212,7 +212,7 @@ def _apply_optimizer_update(state, grads, indices, new_rng, current_lr):
     new_flat_params[pool_key] = new_pool_params
     new_params                = traverse_util.unflatten_dict(new_flat_params)
 
-    return state.replace(
+    new_state = state.replace(
         step=state.step + 1,
         params=new_params,
         opt_state=new_opt_state,
@@ -220,6 +220,7 @@ def _apply_optimizer_update(state, grads, indices, new_rng, current_lr):
         pool_v=new_pool_v,
         rng=new_rng,
     )
+    return new_state, pool_grad_norm
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -299,8 +300,8 @@ def train_step(
             loss_fn, has_aux=True
         )(state.params)
 
-    new_state = _apply_optimizer_update(state, grads, indices, new_rng, current_lr)
-    return new_state, loss, mean_sigma
+    new_state, pool_grad_norm = _apply_optimizer_update(state, grads, indices, new_rng, current_lr)
+    return new_state, loss, mean_sigma, pool_grad_norm
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -429,8 +430,8 @@ def grad_accum_step(
     # flatten indices from (grad_accum_steps, micro_B, max_loops) to (B, max_loops)
     all_indices = jnp.reshape(all_indices, (-1, all_indices.shape[-1]))
 
-    new_state = _apply_optimizer_update(state, avg_grads, all_indices, new_rng, current_lr)
-    return new_state, avg_loss, avg_sigma
+    new_state, pool_grad_norm = _apply_optimizer_update(state, avg_grads, all_indices, new_rng, current_lr)
+    return new_state, avg_loss, avg_sigma, pool_grad_norm
 
 
 # ─────────────────────────────────────────────────────────────────────────────
