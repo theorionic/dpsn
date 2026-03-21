@@ -1,4 +1,3 @@
-import jax
 import jax.numpy as jnp
 import flax.linen as nn
 from dpsn_r_jax.config import DPSNRConfig
@@ -20,63 +19,32 @@ class TinyController(nn.Module):
         ff_dim = int(
             self.config.controller_hidden_dim * self.config.controller_ff_multiplier
         )
-        # Flax remat counts the module instance as arg 0, so:
-        #   arg 0 = module instance
-        #   arg 1 = x  (JAX array — traced normally)
-        #   arg 2 = deterministic  (Python bool — must be static)
-        # Without static_argnums=(2,), deterministic becomes a JAX tracer
-        # and `if not deterministic:` raises TracerBoolConversionError.
-        #
-        # dots_saveable policy: during remat, save only the outputs of matmuls
-        # (QKV projection, FFN dense, etc.) rather than all intermediate
-        # activations.  This avoids saving the large (B, T, D) tensors at
-        # every sub-operation, cutting HBM traffic by ~3–4× vs plain remat.
-        #
-        # controller_checkpoint_interval: checkpoint every N-th layer instead
-        # of every layer.  With interval=4 on 24 layers we checkpoint layers
-        # 0, 4, 8, 12, 16, 20 — the 6 boundary layers still save activations,
-        # while the 18 inner layers recompute freely.  This is 6× fewer HBM
-        # write/read round-trips per backward pass at the cost of ~10% more
-        # peak activation memory (inner layers kept live until the boundary).
+        layer_cls = TinyTransformerLayer
         if self.config.gradient_checkpointing:
-            interval = getattr(self.config, "controller_checkpoint_interval", 1)
-            remated_cls = nn.remat(
-                TinyTransformerLayer,
-                static_argnums=(2,),
-                policy=jax.checkpoint_policies.dots_saveable,
+            # Flax remat counts the module instance as arg 0, so:
+            #   arg 0 = module instance
+            #   arg 1 = x  (JAX array — traced normally)
+            #   arg 2 = deterministic  (Python bool — must be static)
+            # Without static_argnums=(2,), deterministic becomes a JAX tracer
+            # and `if not deterministic:` raises TracerBoolConversionError.
+            #
+            # No checkpoint policy: remat saves only the layer input
+            # (f32[B,T,D] = 64MB per layer) and recomputes all intermediates.
+            # dots_saveable was tried but saves matmul outputs instead (e.g.
+            # f32[B,T,4096] FFN intermediate = 256MB) — 4× more HBM, not less.
+            layer_cls = nn.remat(TinyTransformerLayer, static_argnums=(2,))
+
+        self.layers = [
+            layer_cls(
+                self.config.controller_hidden_dim,
+                self.config.controller_num_heads,
+                ff_dim,
+                self.config.dropout,
+                self.config.use_flash_attention,
+                self.config.attn_window_size,
             )
-            self.layers = [
-                remated_cls(
-                    self.config.controller_hidden_dim,
-                    self.config.controller_num_heads,
-                    ff_dim,
-                    self.config.dropout,
-                    self.config.use_flash_attention,
-                    self.config.attn_window_size,
-                )
-                if i % interval == 0
-                else TinyTransformerLayer(
-                    self.config.controller_hidden_dim,
-                    self.config.controller_num_heads,
-                    ff_dim,
-                    self.config.dropout,
-                    self.config.use_flash_attention,
-                    self.config.attn_window_size,
-                )
-                for i in range(self.config.controller_num_layers)
-            ]
-        else:
-            self.layers = [
-                TinyTransformerLayer(
-                    self.config.controller_hidden_dim,
-                    self.config.controller_num_heads,
-                    ff_dim,
-                    self.config.dropout,
-                    self.config.use_flash_attention,
-                    self.config.attn_window_size,
-                )
-                for _ in range(self.config.controller_num_layers)
-            ]
+            for _ in range(self.config.controller_num_layers)
+        ]
 
         # Output head
         self.final_norm = nn.LayerNorm()

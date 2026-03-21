@@ -108,15 +108,6 @@ class DPSNRConfig:
     # weight is linearly ramped from 0 → precision_loss_weight over sigma_anneal_steps.
     precision_loss_weight: float = 0.0
 
-    # ── Gradient Checkpointing granularity ────────────────────────────────
-    # Checkpoint every N controller layers instead of every layer.
-    # N=1 (default): every layer is rematerialised — maximum memory savings,
-    #   but causes 24 HBM read/write round-trips per backward pass.
-    # N=4: only layers 0,4,8,… are checkpointed — 6× fewer activations saved,
-    #   trading ~10% more peak memory for far less HBM traffic.
-    # Set to 1 to revert to the original behaviour.
-    controller_checkpoint_interval: int = 1
-
     # ── Splash Attention (Pallas TPU kernel) ───────────────────────────────
     # When True, FlashCausalSelfAttention uses splash_attention (Pallas TPU)
     # instead of Flax's nn.dot_product_attention.
@@ -360,7 +351,6 @@ def get_model_config(name: str) -> DPSNRConfig:
             loss_chunk_size=128,
             use_flash_attention=True,
             pool_super_window_factor=2,
-            controller_checkpoint_interval=4,
             learning_rate=1e-4,
         )
 
