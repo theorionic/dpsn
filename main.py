@@ -865,7 +865,7 @@ def main():
             prefetch_depth=_prefetch_depth,
         )
 
-    LOG_INTERVAL = 200  # sync + log every N steps; lower = more block_until_ready stalls
+    LOG_INTERVAL = 50   # sync + log every N steps; lower = more block_until_ready stalls
     # Component timing: run forward_only_step every TIMING_INTERVAL steps and
     # compare to the avg step time to estimate forward vs backward+optimizer split.
     # Set to 0 to disable.  First run is skipped (includes JIT compilation).
@@ -1043,7 +1043,8 @@ def main():
 
                 active_tpu_time = max(0.0001, avg_step_time - avg_data_wait)
 
-                tokens_per_sec = (args.batch_size * config.max_seq_len) / avg_step_time
+                tokens_per_sec  = (args.batch_size * config.max_seq_len) / avg_step_time
+                steps_per_sec   = 1.0 / avg_step_time
                 tflops = flops_per_step / active_tpu_time / 1e12
 
                 # All float() calls happen AFTER block_until_ready — single sync point
@@ -1059,6 +1060,7 @@ def main():
                 writer.add_scalar("Routing/mean_sigma", sigma_val, global_step)
                 writer.add_scalar("Routing/sigma_scale", sigma_scale_val, global_step)
                 writer.add_scalar("Perf/TPS", tokens_per_sec, global_step)
+                writer.add_scalar("Perf/SPS", steps_per_sec, global_step)
                 writer.add_scalar("Perf/TFLOPS", tflops, global_step)
                 writer.add_scalar("Perf/DataWaitTime_s", avg_data_wait, global_step)
 
@@ -1067,7 +1069,8 @@ def main():
                     f"{file_label}Epoch {epoch + 1} | Step {step} | Global Step {global_step} | "
                     f"Loss: {loss_val:.4f} | PPL: {ppl_val:.4f} | LR: {current_lr:.2e} | "
                     f"sigma={sigma_val:.3f} ({precision_tag}) | "
-                    f"TPS: {tokens_per_sec:.0f} | TFLOPS: {tflops:.4f} | DataWait: {avg_data_wait:.3f}s"
+                    f"TPS: {tokens_per_sec:.0f} | SPS: {steps_per_sec:.3f} | "
+                    f"TFLOPS: {tflops:.4f} | DataWait: {avg_data_wait:.3f}s"
                 )
 
             # ── Component timing: forward vs backward+optimizer split ─────────
