@@ -61,7 +61,23 @@ def _interpret_mode() -> bool:
 
 
 def _use_pallas() -> bool:
-    return _PALLAS_AVAILABLE and (_is_tpu() or _interpret_mode())
+    """Return True only when Pallas kernels are safe to call.
+
+    Mosaic TPU kernels cannot be auto-partitioned by XLA's GSPMD, so they fail
+    inside jit with a multi-chip mesh unless explicitly wrapped in shard_map.
+    We therefore restrict to single-chip TPU by default.
+
+    To enable on multi-chip (after wrapping calls in shard_map yourself):
+        export DPSN_PALLAS_FORCE=1
+    """
+    if _interpret_mode():
+        return _PALLAS_AVAILABLE  # interpret mode always safe (pure Python)
+    if not _PALLAS_AVAILABLE or not _is_tpu():
+        return False
+    # Multi-chip guard: disable unless the user has explicitly opted in.
+    if jax.device_count() > 1 and os.environ.get("DPSN_PALLAS_FORCE", "0") != "1":
+        return False
+    return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
