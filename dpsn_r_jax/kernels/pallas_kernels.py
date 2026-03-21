@@ -276,6 +276,34 @@ def _pool1d_body(
     out_ref[0, :] = agg
 
 
+def _pool1d_pallas_impl(pool, mu, sigma, start_indices, W, Total):
+    """Actual Pallas kernel call (or JAX fallback). No autodiff wrapping."""
+    if not _use_pallas():
+        return _pool1d_jax_fallback(pool, mu, sigma, start_indices, W, Total)
+
+    B, D = mu.shape[0], pool.shape[1]
+    kernel = functools.partial(_pool1d_body, W=W, Total=Total)
+
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((B, D), jnp.float32),
+        grid_spec=pl.GridSpec(
+            grid=(B,),
+            in_specs=[
+                pl.BlockSpec((Total, D), lambda i: (0, 0)),
+                pl.BlockSpec((1,), lambda i: (i,)),
+                pl.BlockSpec((1,), lambda i: (i,)),
+                pl.BlockSpec((1,), lambda i: (i,)),
+            ],
+            out_specs=pl.BlockSpec((1, D), lambda i: (i, 0)),
+        ),
+        interpret=_interpret_mode(),
+    )(pool, start_indices, mu, sigma)
+
+
+# custom_vjp: Pallas runs in the forward pass; pure-JAX VJP in the backward.
+# nondiff_argnums covers W and Total (Python ints — never traced by JAX).
+@functools.partial(jax.custom_vjp, nondiff_argnums=(4, 5))
 def pool_retrieve_1d_pallas(
     pool:          jnp.ndarray,   # (Total, D) bfloat16 — full pool storage
     mu:            jnp.ndarray,   # (B,)       float32  — normalised coordinate
@@ -290,42 +318,29 @@ def pool_retrieve_1d_pallas(
       vmap(dynamic_slice) + gaussian weights + einsum
 
     The intermediate (B, W, D) and (B, W) tensors are never written to HBM.
-
-    Args:
-        pool:          Full pool tensor (stays in HBM; only W×D per sample loaded).
-        mu:            Per-sample pool coordinates in (0, 1).
-        sigma:         Per-sample retrieval bandwidths.
-        start_indices: Pre-computed, clipped window starts (use the same
-                       start_indices that are already computed before this call).
-        W:             Window size — must match the value used to compute starts.
-        Total:         Total number of pool vectors.
-
-    Returns:
-        aggregated (B, D) float32 — the Gaussian-weighted pool retrieval.
+    Supports reverse-mode autodiff via custom_vjp (backward uses pure JAX).
     """
-    if not _use_pallas():
-        return _pool1d_jax_fallback(pool, mu, sigma, start_indices, W, Total)
+    return _pool1d_pallas_impl(pool, mu, sigma, start_indices, W, Total)
 
-    B, D = mu.shape[0], pool.shape[1]
-    kernel = functools.partial(_pool1d_body, W=W, Total=Total)
 
-    result = pl.pallas_call(
-        kernel,
-        out_shape=jax.ShapeDtypeStruct((B, D), jnp.float32),
-        grid_spec=pl.GridSpec(
-            grid=(B,),
-            in_specs=[
-                pl.BlockSpec((Total, D), lambda i: (0, 0)),  # full pool — no partitioning
-                pl.BlockSpec((1,), lambda i: (i,)),          # start for sample i
-                pl.BlockSpec((1,), lambda i: (i,)),          # mu[i]
-                pl.BlockSpec((1,), lambda i: (i,)),          # sigma[i]
-            ],
-            out_specs=pl.BlockSpec((1, D), lambda i: (i, 0)),
-        ),
-        interpret=_interpret_mode(),
-    )(pool, start_indices, mu, sigma)
+def _pool1d_fwd(pool, mu, sigma, start_indices, W, Total):
+    out = _pool1d_pallas_impl(pool, mu, sigma, start_indices, W, Total)
+    return out, (pool, mu, sigma, start_indices)
 
-    return result
+
+def _pool1d_bwd(W, Total, res, g):
+    pool, mu, sigma, start_indices = res
+    # Re-run VJP through the pure-JAX equivalent — correct gradients, no Pallas needed.
+    _, vjp_fn = jax.vjp(
+        lambda p, m, s: _pool1d_jax_fallback(p, m, s, start_indices, W, Total),
+        pool, mu, sigma,
+    )
+    d_pool, d_mu, d_sigma = vjp_fn(g)
+    # start_indices is int32 — no gradient
+    return d_pool, d_mu, d_sigma, jnp.zeros_like(start_indices)
+
+
+pool_retrieve_1d_pallas.defvjp(_pool1d_fwd, _pool1d_bwd)
 
 
 def _pool1d_jax_fallback(pool, mu, sigma, start_indices, W, Total):
@@ -402,6 +417,36 @@ def _pool2d_body(
     out_ref[0, :] = agg
 
 
+def _pool2d_pallas_impl(pool, r_start, c_start, r_center, c_center, sigma, W, R, C):
+    """Actual Pallas kernel call (or JAX fallback). No autodiff wrapping."""
+    if not _use_pallas():
+        return _pool2d_jax_fallback(pool, r_start, c_start, r_center, c_center, sigma, W, C)
+
+    B, D = sigma.shape[0], pool.shape[2]
+    kernel = functools.partial(_pool2d_body, W=W, R=R, C=C)
+
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((B, D), jnp.float32),
+        grid_spec=pl.GridSpec(
+            grid=(B,),
+            in_specs=[
+                pl.BlockSpec((R, C, D), lambda i: (0, 0, 0)),
+                pl.BlockSpec((1,), lambda i: (i,)),
+                pl.BlockSpec((1,), lambda i: (i,)),
+                pl.BlockSpec((1,), lambda i: (i,)),
+                pl.BlockSpec((1,), lambda i: (i,)),
+                pl.BlockSpec((1,), lambda i: (i,)),
+            ],
+            out_specs=pl.BlockSpec((1, D), lambda i: (i, 0)),
+        ),
+        interpret=_interpret_mode(),
+    )(pool, r_start, c_start, r_center, c_center, sigma)
+
+
+# custom_vjp: Pallas forward, pure-JAX backward.
+# nondiff_argnums covers W, R, C (Python ints).
+@functools.partial(jax.custom_vjp, nondiff_argnums=(6, 7, 8))
 def pool_retrieve_2d_pallas(
     pool:     jnp.ndarray,   # (R, C, D)  bfloat16 — full 2-D pool storage
     r_start:  jnp.ndarray,   # (B,)       int32
@@ -420,44 +465,35 @@ def pool_retrieve_2d_pallas(
 
     The (B, W, W, D) windows buffer and the (B, W, W) weight matrix are both
     eliminated — only the (B, D) output is written to HBM.
-
-    Args:
-        pool:     Full 2-D pool tensor (R, C, D).
-        r_start:  Pre-computed row window starts, clipped to [0, R-W].
-        c_start:  Pre-computed col window starts, clipped to [0, C-W].
-        r_center: Continuous row coordinates (mu_row * (R-1)).
-        c_center: Continuous col coordinates (mu_col * (C-1)).
-        sigma:    Retrieval bandwidth (same σ for both axes).
-        W, R, C:  Window size and grid dimensions (static).
-
-    Returns:
-        aggregated (B, D) float32.
+    Supports reverse-mode autodiff via custom_vjp (backward uses pure JAX).
     """
-    if not _use_pallas():
-        return _pool2d_jax_fallback(pool, r_start, c_start, r_center, c_center, sigma, W, C)
+    return _pool2d_pallas_impl(pool, r_start, c_start, r_center, c_center, sigma, W, R, C)
 
-    B, D = sigma.shape[0], pool.shape[2]
-    kernel = functools.partial(_pool2d_body, W=W, R=R, C=C)
 
-    result = pl.pallas_call(
-        kernel,
-        out_shape=jax.ShapeDtypeStruct((B, D), jnp.float32),
-        grid_spec=pl.GridSpec(
-            grid=(B,),
-            in_specs=[
-                pl.BlockSpec((R, C, D), lambda i: (0, 0, 0)),  # full pool
-                pl.BlockSpec((1,), lambda i: (i,)),             # r_start[i]
-                pl.BlockSpec((1,), lambda i: (i,)),             # c_start[i]
-                pl.BlockSpec((1,), lambda i: (i,)),             # r_center[i]
-                pl.BlockSpec((1,), lambda i: (i,)),             # c_center[i]
-                pl.BlockSpec((1,), lambda i: (i,)),             # sigma[i]
-            ],
-            out_specs=pl.BlockSpec((1, D), lambda i: (i, 0)),
-        ),
-        interpret=_interpret_mode(),
-    )(pool, r_start, c_start, r_center, c_center, sigma)
+def _pool2d_fwd(pool, r_start, c_start, r_center, c_center, sigma, W, R, C):
+    out = _pool2d_pallas_impl(pool, r_start, c_start, r_center, c_center, sigma, W, R, C)
+    return out, (pool, r_start, c_start, r_center, c_center, sigma)
 
-    return result
+
+def _pool2d_bwd(W, R, C, res, g):
+    pool, r_start, c_start, r_center, c_center, sigma = res
+    _, vjp_fn = jax.vjp(
+        lambda p, rc, cc, s: _pool2d_jax_fallback(p, r_start, c_start, rc, cc, s, W, C),
+        pool, r_center, c_center, sigma,
+    )
+    d_pool, d_r_center, d_c_center, d_sigma = vjp_fn(g)
+    # r_start / c_start are int32 — no gradient
+    return (
+        d_pool,
+        jnp.zeros_like(r_start),
+        jnp.zeros_like(c_start),
+        d_r_center,
+        d_c_center,
+        d_sigma,
+    )
+
+
+pool_retrieve_2d_pallas.defvjp(_pool2d_fwd, _pool2d_bwd)
 
 
 def _pool2d_jax_fallback(pool, r_start, c_start, r_center, c_center, sigma, W, C):
