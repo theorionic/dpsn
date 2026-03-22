@@ -898,9 +898,6 @@ def main():
             jnp.zeros((args.batch_size, config.max_seq_len), dtype=jnp.int32),
             batch_sharding,
         )
-        _profile_lr    = jnp.float32(config.learning_rate)
-        _profile_sigma = jnp.float32(1.0)
-        _profile_step_fn = train_step  # always use single-step fn for profiling
         print(
             f"\n[MODEL PROFILER] --profile_model enabled\n"
             f"  warmup={args.profile_model_warmup} runs, "
@@ -916,9 +913,6 @@ def main():
             sample_batch=_profile_batch,
             batch_sharding=batch_sharding,
             replicated_sharding=replicated_sharding,
-            train_step_fn=_profile_step_fn,
-            current_lr=_profile_lr,
-            sigma_scale=_profile_sigma,
             warmup=args.profile_model_warmup,
             runs=args.profile_model_runs,
             step=0,

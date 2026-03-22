@@ -379,89 +379,84 @@ def _print_report(results: dict, config, step: int) -> None:
         bar     = "█" * bar_len + "░" * (20 - bar_len) if pct_of else ""
         print(f"  {prefix}{label:<42} {ms:8.1f} ms  {pct_str}  {bar}", flush=True)
 
-    R          = config.max_reasoning_loops
-    train_ms   = (results.get("train_step") or {}).get("median_ms")
-    forward_ms = (results.get("forward")    or {}).get("median_ms")
-    loop_ms    = (results.get("reasoning_loop") or {}).get("median_ms")
-    iter_ms    = (results.get("reasoning_iter") or {}).get("median_ms")
+    R        = config.max_reasoning_loops
+    loop_ms  = (results.get("reasoning_loop") or {}).get("median_ms")
+    iter_ms  = (results.get("reasoning_iter") or {}).get("median_ms")
+    ctrl_ms  = (results.get("controller")     or {}).get("median_ms")
+    dec_ms   = (results.get("decoder")        or {}).get("median_ms")
 
-    bwd_ms = (train_ms - forward_ms) if (train_ms and forward_ms) else None
     scan_overhead_ms = (loop_ms - R * iter_ms) if (loop_ms and iter_ms) else None
+
+    # Use controller + loop + decoder as the denominator for % bars.
+    # This is the forward-pass estimate (full forward OOMs on large configs).
+    fwd_est_ms = sum(x for x in [ctrl_ms, loop_ms, dec_ms] if x)
+    bar_base   = fwd_est_ms if fwd_est_ms > 0 else None
 
     print(f"\n{'═'*W}", flush=True)
     print(f"  DPSNR MODEL PROFILE  —  step={step}", flush=True)
-    print(f"  config: B={config.max_seq_len}, D={config.controller_hidden_dim}, "
+    print(f"  config: T={config.max_seq_len}, D={config.controller_hidden_dim}, "
           f"L={config.controller_num_layers}, R={R}", flush=True)
-    print(f"  Each cell = median over timed runs  "
-          f"(% = fraction of full train_step)", flush=True)
+    print(f"  Each cell = median over {runs} timed runs  "
+          f"(% and bar relative to ctrl+loop+decoder sum)", flush=True)
+    print(f"  NOTE: full forward/train_step not timed — "
+          f"use --timing_interval for fwd/bwd split during training.", flush=True)
     print(f"  {sep}", flush=True)
-    print(f"  {'Component':<42} {'median':>10}  {'% step':>6}  {'bar (20=100%)':>20}",
+    print(f"  {'Component':<44} {'median':>9}  {'% fwd':>6}  {'bar (20=100%)':>20}",
           flush=True)
     print(f"  {sep}", flush=True)
 
-    if results.get("controller"):
-        ctrl_ms = results["controller"]["median_ms"]
-        _row("TinyController (encoder)", ctrl_ms, train_ms)
+    if ctrl_ms:
+        _row("TinyController (encoder)", ctrl_ms, bar_base)
 
     print(f"  {sep}", flush=True)
 
     if loop_ms:
-        _row(f"Reasoning Loop ×{R} (lax.scan total)", loop_ms, train_ms)
+        _row(f"Reasoning Loop ×{R} (lax.scan total)", loop_ms, bar_base)
 
         if results.get("indexer"):
-            # indexer fn includes controller; subtract to get indexer-only
             idx_total_ms = results["indexer"]["median_ms"]
-            idx_ms       = idx_total_ms - ((results.get("controller") or {}).get("median_ms") or 0)
-            idx_ms       = max(idx_ms, 0.1)
-            _row(f"  ├─ LearnedIndexer (×{R} est.)", idx_ms * R, train_ms, indent=1)
+            idx_ms       = max(idx_total_ms - (ctrl_ms or 0), 0.1)
+            _row(f"  ├─ LearnedIndexer (×{R} est.)", idx_ms * R, bar_base, indent=1)
 
         if results.get("pool_retrieve"):
             pool_ms = results["pool_retrieve"]["median_ms"]
-            _row(f"  ├─ Pool retrieve (×{R} est.)",  pool_ms * R, train_ms, indent=1)
+            _row(f"  ├─ Pool retrieve (×{R} est.)",  pool_ms * R, bar_base, indent=1)
 
         if results.get("integrator"):
             integ_ms = results["integrator"]["median_ms"]
-            _row(f"  ├─ Retrieval integrator (×{R} est.)", integ_ms * R, train_ms, indent=1)
+            _row(f"  ├─ Retrieval integrator (×{R} est.)", integ_ms * R, bar_base, indent=1)
 
         if results.get("acc"):
             acc_ms = results["acc"]["median_ms"]
-            _row(f"  ├─ ACC (×{R} est.)", acc_ms * R, train_ms, indent=1)
+            _row(f"  ├─ ACC (×{R} est.)", acc_ms * R, bar_base, indent=1)
 
         if iter_ms:
-            _row(f"  ├─ 1 full iteration (measured)", iter_ms, train_ms, indent=1)
-            _row(f"  ├─ ×{R} iter extrapolated",      iter_ms * R, train_ms, indent=1)
-            if scan_overhead_ms is not None:
-                _row(f"  └─ lax.scan overhead", scan_overhead_ms, train_ms, indent=1)
+            _row(f"  ├─ 1 full iteration (measured)", iter_ms, bar_base, indent=1)
+            _row(f"  ├─ ×{R} iter extrapolated",      iter_ms * R, bar_base, indent=1)
+            if scan_overhead_ms is not None and abs(scan_overhead_ms) > 0.5:
+                _row(f"  └─ lax.scan overhead", scan_overhead_ms, bar_base, indent=1)
 
     print(f"  {sep}", flush=True)
 
-    if results.get("decoder"):
-        dec_ms = results["decoder"]["median_ms"]
-        _row("LM Head Decoder (chunked CE)", dec_ms, train_ms)
+    if dec_ms:
+        _row("LM Head Decoder (chunked CE)", dec_ms, bar_base)
 
     print(f"  {sep}", flush=True)
 
-    if forward_ms:
-        _row("Forward pass total (measured)", forward_ms, train_ms)
-
-    if bwd_ms is not None:
-        _row("Backward + Optimizer (derived)", bwd_ms, train_ms)
-
-    print(f"  {sep}", flush=True)
-
-    if train_ms:
-        _row("FULL TRAIN STEP (wall clock)", train_ms, train_ms)
-        tflops_reported = None
+    if bar_base:
+        _row("Forward estimate (ctrl+loop+dec)", fwd_est_ms, bar_base)
+        print(f"\n  Estimated fwd-only TFLOPS (component sum, not full fwd):", flush=True)
         try:
             from dpsn_r_jax.utils.metrics import calculate_flops
             flops = calculate_flops(config, config.max_seq_len)
-            tflops_reported = flops / (train_ms / 1000.0) / 1e12
+            est_tflops = flops / (fwd_est_ms / 1000.0) / 1e12
+            print(f"    If step ≈ 3× fwd (fwd+bwd+opt): "
+                  f"step_time ≈ {3 * fwd_est_ms:.0f} ms → "
+                  f"~{flops / (3 * fwd_est_ms / 1000.0) / 1e12:.1f} TFLOPS", flush=True)
         except Exception:
             pass
-        if tflops_reported:
-            print(f"\n  Estimated TFLOPS: {tflops_reported:.1f}", flush=True)
 
-    print(f"\n  Timing breakdown (min / median / max) over timed runs:", flush=True)
+    print(f"\n  Timing breakdown (min / median / max) over {runs} runs:", flush=True)
     print(f"  {sep}", flush=True)
     for name, r in results.items():
         if not r:
@@ -483,9 +478,6 @@ def run_model_profile(
     sample_batch,
     batch_sharding,
     replicated_sharding,
-    train_step_fn,
-    current_lr,
-    sigma_scale,
     warmup: int = 3,
     runs:   int = 10,
     step:   int = 0,
@@ -493,22 +485,25 @@ def run_model_profile(
     """
     Run all component benchmarks and print a detailed breakdown table.
 
-    Call this AFTER the model has been JIT-compiled (i.e., after the first
-    training step) so the timing reflects compiled execution, not compilation.
+    Each component is compiled into its own JIT function and timed with
+    jax.block_until_ready — works on multi-device (v5e-8) unlike ctimer.
+
+    The full forward pass and train_step are NOT timed here:
+      - forward: OOMs on large configs (activations don't fit alongside params)
+      - train_step: uses donate_argnums=(0,) which would invalidate state for
+        subsequent training, and the first call includes JIT compilation time.
+    Use --timing_interval to measure forward vs backward split during training.
 
     Args:
         model:               DPSNR model instance.
         state:               Current TrainState (contains params on device).
         config:              DPSNRConfig.
-        sample_batch:        A representative (B, T) int32 batch on host or device.
-        batch_sharding:      NamedSharding for batch dimension.
+        sample_batch:        A representative (B, T) int32 batch (on device).
+        batch_sharding:      NamedSharding for the batch dimension.
         replicated_sharding: NamedSharding for replicated tensors.
-        train_step_fn:       The jit-compiled train_step function.
-        current_lr:          Current learning rate scalar (JAX array).
-        sigma_scale:         Current sigma annealing scale (JAX array).
-        warmup:              Number of warmup runs before timing.
-        runs:                Number of timed runs (median reported).
-        step:                Current training step (for header label).
+        warmup:              Warmup runs before timing (compiled, not counted).
+        runs:                Timed runs per component (median reported).
+        step:                Current training step (for the report header).
     """
     pad_token_id = getattr(config, "pad_token_id", 0)
 
@@ -562,37 +557,6 @@ def run_model_profile(
     _bench("decoder", _build_decoder_fn,
            model, state, sample_batch, config, batch_sharding,
            replicated_sharding, pad_token_id)
-
-    # ── 9. Full forward ───────────────────────────────────────────────────────
-    _bench("forward", _build_forward_fn,
-           model, state, sample_batch, config, batch_sharding)
-
-    # ── 10. Full training step ────────────────────────────────────────────────
-    # NOTE: train_step uses donate_argnums=(0,) so state is donated (invalidated)
-    # after the first call. We only run it once and estimate from the first run.
-    print(f"  [train_step] timing full training step (single run, no repeat — "
-          f"donated state cannot be reused)...", end=" ", flush=True)
-    try:
-        fn, args = _build_train_step_fn(
-            train_step_fn, state, sample_batch,
-            config, batch_sharding, current_lr, sigma_scale,
-        )
-        t0         = time.perf_counter()
-        out        = fn(*args)
-        jax.block_until_ready(out)
-        train_ms   = (time.perf_counter() - t0) * 1000.0
-        results["train_step"] = {
-            "median_ms": train_ms,
-            "mean_ms":   train_ms,
-            "min_ms":    train_ms,
-            "max_ms":    train_ms,
-            "std_ms":    0.0,
-        }
-        print(f"{train_ms:.1f} ms  (single run — donate_argnums invalidates state)",
-              flush=True)
-    except Exception as exc:
-        print(f"FAILED ({exc})", flush=True)
-        results["train_step"] = None
 
     # ── Report ────────────────────────────────────────────────────────────────
     _print_report(results, config, step)
