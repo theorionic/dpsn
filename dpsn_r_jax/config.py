@@ -301,11 +301,11 @@ def get_model_config(name: str) -> DPSNRConfig:
             vocab_size=50304,  # 393 × 128, MXU-aligned
             controller_hidden_dim=768,
             controller_num_layers=12,
-            controller_num_heads=12,
+            controller_num_heads=6,   # head_dim=128 → MXU-aligned (was 12→head_dim=64, 50% MXU waste)
             max_seq_len=4096,
             pool_total_vectors=262144,
             pool_hidden_dim=768,
-            max_reasoning_loops=6,
+            max_reasoning_loops=4,    # reduced from 6 → saves ~33% pool gradient scatter cost
             learning_rate=3e-4,
             attn_window_size=512,
             num_indexer_heads=4,
