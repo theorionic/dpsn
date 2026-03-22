@@ -203,11 +203,15 @@ def _apply_sparse_pool_adam(pool_params, pool_m, pool_v, r_starts, c_starts,
                              grad_slices, lr, step, b1=0.9, b2=0.999, eps=1e-8):
     """Apply sparse Adam updates to pool at specific (r_start, c_start) positions.
 
-    Replaces the previous approach of scattering into an 805 MB gradient array.
-    Instead, reads/writes only the touched W×W×D slices — ~1000× less memory traffic.
+    Vectorized gather → Adam → scatter.  All N events run in parallel:
+      1. vmap(dynamic_slice) — single parallel gather kernel
+      2. batched Adam on (N, W, W, D) arrays — all arithmetic fused
+      3. at[flat_idx].set() — single scatter kernel (last-write-wins for overlaps)
+
+    No serial scan ⇒ XLA can schedule everything as one wave.
 
     Args:
-        pool_params:  (R_pool, C_pool, D) bfloat16
+        pool_params:  (R_pool, C_pool, D)
         pool_m:       (R_pool, C_pool, D) float32 — Adam 1st moment
         pool_v:       (R_pool, C_pool, D) float32 — Adam 2nd moment
         r_starts:     (N,) int32
@@ -215,39 +219,63 @@ def _apply_sparse_pool_adam(pool_params, pool_m, pool_v, r_starts, c_starts,
         grad_slices:  (N, W, W, D) float32
         lr, step, b1, b2, eps: Adam hyperparameters
     """
+    import jax
     from jax import lax
     W = grad_slices.shape[1]
     D = grad_slices.shape[-1]
+    R_pool, C_pool = pool_params.shape[0], pool_params.shape[1]
     pool_dtype = pool_params.dtype
+    m_dtype = pool_m.dtype
+    v_dtype = pool_v.dtype
 
-    def update_one(carry, x):
-        p, m, v = carry
-        r_s, c_s, g = x  # scalar int32, scalar int32, (W, W, D) f32
+    # ── 1. Parallel gather ────────────────────────────────────────────────────
+    gather_fn_p = lambda r, c: lax.dynamic_slice(pool_params, (r, c, 0), (W, W, D))
+    gather_fn_m = lambda r, c: lax.dynamic_slice(pool_m,     (r, c, 0), (W, W, D))
+    gather_fn_v = lambda r, c: lax.dynamic_slice(pool_v,     (r, c, 0), (W, W, D))
 
-        m_dtype = m.dtype
-        v_dtype = v.dtype
+    p_slices = jax.vmap(gather_fn_p)(r_starts, c_starts).astype(jnp.float32)  # (N,W,W,D)
+    m_slices = jax.vmap(gather_fn_m)(r_starts, c_starts).astype(jnp.float32)
+    v_slices = jax.vmap(gather_fn_v)(r_starts, c_starts).astype(jnp.float32)
 
-        p_sl = lax.dynamic_slice(p, (r_s, c_s, 0), (W, W, D)).astype(jnp.float32)
-        m_sl = lax.dynamic_slice(m, (r_s, c_s, 0), (W, W, D)).astype(jnp.float32)
-        v_sl = lax.dynamic_slice(v, (r_s, c_s, 0), (W, W, D)).astype(jnp.float32)
+    # ── 2. Batched Adam on (N, W, W, D) ──────────────────────────────────────
+    step_f = step.astype(jnp.float32)
+    m_new = b1 * m_slices + (1.0 - b1) * grad_slices
+    v_new = b2 * v_slices + (1.0 - b2) * grad_slices ** 2
+    m_hat = m_new / (1.0 - b1 ** step_f)
+    v_hat = v_new / (1.0 - b2 ** step_f)
+    p_new = p_slices - lr * m_hat / (jnp.sqrt(v_hat) + eps)
 
-        m_new = b1 * m_sl + (1.0 - b1) * g
-        v_new = b2 * v_sl + (1.0 - b2) * g ** 2
-        m_hat = m_new / (1.0 - b1 ** step)
-        v_hat = v_new / (1.0 - b2 ** step)
-        p_new = p_sl - lr * m_hat / (jnp.sqrt(v_hat) + eps)
+    # ── 3. Build flat indices for scatter ────────────────────────────────────
+    # Each event covers r_starts[i]:r_starts[i]+W, c_starts[i]:c_starts[i]+W
+    # flat index of pool[r, c, :] = r * C_pool + c  (in the (R*C, D) view)
+    wr = jnp.arange(W, dtype=jnp.int32)  # (W,)
+    wc = jnp.arange(W, dtype=jnp.int32)  # (W,)
+    # row offsets for each event: (N, W)
+    row_offsets = (r_starts[:, None] + wr[None, :]) * C_pool  # (N, W)
+    # col offsets: (N, W)
+    col_offsets = c_starts[:, None] + wc[None, :]              # (N, W)
+    # flat indices: (N, W, W) via broadcasting
+    flat_idx = row_offsets[:, :, None] + col_offsets[:, None, :]  # (N, W, W)
 
-        p = lax.dynamic_update_slice(p, p_new.astype(pool_dtype), (r_s, c_s, 0))
-        m = lax.dynamic_update_slice(m, m_new.astype(m_dtype), (r_s, c_s, 0))
-        v = lax.dynamic_update_slice(v, v_new.astype(v_dtype), (r_s, c_s, 0))
-        return (p, m, v), None
+    flat_idx_1d = flat_idx.reshape(-1)                          # (N*W*W,)
 
-    (pool_params, pool_m, pool_v), _ = lax.scan(
-        update_one,
-        (pool_params, pool_m, pool_v),
-        (r_starts, c_starts, grad_slices),
-    )
-    return pool_params, pool_m, pool_v
+    # ── 4. Scatter back (last-write-wins; overlaps are rare in practice) ─────
+    pool_flat = pool_params.reshape(-1, D)
+    pool_params_new = pool_flat.at[flat_idx_1d].set(
+        p_new.reshape(-1, D).astype(pool_dtype)
+    ).reshape(pool_params.shape)
+
+    m_flat = pool_m.reshape(-1, D)
+    pool_m_new = m_flat.at[flat_idx_1d].set(
+        m_new.reshape(-1, D).astype(m_dtype)
+    ).reshape(pool_m.shape)
+
+    v_flat = pool_v.reshape(-1, D)
+    pool_v_new = v_flat.at[flat_idx_1d].set(
+        v_new.reshape(-1, D).astype(v_dtype)
+    ).reshape(pool_v.shape)
+
+    return pool_params_new, pool_m_new, pool_v_new
 
 
 # ─────────────────────────────────────────────────────────────────────────────
