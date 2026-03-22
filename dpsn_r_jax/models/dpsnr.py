@@ -83,7 +83,7 @@ class DPSNR(nn.Module):
         # ── Timing mark: encode (controller + reasoning loop) starting ────────
         ctimer.mark("00_encode_start", input_ids.astype(jnp.float32))
 
-        state_hidden, all_indices, mean_sigma = self._encode_hidden(
+        state_hidden, all_indices, mean_sigma, _, _, _, _ = self._encode_hidden(
             input_ids, deterministic, sigma_max_scale
         )
 
@@ -94,7 +94,7 @@ class DPSNR(nn.Module):
 
         return logits, (self.config.max_reasoning_loops, all_indices, mean_sigma)
 
-    def encode_to_hidden(self, input_ids, deterministic=True, sigma_max_scale: float = 1.0):
+    def encode_to_hidden(self, input_ids, deterministic=True, sigma_max_scale: float = 1.0, retrieved_probes=None):
         """Run controller + reasoning loop and return state_hidden WITHOUT the LM head.
 
         Used by chunked_lm_loss in trainer.py to avoid materialising the full
@@ -103,17 +103,17 @@ class DPSNR(nn.Module):
 
         Returns:
             state_hidden: (B, T, D)
-            aux:          (max_loops, all_indices, mean_sigma)
+            aux:          (max_loops, all_indices, mean_sigma, all_mu_r, all_mu_c, all_sigma_h, all_start_2d)
         """
-        state_hidden, all_indices, mean_sigma = self._encode_hidden(
-            input_ids, deterministic, sigma_max_scale
+        state_hidden, all_indices, mean_sigma, all_mu_r, all_mu_c, all_sigma_h, all_start_2d = self._encode_hidden(
+            input_ids, deterministic, sigma_max_scale, retrieved_probes=retrieved_probes
         )
-        return state_hidden, (self.config.max_reasoning_loops, all_indices, mean_sigma)
+        return state_hidden, (self.config.max_reasoning_loops, all_indices, mean_sigma, all_mu_r, all_mu_c, all_sigma_h, all_start_2d)
 
-    def _encode_hidden(self, input_ids, deterministic=True, sigma_max_scale: float = 1.0):
+    def _encode_hidden(self, input_ids, deterministic=True, sigma_max_scale: float = 1.0, retrieved_probes=None):
         """Core shared encoder: controller + reasoning loop.
 
-        Returns (state_hidden, all_indices, mean_sigma).
+        Returns (state_hidden, all_indices, mean_sigma, all_mu_r, all_mu_c, all_sigma_h, all_start_2d).
         Called by both __call__ and encode_to_hidden so they share code.
         """
         # 1. Encode
@@ -135,7 +135,12 @@ class DPSNR(nn.Module):
                     hidden, sigma_max_scale
                 )
             ctimer.mark("08_all_reasoning_loops_done", state_hidden)
-            return state_hidden, all_indices, mean_sigma
+            # Dummy pool info — sparse gradient not supported on prefetch path
+            H_dim = max(1, self.config.num_indexer_heads // 2)
+            R = self.config.max_reasoning_loops
+            dummy_f = jnp.zeros((R, B, H_dim), dtype=jnp.float32)
+            dummy_i = jnp.zeros((R, B, H_dim), dtype=jnp.int32)
+            return state_hidden, all_indices, mean_sigma, dummy_f, dummy_f, dummy_f, dummy_i
 
         # ── Original path: per-iteration HBM fetching ─────────────────────────
         state_hidden = hidden
@@ -198,7 +203,7 @@ class DPSNR(nn.Module):
             sw_carry = (init_sw, init_sw_r, init_sw_c)
 
         # ── reasoning_step ────────────────────────────────────────────────────
-        def reasoning_step(carry, i):
+        def reasoning_step(carry, i, retrieved_probes=retrieved_probes):
             if USE_SW:
                 s_hidden, h_prob, h_mask, (sw, sw_r, sw_c) = carry
             else:
@@ -256,6 +261,16 @@ class DPSNR(nn.Module):
 
             retrieved     = jnp.mean(retrieved_all, axis=1)  # (B, D)
             start_indices = start_all.reshape(-1)             # (B*P,)
+
+            # ── Sparse-gradient probe injection ──────────────────────────────────────
+            # When training with sparse pool gradients, retrieved_probes is a (R, B, D)
+            # zero tensor. By differentiating w.r.t. probe, we get ∂loss/∂retrieved
+            # without computing a full (512,512,768) pool gradient tensor.
+            if retrieved_probes is not None:
+                from jax import lax
+                retrieved = retrieved + lax.dynamic_index_in_dim(
+                    retrieved_probes, i, axis=0, keepdims=False
+                )
 
             # ── Timing mark: pool retrieval done ─────────────────────────────
             ctimer.mark("05_pool_retrieval_done", retrieved)
@@ -318,7 +333,7 @@ class DPSNR(nn.Module):
             else:
                 new_carry = (s_hidden, h_prob, new_h_mask)
 
-            return new_carry, (start_indices, mean_sigma_step)
+            return new_carry, (start_indices, mean_sigma_step, mu_r, mu_c, sigma_h, start_all)
 
         # ── Optional gradient checkpointing on reasoning_step ─────────────────
         # The old tracer-leak (TracerBoolConversionError) was because the
@@ -339,7 +354,7 @@ class DPSNR(nn.Module):
         else:
             init_carry = (state_hidden, halt_prob, halted_mask)
 
-        final_carry, (all_indices, sigma_per_loop) = jax.lax.scan(
+        final_carry, (all_indices, sigma_per_loop, all_mu_r, all_mu_c, all_sigma_h, all_start_2d) = jax.lax.scan(
             _scan_fn,
             init_carry,
             jnp.arange(self.config.max_reasoning_loops),
@@ -359,7 +374,7 @@ class DPSNR(nn.Module):
         # mean_sigma averaged across all reasoning loops
         mean_sigma = jnp.mean(sigma_per_loop)
 
-        return state_hidden, all_indices, mean_sigma
+        return state_hidden, all_indices, mean_sigma, all_mu_r, all_mu_c, all_sigma_h, all_start_2d
 
     # ─────────────────────────────────────────────────────────────────────────
     # Prefetch Reasoning path

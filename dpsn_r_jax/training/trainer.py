@@ -16,6 +16,8 @@ class TrainState(train_state.TrainState):
     pool_m: jnp.ndarray
     pool_v: jnp.ndarray
     window_size: int = struct.field(pytree_node=False)
+    max_reasoning_loops: int = struct.field(pytree_node=False)
+    heads_per_dim: int = struct.field(pytree_node=False)
 
 
 def _make_sigma_anneal_fn(sigma_anneal_steps: int, sigma_target_ratio: float):
@@ -72,6 +74,8 @@ def create_train_state(rng, config, learning_rate_fn=None):
         pool_m=pool_m,
         pool_v=pool_v,
         window_size=config.max_k,
+        max_reasoning_loops=config.max_reasoning_loops,
+        heads_per_dim=max(1, config.num_indexer_heads // 2),
         learning_rate_fn=learning_rate_fn,
         sigma_anneal_fn=sigma_anneal_fn,
     )
@@ -135,6 +139,112 @@ def chunked_lm_loss(hidden, labels, decode_fn, pad_token_id, chunk_size):
     )
     # weighted_losses / masks: (n_chunks, B, chunk_size)
     return weighted_losses.sum() / jnp.maximum(masks.sum(), 1.0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sparse pool gradient helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _compute_pool_slice_grads(grad_probe, all_mu_r, all_mu_c, all_sigma_h, all_start_2d, W, R_pool, C_pool):
+    """Compute gradient slices for sparse pool update from probe gradients.
+
+    Args:
+        grad_probe:   (R, B, D)        — ∂loss/∂retrieved per reasoning loop
+        all_mu_r:     (R, B, H_dim)    — normalised row coordinate per head
+        all_mu_c:     (R, B, H_dim)    — normalised col coordinate per head
+        all_sigma_h:  (R, B, H_dim)    — Gaussian bandwidth per head
+        all_start_2d: (R, B, H_dim)    — flat_start = r_start * C + c_start
+        W:            window size per axis (axis_window)
+        R_pool, C_pool: pool grid dimensions
+
+    Returns:
+        all_r_starts:    (N,) int32        where N = R * B * H_dim
+        all_c_starts:    (N,) int32
+        all_grad_slices: (N, W, W, D) f32  gradient for each retrieval event
+    """
+    R_loops, B, H_dim = all_mu_r.shape
+    D = grad_probe.shape[-1]
+
+    all_r_starts = (all_start_2d // C_pool).astype(jnp.int32)   # (R, B, H)
+    all_c_starts = (all_start_2d % C_pool).astype(jnp.int32)    # (R, B, H)
+
+    r_centers = (all_mu_r * (R_pool - 1)).astype(jnp.float32)   # (R, B, H)
+    c_centers = (all_mu_c * (C_pool - 1)).astype(jnp.float32)
+
+    w_arange = jnp.arange(W, dtype=jnp.float32)
+    r_idx = all_r_starts[:, :, :, None].astype(jnp.float32) + w_arange[None, None, None, :]  # (R, B, H, W)
+    c_idx = all_c_starts[:, :, :, None].astype(jnp.float32) + w_arange[None, None, None, :]
+
+    r_dist = r_idx - r_centers[:, :, :, None]
+    c_dist = c_idx - c_centers[:, :, :, None]
+
+    sigma_sq = (all_sigma_h.astype(jnp.float32) + 1e-6) ** 2   # (R, B, H)
+    r_w = jnp.exp(-r_dist ** 2 / (2.0 * sigma_sq[:, :, :, None]))  # (R, B, H, W)
+    c_w = jnp.exp(-c_dist ** 2 / (2.0 * sigma_sq[:, :, :, None]))
+
+    w_2d = jnp.einsum("rbhi,rbhj->rbhij", r_w, c_w)            # (R, B, H, W, W)
+    w_2d = w_2d / (w_2d.sum(axis=(-2, -1), keepdims=True) + 1e-9)
+
+    # ∂loss/∂retrieved_per_head = grad_probe / H_dim  (chain rule through mean)
+    grad_per_head = grad_probe[:, :, None, :].astype(jnp.float32) / jnp.float32(H_dim)  # (R, B, H, D)
+
+    # Pool slice grad: outer product of grad and weights
+    all_grad_slices = jnp.einsum("rbhd,rbhij->rbhijd", grad_per_head, w_2d)  # (R, B, H, W, W, D)
+
+    N = R_loops * B * H_dim
+    return (
+        all_r_starts.reshape(N),
+        all_c_starts.reshape(N),
+        all_grad_slices.reshape(N, W, W, D).astype(jnp.float32),
+    )
+
+
+def _apply_sparse_pool_adam(pool_params, pool_m, pool_v, r_starts, c_starts,
+                             grad_slices, lr, step, b1=0.9, b2=0.999, eps=1e-8):
+    """Apply sparse Adam updates to pool at specific (r_start, c_start) positions.
+
+    Replaces the previous approach of scattering into an 805 MB gradient array.
+    Instead, reads/writes only the touched W×W×D slices — ~1000× less memory traffic.
+
+    Args:
+        pool_params:  (R_pool, C_pool, D) bfloat16
+        pool_m:       (R_pool, C_pool, D) float32 — Adam 1st moment
+        pool_v:       (R_pool, C_pool, D) float32 — Adam 2nd moment
+        r_starts:     (N,) int32
+        c_starts:     (N,) int32
+        grad_slices:  (N, W, W, D) float32
+        lr, step, b1, b2, eps: Adam hyperparameters
+    """
+    from jax import lax
+    W = grad_slices.shape[1]
+    D = grad_slices.shape[-1]
+    pool_dtype = pool_params.dtype
+
+    def update_one(carry, x):
+        p, m, v = carry
+        r_s, c_s, g = x  # scalar int32, scalar int32, (W, W, D) f32
+
+        p_sl = lax.dynamic_slice(p, (r_s, c_s, 0), (W, W, D)).astype(jnp.float32)
+        m_sl = lax.dynamic_slice(m, (r_s, c_s, 0), (W, W, D))
+        v_sl = lax.dynamic_slice(v, (r_s, c_s, 0), (W, W, D))
+
+        m_new = b1 * m_sl + (1.0 - b1) * g
+        v_new = b2 * v_sl + (1.0 - b2) * g ** 2
+        m_hat = m_new / (1.0 - b1 ** step)
+        v_hat = v_new / (1.0 - b2 ** step)
+        p_new = p_sl - lr * m_hat / (jnp.sqrt(v_hat) + eps)
+
+        p = lax.dynamic_update_slice(p, p_new.astype(pool_dtype), (r_s, c_s, 0))
+        m = lax.dynamic_update_slice(m, m_new, (r_s, c_s, 0))
+        v = lax.dynamic_update_slice(v, v_new, (r_s, c_s, 0))
+        return (p, m, v), None
+
+    (pool_params, pool_m, pool_v), _ = lax.scan(
+        update_one,
+        (pool_params, pool_m, pool_v),
+        (r_starts, c_starts, grad_slices),
+    )
+    return pool_params, pool_m, pool_v
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -226,6 +336,48 @@ def _apply_optimizer_update(state, grads, indices, new_rng, current_lr):
     return new_state, pool_grad_norm
 
 
+def _apply_optimizer_update_sparse(state, dense_grads, dense_params, pool_params,
+                                    r_starts, c_starts, grad_slices, new_rng, current_lr):
+    """Dense AdamW on non-pool params + sparse Adam on pool slices only.
+
+    Pool gradient is represented as (N, W, W, D) slices instead of the full
+    (R_pool, C_pool, D) tensor, eliminating ~805 MB of memory traffic per step.
+    """
+    import jax.profiler
+
+    # ── Dense AdamW update ──────────────────────────────────────────────────
+    with jax.profiler.TraceAnnotation("Optimizer_Dense_AdamW"):
+        updates, new_opt_state = state.tx.update(dense_grads, state.opt_state, dense_params)
+        new_dense_params = optax.apply_updates(dense_params, updates)
+
+    # ── Sparse Adam pool update ─────────────────────────────────────────────
+    with jax.profiler.TraceAnnotation("Optimizer_Sparse_Adam_Pool_Slices"):
+        pool_grad_norm = jnp.sqrt(jnp.sum(grad_slices ** 2) + 1e-9)
+
+        new_pool_params, new_pool_m, new_pool_v = _apply_sparse_pool_adam(
+            pool_params, state.pool_m, state.pool_v,
+            r_starts, c_starts, grad_slices,
+            lr=current_lr,
+            step=state.step + 1,
+        )
+
+    # ── Reassemble full params ──────────────────────────────────────────────
+    pool_key = ("pool", "params_storage")
+    new_flat_params = traverse_util.flatten_dict(new_dense_params)
+    new_flat_params[pool_key] = new_pool_params
+    new_params = traverse_util.unflatten_dict(new_flat_params)
+
+    new_state = state.replace(
+        step=state.step + 1,
+        params=new_params,
+        opt_state=new_opt_state,
+        pool_m=new_pool_m,
+        pool_v=new_pool_v,
+        rng=new_rng,
+    )
+    return new_state, pool_grad_norm
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # train_step
 # ─────────────────────────────────────────────────────────────────────────────
@@ -243,7 +395,7 @@ def train_step(
     precision_loss_weight=0.0, sigma_anneal_steps=0,
     use_bf16=False, loss_chunk_size=0,
 ):
-    """Single training step. Returns (new_state, loss, mean_sigma)."""
+    """Single training step with sparse pool gradient updates."""
     print("Compiling train_step for XLA...", flush=True)
     dropout_rng, new_rng = random.split(state.rng)
 
@@ -253,16 +405,42 @@ def train_step(
     else:
         effective_precision_weight = 0.0
 
-    def loss_fn(params):
+    # ── Split params ────────────────────────────────────────────────────────
+    pool_key = ("pool", "params_storage")
+    flat_params = traverse_util.flatten_dict(state.params)
+    pool_params = flat_params[pool_key]
+    dense_flat = {k: v for k, v in flat_params.items() if k != pool_key}
+    dense_params = traverse_util.unflatten_dict(dense_flat)
+    pool_params_stopped = jax.lax.stop_gradient(pool_params)
+
+    R_pool, C_pool, D_pool = pool_params.shape
+    W = state.window_size
+    axis_W = max(2, int(W ** 0.5))
+    R_loops = state.max_reasoning_loops
+    H_dim   = state.heads_per_dim
+
+    B = batch.shape[0]
+    model_dtype = jnp.bfloat16 if use_bf16 else jnp.float32
+    probe = jnp.zeros((R_loops, B, D_pool), dtype=model_dtype)
+
+    def loss_fn(dense_p_and_probe):
+        dense_p, probe_ = dense_p_and_probe
+        new_flat = dict(traverse_util.flatten_dict(dense_p))
+        new_flat[pool_key] = pool_params_stopped
+        full_params = traverse_util.unflatten_dict(new_flat)
+
         compute_params = (
-            jax.tree_util.tree_map(lambda x: x.astype(jnp.bfloat16), params)
-            if use_bf16 else params
+            jax.tree_util.tree_map(lambda x: x.astype(jnp.bfloat16), full_params)
+            if use_bf16 else full_params
         )
+
         if loss_chunk_size > 0:
             with jax.profiler.TraceAnnotation("Forward_encode_to_hidden"):
-                state_hidden, (_, indices, mean_sigma) = state.apply_fn(
+                state_hidden, (_, indices, mean_sigma,
+                               all_mu_r, all_mu_c, all_sigma_h, all_start_2d) = state.apply_fn(
                     {"params": compute_params}, batch,
                     deterministic=False, sigma_max_scale=sigma_scale,
+                    retrieved_probes=probe_,
                     rngs={"dropout": dropout_rng},
                     method=lambda mod, *a, **kw: mod.encode_to_hidden(*a, **kw),
                 )
@@ -282,6 +460,10 @@ def train_step(
                     deterministic=False, sigma_max_scale=sigma_scale,
                     rngs={"dropout": dropout_rng},
                 )
+            all_mu_r = jnp.zeros((R_loops, B, H_dim))
+            all_mu_c = jnp.zeros((R_loops, B, H_dim))
+            all_sigma_h = jnp.ones((R_loops, B, H_dim))
+            all_start_2d = jnp.zeros((R_loops, B, H_dim), dtype=jnp.int32)
             with jax.profiler.TraceAnnotation("Forward_lm_loss"):
                 logits = logits.astype(jnp.float32)
                 shift_logits = logits[:, :-1, :]
@@ -294,16 +476,28 @@ def train_step(
 
         return (
             lm_loss + effective_precision_weight * jnp.float32(mean_sigma),
-            (indices, mean_sigma),
+            (indices, mean_sigma, all_mu_r, all_mu_c, all_sigma_h, all_start_2d),
         )
 
     import jax.profiler
     with jax.profiler.TraceAnnotation("Loss_and_Backprop"):
-        (loss, (indices, mean_sigma)), grads = jax.value_and_grad(
+        (loss, (indices, mean_sigma,
+                all_mu_r, all_mu_c, all_sigma_h, all_start_2d)), grads = jax.value_and_grad(
             loss_fn, has_aux=True
-        )(state.params)
+        )((dense_params, probe))
 
-    new_state, pool_grad_norm = _apply_optimizer_update(state, grads, indices, new_rng, current_lr)
+    dense_grads, grad_probe = grads  # grad_probe: (R, B, D)
+
+    r_starts, c_starts, grad_slices = _compute_pool_slice_grads(
+        grad_probe, all_mu_r, all_mu_c, all_sigma_h, all_start_2d,
+        W=axis_W, R_pool=R_pool, C_pool=C_pool,
+    )
+
+    new_state, pool_grad_norm = _apply_optimizer_update_sparse(
+        state, dense_grads, dense_params, pool_params,
+        r_starts, c_starts, grad_slices,
+        new_rng, current_lr,
+    )
     return new_state, loss, mean_sigma, pool_grad_norm
 
 
@@ -338,7 +532,13 @@ def grad_accum_step(
     loss_chunk_size=0,
     grad_accum_steps=1,
 ):
-    """Gradient accumulation via fully JIT-compiled jax.lax.scan."""
+    """Gradient accumulation with sparse pool gradient updates.
+
+    Pool parameters are excluded from the lax.scan accumulation buffer.
+    Instead of an 805 MB gradient tensor, we collect tiny (W×W×D) gradient
+    slices per retrieval event and apply sparse Adam directly.
+    Memory traffic reduction: ~1000× for pool gradient operations.
+    """
     print("Compiling grad_accum_step for XLA...", flush=True)
     dropout_rng, new_rng = random.split(state.rng)
 
@@ -348,92 +548,158 @@ def grad_accum_step(
     else:
         effective_precision_weight = jnp.float32(0.0)
 
-    # 1. Define loss function operating on a single micro_batch
-    def loss_fn(params, micro_batch, step_rng):
-        compute_params = (
-            jax.tree_util.tree_map(lambda x: x.astype(jnp.bfloat16), params)
-            if use_bf16 else params
-        )
-        if loss_chunk_size > 0:
-            with jax.profiler.TraceAnnotation("Forward_encode_to_hidden"):
-                state_hidden, (_, indices, mean_sigma) = state.apply_fn(
-                    {"params": compute_params}, micro_batch,
-                    deterministic=False, sigma_max_scale=sigma_scale,
-                    rngs={"dropout": step_rng},
-                    method=lambda mod, *a, **kw: mod.encode_to_hidden(*a, **kw),
-                )
-            def decode_fn(chunk_h):
-                return state.apply_fn(
-                    {"params": compute_params}, chunk_h,
-                    method=lambda mod, h: mod.controller.decode(h),
-                )
-            with jax.profiler.TraceAnnotation("Forward_chunked_lm_loss"):
-                lm_loss = chunked_lm_loss(
-                    state_hidden, micro_batch, decode_fn, pad_token_id, loss_chunk_size
-                ).astype(jnp.float32)
-        else:
-            with jax.profiler.TraceAnnotation("Forward_full_model"):
-                logits, (_, indices, mean_sigma) = state.apply_fn(
-                    {"params": compute_params}, micro_batch,
-                    deterministic=False, sigma_max_scale=sigma_scale,
-                    rngs={"dropout": step_rng},
-                )
-            with jax.profiler.TraceAnnotation("Forward_lm_loss"):
-                logits = logits.astype(jnp.float32)
-                shift_logits = logits[:, :-1, :]
-                shift_labels = micro_batch[:, 1:]
-                per_token = optax.softmax_cross_entropy_with_integer_labels(
-                    shift_logits, shift_labels
-                )
-                mask = (shift_labels != pad_token_id).astype(jnp.float32)
-                lm_loss = (per_token * mask).sum() / (mask.sum() + 1e-9)
+    # ── Extract pool params and dense params ────────────────────────────────
+    pool_key = ("pool", "params_storage")
+    flat_params = traverse_util.flatten_dict(state.params)
+    pool_params = flat_params[pool_key]
+    dense_flat = {k: v for k, v in flat_params.items() if k != pool_key}
+    dense_params = traverse_util.unflatten_dict(dense_flat)
 
-        return (
-            lm_loss + effective_precision_weight * jnp.float32(mean_sigma),
-            (indices, mean_sigma),
-        )
+    # Stop gradient on pool — autograd will NOT compute 805 MB pool gradient.
+    pool_params_stopped = jax.lax.stop_gradient(pool_params)
 
-    # 2. Get value and grad function
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+    # Pool grid dimensions (static, from array shape)
+    R_pool, C_pool, D_pool = pool_params.shape
+    W = state.window_size  # axis_window = max(2, int(max_k**0.5))
+    # Note: window_size in state is max_k (e.g. 32). For 2D pool, actual
+    # axis window = max(2, int(max_k**0.5)). Re-derive here:
+    axis_W = max(2, int(W ** 0.5))
 
-    # 3. Initialize PyTree of zero gradients
-    zero_grads = jax.tree_util.tree_map(jnp.zeros_like, state.params)
+    R_loops = state.max_reasoning_loops
+    H_dim   = state.heads_per_dim
 
-    # 4. Define scan body
+    # ── Zero grads for DENSE params only (no 805 MB pool buffer!) ──────────
+    zero_dense_grads = jax.tree_util.tree_map(jnp.zeros_like, dense_params)
+
+    # ── Scan body ──────────────────────────────────────────────────────────
     def scan_body(carry, i):
-        acc_grads, acc_loss, acc_sigma, current_rng = carry
+        acc_dense_grads, acc_loss, acc_sigma, current_rng = carry
         micro_batch = micro_batches[i]
-        
-        # Split rng for this specific micro-batch forward pass
+
         step_rng, next_rng = random.split(current_rng)
+
+        B = micro_batch.shape[0]
+        model_dtype = jnp.bfloat16 if use_bf16 else jnp.float32
+        probe = jnp.zeros((R_loops, B, D_pool), dtype=model_dtype)
+
+        def loss_fn_sparse(dense_p_and_probe):
+            dense_p, probe_ = dense_p_and_probe
+            # Rebuild full params with stopped pool
+            new_flat = dict(traverse_util.flatten_dict(dense_p))
+            new_flat[pool_key] = pool_params_stopped
+            full_params = traverse_util.unflatten_dict(new_flat)
+
+            compute_params = (
+                jax.tree_util.tree_map(lambda x: x.astype(jnp.bfloat16), full_params)
+                if use_bf16 else full_params
+            )
+
+            if loss_chunk_size > 0:
+                with jax.profiler.TraceAnnotation("Forward_encode_to_hidden"):
+                    state_hidden, (_, indices, mean_sigma,
+                                   all_mu_r, all_mu_c, all_sigma_h, all_start_2d) = state.apply_fn(
+                        {"params": compute_params}, micro_batch,
+                        deterministic=False, sigma_max_scale=sigma_scale,
+                        retrieved_probes=probe_,
+                        rngs={"dropout": step_rng},
+                        method=lambda mod, *a, **kw: mod.encode_to_hidden(*a, **kw),
+                    )
+
+                def decode_fn(chunk_h):
+                    return state.apply_fn(
+                        {"params": compute_params}, chunk_h,
+                        method=lambda mod, h: mod.controller.decode(h),
+                    )
+
+                with jax.profiler.TraceAnnotation("Forward_chunked_lm_loss"):
+                    lm_loss = chunked_lm_loss(
+                        state_hidden, micro_batch, decode_fn, pad_token_id, loss_chunk_size
+                    ).astype(jnp.float32)
+            else:
+                # Non-chunked: fall back (probe not supported in __call__ path)
+                with jax.profiler.TraceAnnotation("Forward_full_model"):
+                    logits, (_, indices, mean_sigma) = state.apply_fn(
+                        {"params": compute_params}, micro_batch,
+                        deterministic=False, sigma_max_scale=sigma_scale,
+                        rngs={"dropout": step_rng},
+                    )
+                all_mu_r = jnp.zeros((R_loops, B, H_dim))
+                all_mu_c = jnp.zeros((R_loops, B, H_dim))
+                all_sigma_h = jnp.ones((R_loops, B, H_dim))
+                all_start_2d = jnp.zeros((R_loops, B, H_dim), dtype=jnp.int32)
+                with jax.profiler.TraceAnnotation("Forward_lm_loss"):
+                    logits = logits.astype(jnp.float32)
+                    shift_logits = logits[:, :-1, :]
+                    shift_labels = micro_batch[:, 1:]
+                    per_token = optax.softmax_cross_entropy_with_integer_labels(
+                        shift_logits, shift_labels
+                    )
+                    mask = (shift_labels != pad_token_id).astype(jnp.float32)
+                    lm_loss = (per_token * mask).sum() / (mask.sum() + 1e-9)
+
+            return (
+                lm_loss + effective_precision_weight * jnp.float32(mean_sigma),
+                (indices, mean_sigma, all_mu_r, all_mu_c, all_sigma_h, all_start_2d),
+            )
 
         import jax.profiler
         with jax.profiler.TraceAnnotation("Microbatch_Forward_Backward"):
-            (loss, (indices, mean_sigma)), grads = grad_fn(state.params, micro_batch, step_rng)
-            
-        new_acc_grads = jax.tree_util.tree_map(jnp.add, acc_grads, grads)
-        
-        return (new_acc_grads, acc_loss + loss, acc_sigma + mean_sigma, next_rng), indices
+            (loss, (indices, mean_sigma,
+                    all_mu_r, all_mu_c, all_sigma_h, all_start_2d)), grads = jax.value_and_grad(
+                loss_fn_sparse, has_aux=True
+            )((dense_params, probe))
 
-    # 5. Execute lax.scan entirely on-device
-    init_carry = (zero_grads, jnp.float32(0.0), jnp.float32(0.0), dropout_rng)
-    
-    (acc_grads, total_loss, total_sigma, _), all_indices = jax.lax.scan(
-        scan_body, 
-        init_carry, 
-        jnp.arange(grad_accum_steps)
+        dense_grads, grad_probe = grads  # dense_grads: pytree; grad_probe: (R, B, D)
+
+        new_acc_dense_grads = jax.tree_util.tree_map(jnp.add, acc_dense_grads, dense_grads)
+
+        return (
+            (new_acc_dense_grads, acc_loss + loss, acc_sigma + mean_sigma, next_rng),
+            (indices, grad_probe, all_mu_r, all_mu_c, all_sigma_h, all_start_2d),
+        )
+
+    # ── Execute lax.scan entirely on-device ────────────────────────────────
+    init_carry = (zero_dense_grads, jnp.float32(0.0), jnp.float32(0.0), dropout_rng)
+
+    (acc_dense_grads, total_loss, total_sigma, _), \
+    (all_indices, all_grad_probes, all_mu_r, all_mu_c, all_sigma_h, all_start_2d) = jax.lax.scan(
+        scan_body,
+        init_carry,
+        jnp.arange(grad_accum_steps),
     )
 
-    # 6. Finalize gradients and update optimizer
+    # ── Average dense grads ─────────────────────────────────────────────────
     scale = jnp.float32(1.0 / grad_accum_steps)
-    avg_grads = jax.tree_util.tree_map(lambda g: g * scale, acc_grads)
-    avg_loss = total_loss * scale
+    avg_dense_grads = jax.tree_util.tree_map(lambda g: g * scale, acc_dense_grads)
+    avg_loss  = total_loss  * scale
     avg_sigma = total_sigma * scale
 
-    # flatten indices from (grad_accum_steps, micro_B, max_loops) to (B, max_loops)
-    all_indices = jnp.reshape(all_indices, (-1, all_indices.shape[-1]))
+    # ── Compute pool slice gradients from probes ────────────────────────────
+    # all_grad_probes: (grad_accum_steps, R, B, D) → flatten accum×R
+    # all_mu_r etc.:  (grad_accum_steps, R, B, H_dim) → same flatten
+    accum_steps_dim = all_grad_probes.shape[0]
+    B_micro = all_grad_probes.shape[2]
 
-    new_state, pool_grad_norm = _apply_optimizer_update(state, avg_grads, all_indices, new_rng, current_lr)
+    flat_grad_probe  = all_grad_probes.reshape(accum_steps_dim * R_loops, B_micro, D_pool) * scale
+    flat_mu_r        = all_mu_r.reshape(accum_steps_dim * R_loops, B_micro, H_dim)
+    flat_mu_c        = all_mu_c.reshape(accum_steps_dim * R_loops, B_micro, H_dim)
+    flat_sigma_h     = all_sigma_h.reshape(accum_steps_dim * R_loops, B_micro, H_dim)
+    flat_start_2d    = all_start_2d.reshape(accum_steps_dim * R_loops, B_micro, H_dim)
+
+    r_starts, c_starts, grad_slices = _compute_pool_slice_grads(
+        flat_grad_probe, flat_mu_r, flat_mu_c, flat_sigma_h, flat_start_2d,
+        W=axis_W, R_pool=R_pool, C_pool=C_pool,
+    )
+
+    # ── Apply updates ───────────────────────────────────────────────────────
+    # Flatten all_indices for logging compatibility: (accum, R, B*H) → (B*H, R) equiv
+    flat_all_indices = all_indices.reshape(-1, all_indices.shape[-1])
+
+    new_state, pool_grad_norm = _apply_optimizer_update_sparse(
+        state, avg_dense_grads, dense_params, pool_params,
+        r_starts, c_starts, grad_slices,
+        new_rng, current_lr,
+    )
     return new_state, avg_loss, avg_sigma, pool_grad_norm
 
 
