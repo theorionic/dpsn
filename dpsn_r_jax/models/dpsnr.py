@@ -1,10 +1,9 @@
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
-from dpsn_r_jax.config import DPSNRConfig, PoolConfig
+from dpsn_r_jax.config import DPSNRConfig
 from dpsn_r_jax.models.controller import TinyController
 from dpsn_r_jax.models.memory import (
-    CoordinateMassivePool,
     CoordinateMassivePool2D,
     LearnedIndexer,
 )
@@ -32,25 +31,15 @@ class DPSNR(nn.Module):
             sigma_max=self.config.sigma_max,
         )
 
-        # ── Pool selection: 1D (flat) or 2D (grid) ────────────────────────────
-        if self.config.use_2d_pool:
-            # 2D Grid Pool: each coordinate only needs 1/sqrt(N) precision.
-            # The window_size here is per-axis; total retrieved = max_k × max_k.
-            axis_window = max(2, int(self.config.max_k ** 0.5))
-            self.pool = CoordinateMassivePool2D(
-                rows=self.config.pool_grid_rows,
-                cols=self.config.pool_grid_cols,
-                hidden_dim=self.config.controller_hidden_dim,
-                window_size=axis_window,
-            )
-        else:
-            self.pool = CoordinateMassivePool(
-                PoolConfig(
-                    self.config.pool_total_vectors,
-                    self.config.controller_hidden_dim,
-                ),
-                window_size=self.config.max_k,
-            )
+        # 2D Grid Pool: each coordinate only needs 1/sqrt(N) precision.
+        # The window_size here is per-axis; total retrieved = axis_window × axis_window.
+        axis_window = max(2, int(self.config.max_k ** 0.5))
+        self.pool = CoordinateMassivePool2D(
+            rows=self.config.pool_grid_rows,
+            cols=self.config.pool_grid_cols,
+            hidden_dim=self.config.controller_hidden_dim,
+            window_size=axis_window,
+        )
 
         self.acc = AdaptiveComputeController(
             self.config.controller_hidden_dim,
@@ -65,6 +54,15 @@ class DPSNR(nn.Module):
                 nn.LayerNorm(),
             ]
         )
+
+        # ── Prefetch reasoning query projections (only when enabled) ──────────
+        # Two lightweight Dense layers used inside the prefetch scan body.
+        # query_attn : scores each token position → attention-pool the sequence
+        # query_proj : projects the pooled (B, D) vector into key space before
+        #              the dot-product comparison against SRAM candidates.
+        if self.config.prefetch_reasoning:
+            self.prefetch_query_attn = nn.Dense(1, use_bias=False)
+            self.prefetch_query_proj = nn.Dense(self.config.controller_hidden_dim)
 
     def __call__(self, input_ids, deterministic=True, sigma_max_scale: float = 1.0):
         """
@@ -127,10 +125,20 @@ class DPSNR(nn.Module):
         # 'hidden' is the trigger array — sequences the mark AFTER the controller.
         ctimer.mark("01_controller_done", hidden)
 
-        # 2. Reasoning Loop
-        state_hidden = hidden
+        # 2. Reasoning Loop — branch on prefetch_reasoning flag
         B, T, D = hidden.shape
 
+        if self.config.prefetch_reasoning:
+            # ── Prefetch path: one HBM fetch, all loops read from SRAM ───────
+            with jax.profiler.TraceAnnotation("PrefetchReasoning"):
+                state_hidden, all_indices, mean_sigma = self._prefetch_encode(
+                    hidden, sigma_max_scale
+                )
+            ctimer.mark("08_all_reasoning_loops_done", state_hidden)
+            return state_hidden, all_indices, mean_sigma
+
+        # ── Original path: per-iteration HBM fetching ─────────────────────────
+        state_hidden = hidden
         halt_prob   = jnp.zeros((B, T, 1), dtype=hidden.dtype)
         halted_mask = jnp.zeros((B, T, 1), dtype=hidden.dtype)
 
@@ -146,12 +154,7 @@ class DPSNR(nn.Module):
         _mu, _sigma = self.indexer(
             jnp.zeros((B, T, D)), sigma_max_scale=sigma_max_scale
         )
-        if self.config.use_2d_pool:
-            _ = self.pool(
-                jnp.zeros((B,)), jnp.zeros((B,)), jnp.zeros((B,))
-            )
-        else:
-            _ = self.pool(jnp.zeros((B,)), jnp.zeros((B,)))
+        _ = self.pool(jnp.zeros((B,)), jnp.zeros((B,)), jnp.zeros((B,)))
         _ = self.retrieval_integrator(
             jnp.zeros((B, T, D + self.config.controller_hidden_dim))
         )
@@ -159,7 +162,6 @@ class DPSNR(nn.Module):
         # ── Timing mark: warm-up tracing finished, reasoning scan about to start ─
         ctimer.mark("02_warmup_done__scan_starting", state_hidden)
 
-        use_2d    = self.config.use_2d_pool
         H         = self.config.num_indexer_heads
         SW_FACTOR = self.config.pool_super_window_factor  # Opt-2 knob
         USE_SW    = SW_FACTOR > 1
@@ -174,50 +176,31 @@ class DPSNR(nn.Module):
         if USE_SW:
             # Warm-up calls for the new super-window helpers so Flax traces them
             # before the scan (same pattern as the existing warm-up block above).
-            if use_2d:
-                _sw_dim = self.pool.window_size * SW_FACTOR
-                _ = self.pool.fetch_super_window_2d(
-                    jnp.zeros((B,)), jnp.zeros((B,)), SW_FACTOR
-                )
-                _ = self.pool.__call_from_super_window_2d__(
-                    jnp.zeros((B, _sw_dim, _sw_dim, D), dtype=jnp.bfloat16),
-                    jnp.zeros((B,), dtype=jnp.int32),
-                    jnp.zeros((B,), dtype=jnp.int32),
-                    jnp.zeros((B,)), jnp.zeros((B,)), jnp.zeros((B,)),
-                )
-            else:
-                _sw_dim = self.pool.window_size * SW_FACTOR
-                _ = self.pool.fetch_super_window(jnp.zeros((B,)), SW_FACTOR)
-                _ = self.pool.__call_from_super_window__(
-                    jnp.zeros((B, _sw_dim, D), dtype=jnp.bfloat16),
-                    jnp.zeros((B,), dtype=jnp.int32),
-                    jnp.zeros((B,)), jnp.zeros((B,)),
-                )
+            _sw_dim = self.pool.window_size * SW_FACTOR
+            _ = self.pool.fetch_super_window_2d(
+                jnp.zeros((B,)), jnp.zeros((B,)), SW_FACTOR
+            )
+            _ = self.pool.__call_from_super_window_2d__(
+                jnp.zeros((B, _sw_dim, _sw_dim, D), dtype=jnp.bfloat16),
+                jnp.zeros((B,), dtype=jnp.int32),
+                jnp.zeros((B,), dtype=jnp.int32),
+                jnp.zeros((B,)), jnp.zeros((B,)), jnp.zeros((B,)),
+            )
 
             # Run real initial indexer pass to anchor the super-window
             _mu_init, _ = self.indexer(state_hidden, sigma_max_scale=sigma_max_scale)
-            if use_2d:
-                heads_per_dim = max(1, H // 2)
-                _mu_r0 = _mu_init[:, 0]
-                _mu_c0 = _mu_init[:, min(heads_per_dim, H - 1)]
-                init_sw, init_sw_r, init_sw_c = self.pool.fetch_super_window_2d(
-                    _mu_r0, _mu_c0, SW_FACTOR
-                )
-                sw_carry = (init_sw, init_sw_r, init_sw_c)
-            else:
-                _mu_1d0 = _mu_init[:, 0]
-                init_sw, init_sw_start = self.pool.fetch_super_window(
-                    _mu_1d0, SW_FACTOR
-                )
-                sw_carry = (init_sw, init_sw_start)
+            heads_per_dim = max(1, H // 2)
+            _mu_r0 = _mu_init[:, 0]
+            _mu_c0 = _mu_init[:, min(heads_per_dim, H - 1)]
+            init_sw, init_sw_r, init_sw_c = self.pool.fetch_super_window_2d(
+                _mu_r0, _mu_c0, SW_FACTOR
+            )
+            sw_carry = (init_sw, init_sw_r, init_sw_c)
 
         # ── reasoning_step ────────────────────────────────────────────────────
         def reasoning_step(carry, i):
             if USE_SW:
-                if use_2d:
-                    s_hidden, h_prob, h_mask, (sw, sw_r, sw_c) = carry
-                else:
-                    s_hidden, h_prob, h_mask, (sw, sw_s) = carry
+                s_hidden, h_prob, h_mask, (sw, sw_r, sw_c) = carry
             else:
                 s_hidden, h_prob, h_mask = carry
 
@@ -236,72 +219,43 @@ class DPSNR(nn.Module):
             ctimer.mark("04_indexer_done", mu)
 
             # ── 2. Per-head pool retrieval — vectorized with jax.vmap ─────────
-            if use_2d:
-                heads_per_dim = max(1, H // 2)
-                h_row_ids = jnp.arange(heads_per_dim)
-                h_col_ids = jnp.minimum(h_row_ids + heads_per_dim, H - 1)
+            heads_per_dim = max(1, H // 2)
+            h_row_ids = jnp.arange(heads_per_dim)
+            h_col_ids = jnp.minimum(h_row_ids + heads_per_dim, H - 1)
 
-                mu_r    = mu[:, h_row_ids]
-                mu_c    = mu[:, h_col_ids]
-                sigma_h = (sigma[:, h_row_ids] + sigma[:, h_col_ids]) / 2.0
+            mu_r    = mu[:, h_row_ids]
+            mu_c    = mu[:, h_col_ids]
+            sigma_h = (sigma[:, h_row_ids] + sigma[:, h_col_ids]) / 2.0
 
-                if USE_SW:
-                    # ── SRAM path: slice from the in-scan super-window carry ──
-                    def pool2d_head_sw(mu_r_h, mu_c_h, sig_h):
-                        return self.pool.__call_from_super_window_2d__(
-                            sw, sw_r, sw_c, mu_r_h, mu_c_h, sig_h
-                        )
-                    with jax.profiler.TraceAnnotation("CoordinateMassivePool2D_SW_vmap"):
-                        retrieved_all, start_all = jax.vmap(
-                            pool2d_head_sw, in_axes=(1, 1, 1), out_axes=(1, 1)
-                        )(mu_r, mu_c, sigma_h)
-
-                    # Refresh super-window for the next iteration (track new mu)
-                    new_mu_r = jnp.mean(mu_r, axis=1)
-                    new_mu_c = jnp.mean(mu_c, axis=1)
-                    new_sw, new_sw_r, new_sw_c = self.pool.fetch_super_window_2d(
-                        new_mu_r, new_mu_c, SW_FACTOR
+            if USE_SW:
+                # ── SRAM path: slice from the in-scan super-window carry ──
+                def pool2d_head_sw(mu_r_h, mu_c_h, sig_h):
+                    return self.pool.__call_from_super_window_2d__(
+                        sw, sw_r, sw_c, mu_r_h, mu_c_h, sig_h
                     )
-                    new_sw_carry = (new_sw, new_sw_r, new_sw_c)
-                else:
-                    # ── Original HBM path ────────────────────────────────────
-                    def pool2d_head(mu_r_h, mu_c_h, sig_h):
-                        return self.pool(mu_r_h, mu_c_h, sig_h)
-                    with jax.profiler.TraceAnnotation("CoordinateMassivePool2D_vmap"):
-                        retrieved_all, start_all = jax.vmap(
-                            pool2d_head, in_axes=(1, 1, 1), out_axes=(1, 1)
-                        )(mu_r, mu_c, sigma_h)
+                with jax.profiler.TraceAnnotation("CoordinateMassivePool2D_SW_vmap"):
+                    retrieved_all, start_all = jax.vmap(
+                        pool2d_head_sw, in_axes=(1, 1, 1), out_axes=(1, 1)
+                    )(mu_r, mu_c, sigma_h)
 
-                retrieved     = jnp.mean(retrieved_all, axis=1)  # (B, D)
-                start_indices = start_all.reshape(-1)             # (B*P,)
-
+                # Refresh super-window for the next iteration (track new mu)
+                new_mu_r = jnp.mean(mu_r, axis=1)
+                new_mu_c = jnp.mean(mu_c, axis=1)
+                new_sw, new_sw_r, new_sw_c = self.pool.fetch_super_window_2d(
+                    new_mu_r, new_mu_c, SW_FACTOR
+                )
+                new_sw_carry = (new_sw, new_sw_r, new_sw_c)
             else:
-                if USE_SW:
-                    # ── SRAM path (1D) ───────────────────────────────────────
-                    def pool1d_head_sw(mu_h, sig_h):
-                        return self.pool.__call_from_super_window__(
-                            sw, sw_s, mu_h, sig_h
-                        )
-                    with jax.profiler.TraceAnnotation("CoordinateMassivePool1D_SW_vmap"):
-                        retrieved_all, start_all = jax.vmap(
-                            pool1d_head_sw, in_axes=(1, 1), out_axes=(1, 1)
-                        )(mu, sigma)
+                # ── Original HBM path ────────────────────────────────────
+                def pool2d_head(mu_r_h, mu_c_h, sig_h):
+                    return self.pool(mu_r_h, mu_c_h, sig_h)
+                with jax.profiler.TraceAnnotation("CoordinateMassivePool2D_vmap"):
+                    retrieved_all, start_all = jax.vmap(
+                        pool2d_head, in_axes=(1, 1, 1), out_axes=(1, 1)
+                    )(mu_r, mu_c, sigma_h)
 
-                    # Refresh super-window
-                    new_mu_1d = jnp.mean(mu, axis=1)
-                    new_sw, new_sw_s = self.pool.fetch_super_window(new_mu_1d, SW_FACTOR)
-                    new_sw_carry = (new_sw, new_sw_s)
-                else:
-                    # ── Original HBM path (1D) ───────────────────────────────
-                    def pool1d_head(mu_h, sig_h):
-                        return self.pool(mu_h, sig_h)
-                    with jax.profiler.TraceAnnotation("CoordinateMassivePool1D_vmap"):
-                        retrieved_all, start_all = jax.vmap(
-                            pool1d_head, in_axes=(1, 1), out_axes=(1, 1)
-                        )(mu, sigma)
-
-                retrieved     = jnp.mean(retrieved_all, axis=1)  # (B, D)
-                start_indices = start_all.reshape(-1)             # (B*H,)
+            retrieved     = jnp.mean(retrieved_all, axis=1)  # (B, D)
+            start_indices = start_all.reshape(-1)             # (B*P,)
 
             # ── Timing mark: pool retrieval done ─────────────────────────────
             ctimer.mark("05_pool_retrieval_done", retrieved)
@@ -329,7 +283,7 @@ class DPSNR(nn.Module):
 
             # ── 3. Integrate retrieved knowledge ───────────────────────────────
             with jax.profiler.TraceAnnotation("Retrieval_Integrator"):
-                retrieved_expanded = jnp.expand_dims(retrieved, 1).repeat(T, axis=1)
+                retrieved_expanded = jnp.broadcast_to(retrieved[:, None, :], (B, T, D))
                 combined = jnp.concatenate([s_hidden, retrieved_expanded], axis=-1)
                 integrated = self.retrieval_integrator(combined)
             # ── Timing mark: retrieval integrator done ────────────────────────
@@ -370,13 +324,12 @@ class DPSNR(nn.Module):
         # The old tracer-leak (TracerBoolConversionError) was because the
         # previous reasoning_step closed over `deterministic` (a JAX bool
         # tracer).  In _encode_hidden, reasoning_step only closes over `self`,
-        # `sigma_max_scale`, `use_2d`, `H`, `T` — concrete Python values —
+        # `sigma_max_scale`, `H`, `T` — concrete Python values —
         # so jax.checkpoint is now safe to use.
         #
-        # Without checkpointing, the backward stores 18+ buffers of shape
-        # f32[max_loops, B/chips, T, D] = ~450 MB each → 8+ GB total at BS=200.
-        # With checkpointing, XLA recomputes reasoning_step during backward
-        # keeping peak memory to one loop iteration at a time.
+        # Without checkpointing, the backward stores 18+ buffers per loop
+        # → 8+ GB total at BS=200.  With checkpointing, XLA recomputes
+        # reasoning_step during backward, keeping peak memory to one iteration.
         _scan_fn = reasoning_step
         if self.config.gradient_checkpointing:
             _scan_fn = jax.checkpoint(reasoning_step)
@@ -406,4 +359,162 @@ class DPSNR(nn.Module):
         # mean_sigma averaged across all reasoning loops
         mean_sigma = jnp.mean(sigma_per_loop)
 
+        return state_hidden, all_indices, mean_sigma
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Prefetch Reasoning path
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _prefetch_encode(self, hidden, sigma_max_scale: float = 1.0):
+        """Prefetch-once, reason-in-SRAM encoding path.
+
+        Design
+        ──────
+        Stage 1  One indexer forward pass → initial (mu_r, mu_c) coordinates.
+        Stage 2  ONE lax.dynamic_slice call fetches a patch_size × patch_size
+                 region from HBM into a (B, K, D) tensor where K = patch_size².
+        Stage 3  lax.scan carries that tensor as part of its carry pytree.
+                 XLA keeps carry tensors in on-chip SRAM across iterations, so
+                 every reasoning step reads from SRAM (~1 ns) instead of HBM
+                 (~100 ns per dynamic_slice).
+        Stage 4  Each scan iteration does scaled dot-product attention over the
+                 K SRAM-resident candidates instead of a Gaussian-weighted
+                 dynamic_slice. The retrieval_integrator and ACC modules are
+                 reused unchanged.
+
+        Args:
+            hidden:          (B, T, D) — controller output.
+            sigma_max_scale: Sigma annealing multiplier (1.0 = full range).
+
+        Returns:
+            state_hidden: (B, T, D)
+            all_indices:  (B, max_reasoning_loops) flat patch-start indices
+                          for sparse-Adam pool update.
+            mean_sigma:   scalar — mean sigma from the initial indexer call.
+        """
+        B, T, D = hidden.shape
+        model_dtype = hidden.dtype
+
+        # ── Stage 1: single indexer pass (one HBM probe, outside the scan) ───
+        mu_init, sigma_init = self.indexer(hidden, sigma_max_scale=sigma_max_scale)
+        ctimer.mark("04_indexer_done", mu_init)
+
+        H             = self.config.num_indexer_heads
+        heads_per_dim = max(1, H // 2)
+        mu_r = mu_init[:, 0]
+        mu_c = mu_init[:, min(heads_per_dim, H - 1)]
+
+        # ── Stage 2: ONE HBM fetch — prefetch_size² candidates ────────────────
+        patch_size = self.config.prefetch_size
+        with jax.profiler.TraceAnnotation("PrefetchReasoning_HBM_Fetch"):
+            candidates_2d, patch_r_start, patch_c_start = self.pool.fetch_patch_2d(
+                mu_r, mu_c, patch_size
+            )
+        # candidates_2d : (B, patch_size, patch_size, D)  — bfloat16 from pool
+        # Reshape spatial dims → (B, K, D)  K = patch_size²
+        K          = patch_size * patch_size
+        candidates = candidates_2d.reshape(B, K, D).astype(model_dtype)
+        ctimer.mark("05_pool_retrieval_done", candidates)
+
+        # ── Stage 3: Warm-up calls before lax.scan ────────────────────────────
+        # Flax requires every module called inside lax.scan to be invoked at
+        # least once outside it so parameter bindings are registered first.
+        halt_prob   = jnp.zeros((B, T, 1), dtype=model_dtype)
+        halted_mask = jnp.zeros((B, T, 1), dtype=model_dtype)
+
+        _dummy_candidates = jnp.zeros((B, K, D), dtype=model_dtype)
+        _dummy_attn  = self.prefetch_query_attn(hidden)                        # (B, T, 1)
+        _dummy_q     = self.prefetch_query_proj(jnp.zeros((B, D), dtype=model_dtype))
+        _dummy_integ = self.retrieval_integrator(
+            jnp.zeros((B, T, 2 * D), dtype=model_dtype)
+        )
+        _dummy_acc   = self.acc(hidden, hidden, 0, halt_prob, halted_mask)
+        ctimer.mark("02_warmup_done__scan_starting", hidden)
+
+        # ── Stage 4: Reasoning scan — candidates live in SRAM as carry ────────
+        def prefetch_step(carry, i):
+            s_hidden, h_prob, h_mask, cands = carry
+            prev = s_hidden
+
+            ctimer.mark("03_iter_start", s_hidden)
+
+            # ── Cross-attention over SRAM-resident candidates ─────────────────
+            # Step a: attention-pool the full sequence → single query vector
+            with jax.profiler.TraceAnnotation("PrefetchReasoning_CrossAttn"):
+                attn_score = self.prefetch_query_attn(s_hidden)          # (B, T, 1)
+                attn_w     = jax.nn.softmax(attn_score, axis=1)          # (B, T, 1)
+                query      = jnp.sum(attn_w * s_hidden, axis=1)          # (B, D)
+
+                # Step b: project query → key space
+                query = nn.gelu(self.prefetch_query_proj(query))          # (B, D)
+
+                # Step c: scaled dot-product over K SRAM candidates
+                # Cast to float32 for softmax numerical stability; cands stays
+                # in model_dtype (bf16) in the carry to save SRAM.
+                scale     = D ** -0.5
+                scores    = jnp.einsum(
+                    'bd,bkd->bk',
+                    query,
+                    cands.astype(jnp.float32),
+                ) * scale                                                  # (B, K)
+                weights   = jax.nn.softmax(scores, axis=-1)               # (B, K)
+                retrieved = jnp.einsum(
+                    'bk,bkd->bd',
+                    weights,
+                    cands.astype(jnp.float32),
+                )                                                          # (B, D) fp32
+
+            ctimer.mark("05_pool_retrieval_done", retrieved)
+
+            # ── Integrate retrieved knowledge (reuses existing module) ─────────
+            with jax.profiler.TraceAnnotation("Retrieval_Integrator"):
+                retrieved_exp = jnp.broadcast_to(
+                    retrieved[:, None, :], (B, T, D)
+                )
+                combined   = jnp.concatenate(
+                    [s_hidden, retrieved_exp.astype(model_dtype)], axis=-1
+                )
+                integrated = self.retrieval_integrator(combined)
+
+            ctimer.mark("06_integrator_done", integrated)
+
+            # ── Adaptive halting (reuses existing ACC module) ──────────────────
+            with jax.profiler.TraceAnnotation("AdaptiveComputeController"):
+                new_s, h_prob, new_h_mask = self.acc(
+                    s_hidden, s_hidden + integrated, i, h_prob, h_mask
+                )
+
+            update_mask = 1.0 - h_mask
+            s_hidden    = (update_mask * new_s + h_mask * prev).astype(model_dtype)
+            h_prob      = h_prob.astype(model_dtype)
+            new_h_mask  = new_h_mask.astype(model_dtype)
+
+            ctimer.mark("07_acc_iter_done", s_hidden)
+
+            # cands is passed through unchanged — XLA keeps it in SRAM
+            return (s_hidden, h_prob, new_h_mask, cands), None
+
+        _scan_fn = prefetch_step
+        if self.config.gradient_checkpointing:
+            _scan_fn = jax.checkpoint(prefetch_step)
+
+        (state_hidden, _, _, _), _ = jax.lax.scan(
+            _scan_fn,
+            (hidden, halt_prob, halted_mask, candidates),
+            jnp.arange(self.config.max_reasoning_loops),
+        )
+
+        # ── Build all_indices for sparse-Adam pool update ─────────────────────
+        # The "touched" pool region is the pre-fetched patch.  We report its
+        # flat start position so the trainer updates those pool vectors.
+        flat_patch_start = (
+            patch_r_start * self.config.pool_grid_cols + patch_c_start
+        )                                                                  # (B,)
+        # Tile to (B, max_reasoning_loops) to match the trainer's expected shape
+        all_indices = jnp.tile(
+            flat_patch_start[:, None],
+            (1, self.config.max_reasoning_loops),
+        )
+
+        mean_sigma = jnp.mean(sigma_init)
         return state_hidden, all_indices, mean_sigma

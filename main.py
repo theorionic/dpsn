@@ -261,6 +261,13 @@ def main():
         help="Log metrics to TensorBoard and print to stdout every N steps (default: 50).",
     )
     parser.add_argument(
+        "--timing_interval",
+        type=int,
+        default=0,
+        help="Run forward_only_step every N steps to measure fwd/bwd time split (0=disabled). "
+             "Loads a second JIT program — disable on memory-constrained configs like xxl.",
+    )
+    parser.add_argument(
         "--profile_components",
         action="store_true",
         help=(
@@ -300,6 +307,37 @@ def main():
         help="Directory to persist JAX/XLA JIT compilation cache. "
              "First run compiles and saves artifacts; subsequent runs skip recompilation. "
              "Cache is hardware- and JAX-version-specific.",
+    )
+    parser.add_argument(
+        "--prefetch_reasoning",
+        action="store_true",
+        help=(
+            "Enable prefetch-once SRAM reasoning. "
+            "Instead of fetching pool vectors from HBM on every reasoning loop "
+            "iteration, this fetches a patch_size×patch_size region ONCE before "
+            "the scan and passes it as a lax.scan carry so XLA keeps it in "
+            "on-chip SRAM (~1 ns reads vs ~100 ns HBM). "
+            "Each iteration then uses scaled dot-product attention over the "
+            "SRAM-resident candidates instead of dynamic_slice from HBM. "
+            "The retrieval_integrator and ACC modules are reused unchanged. "
+            "SRAM cost: B_per_chip × prefetch_size² × D × 2 bytes "
+            "(e.g. xxl/8-chip/B=32: 4 × 64² × 1024 × 2 = 33 MB per chip). "
+            "Combine with --prefetch_size to control the candidate pool size."
+        ),
+    )
+    parser.add_argument(
+        "--prefetch_size",
+        type=int,
+        default=64,
+        help=(
+            "Per-axis size of the pre-fetched pool patch (total = prefetch_size²). "
+            "Only used when --prefetch_reasoning is set. "
+            "Recommended values: "
+            "  64  → 4 096 candidates, ~33 MB/chip on xxl (safe default). "
+            " 128  → 16 384 candidates, ~134 MB/chip on xxl (tight, use only on "
+            "         smaller configs like base/large where D is smaller). "
+            "Larger patch = broader pool coverage per step, higher SRAM use."
+        ),
     )
 
     args = parser.parse_args()
@@ -350,6 +388,29 @@ def main():
 
     if args.bf16:
         config.use_bf16 = True
+
+    if args.prefetch_reasoning:
+        config.prefetch_reasoning = True
+        config.prefetch_size = args.prefetch_size
+        _sram_mb = (args.prefetch_size ** 2 * config.controller_hidden_dim * 2) / 1e6
+        _n_chips = jax.device_count()
+        _b_per_chip = max(1, args.batch_size // _n_chips)
+        _sram_per_chip_mb = _sram_mb * _b_per_chip
+        print(
+            f"[PREFETCH REASONING] Enabled\n"
+            f"  Candidates  : {args.prefetch_size}×{args.prefetch_size} "
+            f"= {args.prefetch_size**2:,} vectors\n"
+            f"  SRAM/chip   : ~{_sram_per_chip_mb:.0f} MB  "
+            f"(limit 128 MB — {'OK' if _sram_per_chip_mb < 100 else 'WARNING: tight'})\n"
+            f"  HBM fetches : 1 per step  (was {config.max_reasoning_loops} per step)\n"
+            f"  Loop style  : dot-product attention over SRAM candidates "
+            f"(integrator + ACC reused)"
+        )
+        if _sram_per_chip_mb > 110:
+            print(
+                f"[PREFETCH REASONING] WARNING: {_sram_per_chip_mb:.0f} MB/chip "
+                f"may exceed VMEM (128 MB). Consider --prefetch_size 32 or 48."
+            )
 
     if args.loss_chunk_size > 0:
         config.loss_chunk_size = args.loss_chunk_size
@@ -877,7 +938,10 @@ def main():
     # Component timing: run forward_only_step every TIMING_INTERVAL steps and
     # compare to the avg step time to estimate forward vs backward+optimizer split.
     # Set to 0 to disable.  First run is skipped (includes JIT compilation).
-    TIMING_INTERVAL = LOG_INTERVAL * 5
+    # NOTE: forward_only_step is a separate JIT program — on memory-constrained
+    # configs (e.g. xxl on v5e-8) it will OOM when loaded alongside grad_accum_step.
+    # Use --timing_interval 0 (default) to disable.
+    TIMING_INTERVAL = args.timing_interval if args.timing_interval > 0 else 0
 
     tokens_per_sec = 0.0
     tflops = 0.0

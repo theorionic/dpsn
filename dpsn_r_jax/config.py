@@ -93,8 +93,7 @@ class DPSNRConfig:
     # ── Precision Routing ──────────────────────────────────────────────────
     # 2D Grid Pool: instead of (N, D), pool is (rows, cols, D).
     # Precision per coordinate: 1/sqrt(N) instead of 1/N  → huge improvement.
-    use_2d_pool: bool = False
-    pool_grid_rows: int = 512   # rows × cols must equal pool_total_vectors
+    pool_grid_rows: int = 512   # rows × cols = total pool vectors
     pool_grid_cols: int = 512
 
     # Sigma annealing: sigma_max decays from its initial value to sigma_target
@@ -107,6 +106,31 @@ class DPSNRConfig:
     # The model is rewarded for using precise, narrow retrievals.
     # weight is linearly ramped from 0 → precision_loss_weight over sigma_anneal_steps.
     precision_loss_weight: float = 0.0
+
+    # ── Prefetch Reasoning (SRAM buffer design) ────────────────────────────
+    # When True, the reasoning loop fetches pool vectors ONCE before the scan
+    # and passes them as a lax.scan carry (XLA keeps the buffer in on-chip
+    # SRAM).  Every reasoning iteration then reads from SRAM via
+    # dot-product attention instead of issuing a new HBM dynamic_slice.
+    #
+    # Hardware benefit:
+    #   Original design  : 1 HBM fetch per reasoning loop iteration
+    #                      (100 ns latency × max_reasoning_loops)
+    #   Prefetch design  : 1 HBM fetch total, then SRAM reads (~1 ns each)
+    #
+    # SRAM cost estimate per chip (batch sharded, B_per_chip = B / n_chips):
+    #   B_per_chip × prefetch_size² × hidden_dim × 2 bytes (bf16)
+    #   e.g. xxl, 8 chips, B=32: 4 × 64² × 1024 × 2 = 33 MB  ← fits in 128 MB
+    #
+    # Tradeoff: pool retrieval coordinates are computed once (initial state)
+    # and fixed for all reasoning loops.  The model compensates by attending
+    # softly over prefetch_size² candidate vectors instead of a hard Gaussian
+    # slice, which is at least as expressive for broad sigma values.
+    #
+    # Recommended: prefetch_size=64 (4096 candidates, ~33 MB/chip on xxl).
+    # Use 128 only on smaller configs where SRAM headroom allows.
+    prefetch_reasoning: bool = False
+    prefetch_size: int = 64   # per-axis size; total candidates = prefetch_size²
 
     # ── Splash Attention (Pallas TPU kernel) ───────────────────────────────
     # When True, FlashCausalSelfAttention uses splash_attention (Pallas TPU)
@@ -133,8 +157,7 @@ class DPSNRConfig:
     # vectors from HBM in one pass.  The XLA lax.scan carry mechanism then
     # holds this wider tensor in on-chip SRAM across all reasoning iterations,
     # reducing per-iteration HBM latency from ~100 ns to ~1 ns.
-    # Set to 1 to disable. For 1D pools, 4-8 is good.
-    # For 2D pools, recommended: 2 (since 2x means 2x2 = 4x the total vectors).
+    # Set to 1 to disable. Recommended: 2 (since 2x means 2x2 = 4x the total vectors).
     pool_super_window_factor: int = 2
 
     @classmethod
@@ -176,6 +199,8 @@ def get_model_config(name: str) -> DPSNRConfig:
             dropout=0.0,
             pool_total_vectors=100,
             pool_hidden_dim=32,
+            pool_grid_rows=10,
+            pool_grid_cols=10,
             librarian_hidden_dim=16,
             max_reasoning_loops=2,
             min_reasoning_loops=1,
@@ -197,8 +222,10 @@ def get_model_config(name: str) -> DPSNRConfig:
             controller_num_layers=6,
             controller_num_heads=8,
             max_seq_len=512,
-            pool_total_vectors=65536,  # 2^16 vectors
+            pool_total_vectors=65536,  # 256 × 256
             pool_hidden_dim=512,
+            pool_grid_rows=256,
+            pool_grid_cols=256,
             max_reasoning_loops=4,
             learning_rate=6e-4,
         )
@@ -210,8 +237,10 @@ def get_model_config(name: str) -> DPSNRConfig:
             controller_num_layers=12,
             controller_num_heads=12,
             max_seq_len=4096,
-            pool_total_vectors=262144,  # 2^18 vectors (~200M params in pool)
+            pool_total_vectors=262144,  # 512 × 512
             pool_hidden_dim=768,
+            pool_grid_rows=512,
+            pool_grid_cols=512,
             max_reasoning_loops=6,
             learning_rate=3e-4,
             attn_window_size=512,   # O(T×512) vs O(T²); pool handles long-range
@@ -224,8 +253,10 @@ def get_model_config(name: str) -> DPSNRConfig:
             controller_num_layers=16,
             controller_num_heads=16,
             max_seq_len=8192,
-            pool_total_vectors=1048576,  # 2^20 vectors (~1.1B params in pool)
+            pool_total_vectors=1048576,  # 1024 × 1024
             pool_hidden_dim=1024,
+            pool_grid_rows=1024,
+            pool_grid_cols=1024,
             max_reasoning_loops=8,
             learning_rate=2e-4,
             attn_window_size=512,   # 512/8192 = 6% local; pool handles the rest
@@ -242,7 +273,7 @@ def get_model_config(name: str) -> DPSNRConfig:
             controller_ff_multiplier=2.0,
             max_seq_len=64,
             dropout=0.0,
-            pool_total_vectors=100,    # 10×10 grid when use_2d_pool=True
+            pool_total_vectors=100,    # 10×10 grid
             pool_hidden_dim=32,
             librarian_hidden_dim=16,
             max_reasoning_loops=2,
@@ -254,7 +285,6 @@ def get_model_config(name: str) -> DPSNRConfig:
             sigma_min=0.01,
             sigma_max=5.0,             # starts broad
             # 2D pool: 10×10 = 100 vectors; 10x easier to address precisely
-            use_2d_pool=True,
             pool_grid_rows=10,
             pool_grid_cols=10,
             # Sigma annealing: broad → precise over 5 000 steps
@@ -283,7 +313,6 @@ def get_model_config(name: str) -> DPSNRConfig:
             sigma_max=5.0,
             # 2D pool: 512×512 = 262 144 vectors
             # Each coordinate only needs 1/512 ≈ 0.2% precision (vs 1/262144 = 0.0004%)
-            use_2d_pool=True,
             pool_grid_rows=512,
             pool_grid_cols=512,
             # Anneal sigma over first 50 000 steps: broad → precise routing
@@ -329,7 +358,6 @@ def get_model_config(name: str) -> DPSNRConfig:
             #   1536²×1024×4 = 9.6 GB — exceeds 15.75 GB HBM when unsharded by GSPMD.
             #   768²×1024×4  = 2.4 GB — fits with room for params + activations.
             # Coordinate precision: 1/768 per axis — still fully learnable.
-            use_2d_pool=True,
             pool_grid_rows=768,
             pool_grid_cols=768,
             pool_hidden_dim=1024,

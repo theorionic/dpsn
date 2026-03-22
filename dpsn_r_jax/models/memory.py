@@ -397,6 +397,56 @@ class CoordinateMassivePool2D(nn.Module):
         )
         return aggregated, flat_start
 
+    # ── Prefetch-reasoning: one-shot full patch fetch ─────────────────────────
+    def fetch_patch_2d(
+        self,
+        mu_row: jnp.ndarray,
+        mu_col: jnp.ndarray,
+        patch_size: int,
+    ) -> tuple:
+        """Pre-fetch a patch_size × patch_size region from the 2D pool grid.
+
+        This is the **single** HBM access in the prefetch-reasoning design.
+        The returned tensor is passed as a ``lax.scan`` carry so XLA keeps
+        it in on-chip SRAM for the entire reasoning loop — no further HBM
+        access occurs during the scan.
+
+        SRAM cost (bf16):
+            B_per_chip × patch_size² × hidden_dim × 2 bytes
+            e.g. B/chip=4, patch=64, D=1024 → 33 MB  (fits in 128 MB VMEM)
+
+        Args:
+            mu_row:     (B,) normalised row coordinate in (0, 1).
+            mu_col:     (B,) normalised col coordinate in (0, 1).
+            patch_size: Number of vectors per grid axis.
+                        Total candidates = patch_size × patch_size.
+
+        Returns:
+            patch:    (B, patch_size, patch_size, D) — candidate vectors
+                      in bfloat16 (native pool storage dtype).
+            r_start:  (B,) integer row start indices (for sparse-Adam tracking).
+            c_start:  (B,) integer col start indices.
+        """
+        R    = self.rows
+        C    = self.cols
+        D    = self.params_storage.shape[-1]   # local dim (hidden_dim / tp_size)
+        half = patch_size // 2
+
+        r_center = (mu_row * (R - 1)).astype(jnp.int32)
+        c_center = (mu_col * (C - 1)).astype(jnp.int32)
+
+        # Clamp so the patch never exceeds pool boundaries
+        r_start = jnp.clip(r_center - half, 0, R - patch_size)
+        c_start = jnp.clip(c_center - half, 0, C - patch_size)
+
+        def _fetch(rs, cs):
+            return lax.dynamic_slice(
+                self.params_storage, (rs, cs, 0), (patch_size, patch_size, D)
+            ).astype(jnp.bfloat16)
+
+        patch = jax.vmap(_fetch)(r_start, c_start)   # (B, patch_size, patch_size, D)
+        return patch, r_start, c_start
+
     # ── Shared weighting & aggregation ───────────────────────────────────────
     def _weight_and_aggregate(
         self, windows, r_start, c_start, r_center, c_center, sigma

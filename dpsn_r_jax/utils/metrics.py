@@ -30,17 +30,12 @@ def calculate_flops(config: DPSNRConfig, batch_size: int) -> float:
     ff_mult = config.controller_ff_multiplier
     H       = config.num_indexer_heads  # number of retrieval heads
 
-    # ── Window size: differs between 1D and 2D pool ────────────────────────
-    if config.use_2d_pool:
-        # CoordinateMassivePool2D uses axis_window = max(2, int(max_k**0.5))
-        # per axis; total retrieved = axis_window² per head-pair.
-        axis_w = max(2, int(config.max_k ** 0.5))
-        W = axis_w * axis_w          # vectors actually retrieved per head-pair
-        n_head_pairs = max(1, H // 2)
-        effective_H = n_head_pairs   # number of parallel pool calls after vmap
-    else:
-        W = config.max_k             # vectors retrieved per head in 1D pool
-        effective_H = H
+    # CoordinateMassivePool2D: axis_window = max(2, int(max_k**0.5)) per axis;
+    # total retrieved = axis_window² per head-pair.
+    axis_w = max(2, int(config.max_k ** 0.5))
+    W = axis_w * axis_w          # vectors actually retrieved per head-pair
+    n_head_pairs = max(1, H // 2)
+    effective_H = n_head_pairs   # number of parallel pool calls after vmap
 
     # ─────────────────────────────────────────────────────────────────────────
     # 1. TinyController Encoder  (per sequence, per layer)
@@ -52,14 +47,18 @@ def calculate_flops(config: DPSNRConfig, batch_size: int) -> float:
     #    • FFN up   (D → ff_dim):                  2 n d (ff_mult d)
     #    • FFN down (ff_dim → D):                  2 n (ff_mult d) d
     # ─────────────────────────────────────────────────────────────────────────
+    # Attention window: local-window attention cost is O(n × window), not O(n²).
+    # Using n² here would overcount by n/window (e.g. 32× for n=8192, window=256).
+    attn_window = getattr(config, 'attn_window_size', n)  # full-attn if not set
+
     ff_dim = ff_mult * d
     encoder_fwd = l * (
-        6 * n * d**2          # QKV projection (fused)
-        + 2 * n * d**2        # output projection
-        + 2 * n**2 * d        # Q @ Kᵀ
-        + 2 * n**2 * d        # scores @ V
-        + 2 * n * d * ff_dim  # FFN up
-        + 2 * n * ff_dim * d  # FFN down
+        6 * n * d**2               # QKV projection (fused)
+        + 2 * n * d**2             # output projection
+        + 2 * n * attn_window * d  # Q @ Kᵀ  (local window)
+        + 2 * n * attn_window * d  # scores @ V
+        + 2 * n * d * ff_dim       # FFN up
+        + 2 * n * ff_dim * d       # FFN down
     )
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -153,17 +152,16 @@ def summarise_flops(config: DPSNRConfig, batch_size: int) -> None:
     ff_mult = config.controller_ff_multiplier
     H       = config.num_indexer_heads
 
-    if config.use_2d_pool:
-        axis_w = max(2, int(config.max_k ** 0.5))
-        W = axis_w * axis_w
-        effective_H = max(1, H // 2)
-    else:
-        W = config.max_k
-        effective_H = H
+    axis_w = max(2, int(config.max_k ** 0.5))
+    W = axis_w * axis_w
+    effective_H = max(1, H // 2)
 
+    attn_window = getattr(config, 'attn_window_size', n)
     ff_dim = ff_mult * d
     encoder_fwd = l * (
-        6*n*d**2 + 2*n*d**2 + 2*n**2*d + 2*n**2*d + 2*n*d*ff_dim + 2*n*ff_dim*d
+        6*n*d**2 + 2*n*d**2
+        + 2*n*attn_window*d + 2*n*attn_window*d
+        + 2*n*d*ff_dim + 2*n*ff_dim*d
     )
     indexer_fwd = 2*n*d + n*d + 2*d**2 + d**2 + d*H + d*H
     pool_fwd    = effective_H * (4*W + 2*W*d)
