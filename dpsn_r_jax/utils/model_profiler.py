@@ -477,16 +477,15 @@ def _print_report(results: dict, config, step: int, runs: int = 10) -> None:
 
     if bar_base:
         _row("Forward estimate (ctrl+loop+dec)", fwd_est_ms, bar_base)
-        print(f"\n  Estimated fwd-only TFLOPS (component sum, not full fwd):", flush=True)
-        try:
-            from dpsn_r_jax.utils.metrics import calculate_flops
-            flops = calculate_flops(config, config.max_seq_len)
-            est_tflops = flops / (fwd_est_ms / 1000.0) / 1e12
-            print(f"    If step ≈ 3× fwd (fwd+bwd+opt): "
-                  f"step_time ≈ {3 * fwd_est_ms:.0f} ms → "
-                  f"~{flops / (3 * fwd_est_ms / 1000.0) / 1e12:.1f} TFLOPS", flush=True)
-        except Exception:
-            pass
+        print(f"\n  Component timing notes:", flush=True)
+        print(f"    Forward estimate (isolated benchmarks, no memory pressure): "
+              f"{fwd_est_ms:.0f} ms", flush=True)
+        print(f"    In full training, actual step time >> forward estimate because:", flush=True)
+        print(f"      • Backward pass = ~2× forward compute", flush=True)
+        print(f"      • gradient_checkpointing recompute = +1× forward", flush=True)
+        print(f"      • Pool gradient scatter + sparse Adam = hidden cost", flush=True)
+        print(f"      • HBM bandwidth contention across all components", flush=True)
+        print(f"    Use --timing_interval to measure the actual fwd/bwd split.", flush=True)
 
     print(f"\n  Timing breakdown (min / median / max) over {runs} runs:", flush=True)
     print(f"  {sep}", flush=True)
