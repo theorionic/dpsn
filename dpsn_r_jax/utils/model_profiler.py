@@ -48,12 +48,14 @@ from __future__ import annotations
 
 import time
 import functools
+import traceback
 from typing import Any
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+from jax.sharding import NamedSharding, PartitionSpec
 
 __all__ = ["run_model_profile"]
 
@@ -106,7 +108,7 @@ def _build_controller_fn(model, state, sample_batch, batch_sharding):
     @functools.partial(jax.jit, donate_argnums=())
     def _fn(p, x):
         return model.apply(
-            p, x,
+            {"params": p}, x,
             method=lambda m, ids: m.controller(ids, deterministic=True),
         )
 
@@ -120,18 +122,15 @@ def _build_indexer_fn(model, state, sample_batch, batch_sharding):
 
     @functools.partial(jax.jit, donate_argnums=())
     def _fn(p, x):
-        # Run controller first (outside timing target) to get hidden states
         hidden = model.apply(
-            p, x,
+            {"params": p}, x,
             method=lambda m, ids: m.controller(ids, deterministic=True),
         )
         return model.apply(
-            p, hidden,
+            {"params": p}, hidden,
             method=lambda m, h: m.indexer(h, sigma_max_scale=1.0),
         )
 
-    # We time only the indexer; subtract controller time in the report.
-    # For a clean standalone measure, pre-compute hidden outside JIT.
     batch = jax.device_put(sample_batch, batch_sharding)
     return _fn, (params, batch)
 
@@ -144,14 +143,22 @@ def _build_pool_retrieve_fn(model, state, sample_batch, config, batch_sharding):
     @functools.partial(jax.jit, donate_argnums=())
     def _fn(p, mu_r, mu_c, sigma):
         return model.apply(
-            p, mu_r, mu_c, sigma,
+            {"params": p}, mu_r, mu_c, sigma,
             method=lambda m, r, c, s: m.pool(r, c, s),
         )
 
-    # Use fixed dummy coordinates — timing is independent of values
-    mu_r  = jax.device_put(jnp.full((B,), 0.5), batch_sharding)
-    mu_c  = jax.device_put(jnp.full((B,), 0.5), batch_sharding)
-    sigma = jax.device_put(jnp.full((B,), 2.0), batch_sharding)
+    # mu_r/mu_c/sigma are 1D (B,) — derive 1D sharding from batch_sharding
+    # (batch_sharding has PartitionSpec(dp_axis, None) for 2D; we need 1D)
+    try:
+        _1d_sharding = NamedSharding(
+            batch_sharding.mesh,
+            PartitionSpec(batch_sharding.spec[0]),
+        )
+    except Exception:
+        _1d_sharding = batch_sharding  # fallback: may error, caught by _bench
+    mu_r  = jax.device_put(jnp.full((B,), 0.5), _1d_sharding)
+    mu_c  = jax.device_put(jnp.full((B,), 0.5), _1d_sharding)
+    sigma = jax.device_put(jnp.full((B,), 2.0), _1d_sharding)
     return _fn, (params, mu_r, mu_c, sigma)
 
 
@@ -166,7 +173,7 @@ def _build_integrator_fn(model, state, sample_batch, config, batch_sharding):
     @functools.partial(jax.jit, donate_argnums=())
     def _fn(p, combined):
         return model.apply(
-            p, combined,
+            {"params": p}, combined,
             method=lambda m, c: m.retrieval_integrator(c),
         )
 
@@ -187,7 +194,7 @@ def _build_acc_fn(model, state, sample_batch, config, batch_sharding):
     @functools.partial(jax.jit, donate_argnums=())
     def _fn(p, h, step_out, halt_prob, halted_mask):
         return model.apply(
-            p, h, step_out, 0, halt_prob, halted_mask,
+            {"params": p}, h, step_out, 0, halt_prob, halted_mask,
             method=lambda m, s, so, i, hp, hm: m.acc(s, so, i, hp, hm),
         )
 
@@ -215,7 +222,6 @@ def _build_reasoning_iter_fn(model, state, sample_batch, config, batch_sharding)
     @functools.partial(jax.jit, donate_argnums=())
     def _fn(p, hidden):
         def _step(m, h):
-            # Indexer
             mu, sigma = m.indexer(h, sigma_max_scale=1.0)
             H           = config.num_indexer_heads
             heads_per_dim = max(1, H // 2)
@@ -223,21 +229,18 @@ def _build_reasoning_iter_fn(model, state, sample_batch, config, batch_sharding)
             mu_c  = mu[:, min(heads_per_dim, H - 1)]
             sigma_h = (sigma[:, 0] + sigma[:, min(heads_per_dim, H - 1)]) / 2.0
 
-            # Pool retrieve (2D)
             retrieved, _ = m.pool(mu_r, mu_c, sigma_h)
 
-            # Integrate
             retrieved_exp = jnp.broadcast_to(retrieved[:, None, :], (h.shape[0], T, D))
             combined      = jnp.concatenate([h, retrieved_exp], axis=-1)
             integrated    = m.retrieval_integrator(combined)
 
-            # ACC
             halt_prob   = jnp.zeros((h.shape[0], T, 1), dtype=h.dtype)
             halted_mask = jnp.zeros((h.shape[0], T, 1), dtype=h.dtype)
             new_h, _, _ = m.acc(h, h + integrated, 0, halt_prob, halted_mask)
             return new_h
 
-        return model.apply(p, hidden, method=_step)
+        return model.apply({"params": p}, hidden, method=_step)
 
     hidden = jax.device_put(jnp.zeros((B, T, D), dtype=dtype), batch_sharding)
     return _fn, (params, hidden)
@@ -283,7 +286,7 @@ def _build_reasoning_loop_fn(model, state, sample_batch, config, batch_sharding)
                                            jnp.arange(R))
             return out
 
-        return model.apply(p, hidden, method=_loop)
+        return model.apply({"params": p}, hidden, method=_loop)
 
     hidden = jax.device_put(jnp.zeros((B, T, D), dtype=dtype), batch_sharding)
     return _fn, (params, hidden)
@@ -304,7 +307,7 @@ def _build_decoder_fn(model, state, sample_batch, config, batch_sharding,
     @functools.partial(jax.jit, donate_argnums=())
     def _fn(p, hidden, labels):
         decode_fn = lambda h: model.apply(
-            p, h, method=lambda m, x: m.controller.decode(x)
+            {"params": p}, h, method=lambda m, x: m.controller.decode(x)
         )
         if chunk > 0:
             return chunked_lm_loss(hidden, labels, decode_fn, pad_token_id, chunk)
@@ -323,15 +326,12 @@ def _build_decoder_fn(model, state, sample_batch, config, batch_sharding,
 
 def _build_forward_fn(model, state, sample_batch, config, batch_sharding):
     """Time: complete forward pass (controller + reasoning + decoder)."""
-    params = state.params
+    params   = state.params
     use_bf16 = getattr(config, "use_bf16", False)
-    loss_chunk = getattr(config, "loss_chunk_size", 0)
 
     @functools.partial(jax.jit, donate_argnums=())
     def _fn(p, x):
-        if use_bf16:
-            x = x  # batch is int32, stays as-is
-        logits, _ = model.apply(p, x, deterministic=True, sigma_max_scale=1.0)
+        logits, _ = model.apply({"params": p}, x, deterministic=True, sigma_max_scale=1.0)
         return logits
 
     batch = jax.device_put(sample_batch, batch_sharding)
@@ -527,6 +527,7 @@ def run_model_profile(
             print(f"median {r['median_ms']:.1f} ms", flush=True)
         except Exception as exc:
             print(f"FAILED ({exc})", flush=True)
+            traceback.print_exc()
             results[name] = None
 
     # ── 1. Controller ─────────────────────────────────────────────────────────
