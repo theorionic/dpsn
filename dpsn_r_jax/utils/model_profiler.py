@@ -362,7 +362,7 @@ def _build_train_step_fn(train_step_fn, state, sample_batch,
 # Report printer
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _print_report(results: dict, config, step: int) -> None:
+def _print_report(results: dict, config, step: int, runs: int = 10) -> None:
     """
     Print a structured breakdown table.
 
@@ -559,4 +559,4 @@ def run_model_profile(
            replicated_sharding, pad_token_id)
 
     # ── Report ────────────────────────────────────────────────────────────────
-    _print_report(results, config, step)
+    _print_report(results, config, step, runs=runs)
