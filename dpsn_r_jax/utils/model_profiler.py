@@ -246,6 +246,34 @@ def _build_reasoning_iter_fn(model, state, sample_batch, config, batch_sharding)
     return _fn, (params, hidden)
 
 
+def _build_prefetch_encode_fn(model, state, sample_batch, config, batch_sharding):
+    """
+    Time: _prefetch_encode (used when config.prefetch_reasoning=True).
+
+    This is the ACTUAL reasoning path when --prefetch_reasoning is passed.
+    It fetches a patch_size×patch_size candidate block from the pool ONCE,
+    then runs R iterations of dot-product attention over those SRAM candidates.
+
+    Replaces _build_reasoning_loop_fn in the profiler when prefetch_reasoning
+    is active — benchmarking the standard scan would measure the wrong path.
+    """
+    params = state.params
+    B      = sample_batch.shape[0]
+    T      = config.max_seq_len
+    D      = config.controller_hidden_dim
+    dtype  = jnp.bfloat16 if config.use_bf16 else jnp.float32
+
+    @functools.partial(jax.jit, donate_argnums=())
+    def _fn(p, hidden):
+        return model.apply(
+            {"params": p}, hidden,
+            method=lambda m, h: m._prefetch_encode(h, sigma_max_scale=1.0),
+        )
+
+    hidden = jax.device_put(jnp.zeros((B, T, D), dtype=dtype), batch_sharding)
+    return _fn, (params, hidden)
+
+
 def _build_reasoning_loop_fn(model, state, sample_batch, config, batch_sharding):
     """
     Time: full lax.scan reasoning loop (R iterations exactly as in training).
@@ -410,8 +438,12 @@ def _print_report(results: dict, config, step: int, runs: int = 10) -> None:
 
     print(f"  {sep}", flush=True)
 
+    _prefetch_active = getattr(config, "prefetch_reasoning", False)
+    _loop_label = (f"Reasoning Loop ×{R} (prefetch_encode)"
+                   if _prefetch_active else
+                   f"Reasoning Loop ×{R} (lax.scan total)")
     if loop_ms:
-        _row(f"Reasoning Loop ×{R} (lax.scan total)", loop_ms, bar_base)
+        _row(_loop_label, loop_ms, bar_base)
 
         if results.get("indexer"):
             idx_total_ms = results["indexer"]["median_ms"]
@@ -549,9 +581,23 @@ def run_model_profile(
     _bench("reasoning_iter", _build_reasoning_iter_fn,
            model, state, sample_batch, config, batch_sharding)
 
-    # ── 7. Full reasoning loop (R iterations) ─────────────────────────────────
-    _bench("reasoning_loop", _build_reasoning_loop_fn,
-           model, state, sample_batch, config, batch_sharding)
+    # ── 7. Full reasoning loop — standard OR prefetch path ────────────────────
+    if getattr(config, "prefetch_reasoning", False):
+        print(f"  [reasoning_loop] --prefetch_reasoning active: "
+              f"benchmarking _prefetch_encode path...", end=" ", flush=True)
+        try:
+            fn, args = _build_prefetch_encode_fn(
+                model, state, sample_batch, config, batch_sharding)
+            r = _time_fn(fn, *args, warmup=warmup, runs=runs)
+            results["reasoning_loop"] = r
+            print(f"median {r['median_ms']:.1f} ms  (prefetch path)", flush=True)
+        except Exception as exc:
+            print(f"FAILED ({exc})", flush=True)
+            traceback.print_exc()
+            results["reasoning_loop"] = None
+    else:
+        _bench("reasoning_loop", _build_reasoning_loop_fn,
+               model, state, sample_batch, config, batch_sharding)
 
     # ── 8. Decoder / LM head ──────────────────────────────────────────────────
     _bench("decoder", _build_decoder_fn,
