@@ -339,6 +339,38 @@ def main():
             "Larger patch = broader pool coverage per step, higher SRAM use."
         ),
     )
+    parser.add_argument(
+        "--profile_model",
+        action="store_true",
+        help=(
+            "Run a fine-grained wall-clock profiler on every model component before "
+            "training starts. Prints a breakdown table showing how step time is split "
+            "across: TinyController / LearnedIndexer / Pool retrieve / "
+            "Retrieval integrator / ACC / LM head decoder / full forward / "
+            "full train step. Also derives backward+optimizer time and lax.scan overhead. "
+            "Works on v5e-8 (multi-device) via jax.block_until_ready — not ctimer. "
+            "Each component is JIT-compiled separately and timed with warmup runs."
+        ),
+    )
+    parser.add_argument(
+        "--profile_model_runs",
+        type=int,
+        default=10,
+        help=(
+            "Number of timed runs per component when --profile_model is set. "
+            "Median over this many runs is reported. "
+            "3–5 is fast; 10+ gives more stable estimates. Default: 10."
+        ),
+    )
+    parser.add_argument(
+        "--profile_model_warmup",
+        type=int,
+        default=3,
+        help=(
+            "Number of warmup runs (compiled, not timed) before profiling each "
+            "component. Ensures XLA has fully pipelined the computation. Default: 3."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -855,6 +887,43 @@ def main():
 
     flops_per_step = calculate_flops(config, args.batch_size)
     summarise_flops(config, args.batch_size)  # print breakdown once at startup
+
+    # ── Model component profiler (--profile_model) ───────────────────────────
+    # Runs BEFORE the training loop so it doesn't interfere with step timing.
+    # Uses synthetic zero batches — timing is independent of actual token values.
+    # Works on v5e-8 (multi-device): uses jax.block_until_ready, NOT ctimer.
+    if args.profile_model:
+        from dpsn_r_jax.utils.model_profiler import run_model_profile
+        _profile_batch = jax.device_put(
+            jnp.zeros((args.batch_size, config.max_seq_len), dtype=jnp.int32),
+            batch_sharding,
+        )
+        _profile_lr    = jnp.float32(config.learning_rate)
+        _profile_sigma = jnp.float32(1.0)
+        _profile_step_fn = train_step  # always use single-step fn for profiling
+        print(
+            f"\n[MODEL PROFILER] --profile_model enabled\n"
+            f"  warmup={args.profile_model_warmup} runs, "
+            f"timed={args.profile_model_runs} runs per component\n"
+            f"  Batch: {args.batch_size} × {config.max_seq_len} (synthetic zeros)\n"
+            f"  NOTE: first component will trigger JIT compilation — "
+            f"subsequent ones use the compiled cache.\n"
+        )
+        run_model_profile(
+            model=model,
+            state=state,
+            config=config,
+            sample_batch=_profile_batch,
+            batch_sharding=batch_sharding,
+            replicated_sharding=replicated_sharding,
+            train_step_fn=_profile_step_fn,
+            current_lr=_profile_lr,
+            sigma_scale=_profile_sigma,
+            warmup=args.profile_model_warmup,
+            runs=args.profile_model_runs,
+            step=0,
+        )
+        print("[MODEL PROFILER] Done. Proceeding to training...\n")
 
     # For infinite HF streaming/chunked datasets, steps_per_epoch from
     # dataset_size is meaningless.  Use max_steps as the epoch length so the
