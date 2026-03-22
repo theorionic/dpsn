@@ -692,6 +692,8 @@ def main():
         pool_m=pool_m,
         pool_v=pool_v,
         window_size=config.max_k,
+        max_reasoning_loops=config.max_reasoning_loops,
+        heads_per_dim=max(1, config.num_indexer_heads // 2),
     )
 
     # ── FIX DOUBLE COMPILATION ────────────────────────────────────────────────
