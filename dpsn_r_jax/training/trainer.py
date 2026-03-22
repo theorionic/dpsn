@@ -224,9 +224,12 @@ def _apply_sparse_pool_adam(pool_params, pool_m, pool_v, r_starts, c_starts,
         p, m, v = carry
         r_s, c_s, g = x  # scalar int32, scalar int32, (W, W, D) f32
 
+        m_dtype = m.dtype
+        v_dtype = v.dtype
+
         p_sl = lax.dynamic_slice(p, (r_s, c_s, 0), (W, W, D)).astype(jnp.float32)
-        m_sl = lax.dynamic_slice(m, (r_s, c_s, 0), (W, W, D))
-        v_sl = lax.dynamic_slice(v, (r_s, c_s, 0), (W, W, D))
+        m_sl = lax.dynamic_slice(m, (r_s, c_s, 0), (W, W, D)).astype(jnp.float32)
+        v_sl = lax.dynamic_slice(v, (r_s, c_s, 0), (W, W, D)).astype(jnp.float32)
 
         m_new = b1 * m_sl + (1.0 - b1) * g
         v_new = b2 * v_sl + (1.0 - b2) * g ** 2
@@ -235,8 +238,8 @@ def _apply_sparse_pool_adam(pool_params, pool_m, pool_v, r_starts, c_starts,
         p_new = p_sl - lr * m_hat / (jnp.sqrt(v_hat) + eps)
 
         p = lax.dynamic_update_slice(p, p_new.astype(pool_dtype), (r_s, c_s, 0))
-        m = lax.dynamic_update_slice(m, m_new, (r_s, c_s, 0))
-        v = lax.dynamic_update_slice(v, v_new, (r_s, c_s, 0))
+        m = lax.dynamic_update_slice(m, m_new.astype(m_dtype), (r_s, c_s, 0))
+        v = lax.dynamic_update_slice(v, v_new.astype(v_dtype), (r_s, c_s, 0))
         return (p, m, v), None
 
     (pool_params, pool_m, pool_v), _ = lax.scan(
