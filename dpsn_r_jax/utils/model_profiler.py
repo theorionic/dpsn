@@ -380,10 +380,10 @@ def _print_report(results: dict, config, step: int) -> None:
         print(f"  {prefix}{label:<42} {ms:8.1f} ms  {pct_str}  {bar}", flush=True)
 
     R          = config.max_reasoning_loops
-    train_ms   = results.get("train_step", {}).get("median_ms")
-    forward_ms = results.get("forward",    {}).get("median_ms")
-    loop_ms    = results.get("reasoning_loop", {}).get("median_ms")
-    iter_ms    = results.get("reasoning_iter", {}).get("median_ms")
+    train_ms   = (results.get("train_step") or {}).get("median_ms")
+    forward_ms = (results.get("forward")    or {}).get("median_ms")
+    loop_ms    = (results.get("reasoning_loop") or {}).get("median_ms")
+    iter_ms    = (results.get("reasoning_iter") or {}).get("median_ms")
 
     bwd_ms = (train_ms - forward_ms) if (train_ms and forward_ms) else None
     scan_overhead_ms = (loop_ms - R * iter_ms) if (loop_ms and iter_ms) else None
@@ -399,35 +399,35 @@ def _print_report(results: dict, config, step: int) -> None:
           flush=True)
     print(f"  {sep}", flush=True)
 
-    if "controller" in results:
+    if results.get("controller"):
         ctrl_ms = results["controller"]["median_ms"]
         _row("TinyController (encoder)", ctrl_ms, train_ms)
 
     print(f"  {sep}", flush=True)
 
-    if "reasoning_loop" in results and loop_ms:
+    if loop_ms:
         _row(f"Reasoning Loop ×{R} (lax.scan total)", loop_ms, train_ms)
 
-        if "indexer" in results:
+        if results.get("indexer"):
             # indexer fn includes controller; subtract to get indexer-only
             idx_total_ms = results["indexer"]["median_ms"]
-            idx_ms       = idx_total_ms - (results.get("controller", {}).get("median_ms") or 0)
+            idx_ms       = idx_total_ms - ((results.get("controller") or {}).get("median_ms") or 0)
             idx_ms       = max(idx_ms, 0.1)
             _row(f"  ├─ LearnedIndexer (×{R} est.)", idx_ms * R, train_ms, indent=1)
 
-        if "pool_retrieve" in results:
+        if results.get("pool_retrieve"):
             pool_ms = results["pool_retrieve"]["median_ms"]
             _row(f"  ├─ Pool retrieve (×{R} est.)",  pool_ms * R, train_ms, indent=1)
 
-        if "integrator" in results:
+        if results.get("integrator"):
             integ_ms = results["integrator"]["median_ms"]
             _row(f"  ├─ Retrieval integrator (×{R} est.)", integ_ms * R, train_ms, indent=1)
 
-        if "acc" in results:
+        if results.get("acc"):
             acc_ms = results["acc"]["median_ms"]
             _row(f"  ├─ ACC (×{R} est.)", acc_ms * R, train_ms, indent=1)
 
-        if "reasoning_iter" in results and iter_ms:
+        if iter_ms:
             _row(f"  ├─ 1 full iteration (measured)", iter_ms, train_ms, indent=1)
             _row(f"  ├─ ×{R} iter extrapolated",      iter_ms * R, train_ms, indent=1)
             if scan_overhead_ms is not None:
@@ -435,7 +435,7 @@ def _print_report(results: dict, config, step: int) -> None:
 
     print(f"  {sep}", flush=True)
 
-    if "decoder" in results:
+    if results.get("decoder"):
         dec_ms = results["decoder"]["median_ms"]
         _row("LM Head Decoder (chunked CE)", dec_ms, train_ms)
 
