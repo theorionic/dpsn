@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+import jax.profiler
 from jax import random
 from flax.training import train_state
 import optax
@@ -219,7 +220,6 @@ def _apply_sparse_pool_adam(pool_params, pool_m, pool_v, r_starts, c_starts,
         grad_slices:  (N, W, W, D) float32
         lr, step, b1, b2, eps: Adam hyperparameters
     """
-    import jax
     from jax import lax
     W = grad_slices.shape[1]
     D = grad_slices.shape[-1]
@@ -298,8 +298,6 @@ def _apply_optimizer_update(state, grads, indices, new_rng, current_lr):
     dense_grads  = traverse_util.unflatten_dict(dense_flat_grads)
     dense_params = traverse_util.unflatten_dict(dense_flat_params)
 
-    import jax.profiler
-
     # ── Dense AdamW update ─────────────────────────────────────────────────
     with jax.profiler.TraceAnnotation("Optimizer_Dense_AdamW"):
         updates, new_opt_state = state.tx.update(dense_grads, state.opt_state, dense_params)
@@ -374,8 +372,6 @@ def _apply_optimizer_update_sparse(state, dense_grads, dense_params, pool_params
     Pool gradient is represented as (N, W, W, D) slices instead of the full
     (R_pool, C_pool, D) tensor, eliminating ~805 MB of memory traffic per step.
     """
-    import jax.profiler
-
     # ── Dense AdamW update ──────────────────────────────────────────────────
     with jax.profiler.TraceAnnotation("Optimizer_Dense_AdamW"):
         updates, new_opt_state = state.tx.update(dense_grads, state.opt_state, dense_params)
@@ -531,7 +527,6 @@ def train_step(
              pf_r_start, pf_c_start),
         )
 
-    import jax.profiler
     with jax.profiler.TraceAnnotation("Loss_and_Backprop"):
         (loss, (indices, mean_sigma,
                 all_mu_r, all_mu_c, all_sigma_h, all_start_2d,
@@ -721,7 +716,6 @@ def grad_accum_step(
                  pf_r_start, pf_c_start),
             )
 
-        import jax.profiler
         with jax.profiler.TraceAnnotation("Microbatch_Forward_Backward"):
             (loss, (indices, mean_sigma,
                     all_mu_r, all_mu_c, all_sigma_h, all_start_2d,
