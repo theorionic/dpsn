@@ -50,16 +50,16 @@ class TinyController(nn.Module):
         self.final_norm = nn.LayerNorm()
         self.lm_head = nn.Dense(self.config.vocab_size, use_bias=False)
 
-    def __call__(self, input_ids, deterministic=True):
-        return self.encode(input_ids, deterministic)
+    def __call__(self, input_ids, deterministic=True, seq_pack_ids=None):
+        return self.encode(input_ids, deterministic, seq_pack_ids=seq_pack_ids)
 
-    def encode(self, input_ids, deterministic=True):
+    def encode(self, input_ids, deterministic=True, seq_pack_ids=None):
         x = self.embedding(input_ids)   # (B, T, D) — no pos_embed added
 
         for layer in self.layers:
             # deterministic is the only extra arg; pass positionally so
             # static_argnums=(1,) in nn.remat catches it correctly.
-            x = layer(x, deterministic)
+            x = layer(x, deterministic, seq_pack_ids=seq_pack_ids)
 
         return x
 

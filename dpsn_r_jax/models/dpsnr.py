@@ -64,7 +64,8 @@ class DPSNR(nn.Module):
             self.prefetch_query_attn = nn.Dense(1, use_bias=False)
             self.prefetch_query_proj = nn.Dense(self.config.controller_hidden_dim)
 
-    def __call__(self, input_ids, deterministic=True, sigma_max_scale: float = 1.0):
+    def __call__(self, input_ids, deterministic=True, sigma_max_scale: float = 1.0,
+                 seq_pack_ids=None):
         """
         Args:
             input_ids:        (B, T) integer token ids.
@@ -74,6 +75,8 @@ class DPSNR(nn.Module):
                               decreasing to ~0.01 at sigma_anneal_steps.
                               Shrinks the effective sigma_max so routing becomes
                               progressively more precise without param changes.
+            seq_pack_ids:     (T,) int32 or None. If provided, uses block-diagonal
+                              causal attention mask for sequence packing.
 
         Returns:
             logits:       (B, T, vocab)
@@ -84,7 +87,7 @@ class DPSNR(nn.Module):
         ctimer.mark("00_encode_start", input_ids.astype(jnp.float32))
 
         state_hidden, all_indices, mean_sigma, _, _, _, _, _, _ = self._encode_hidden(
-            input_ids, deterministic, sigma_max_scale
+            input_ids, deterministic, sigma_max_scale, seq_pack_ids=seq_pack_ids
         )
 
         # 3. Decode — the expensive (B, T, V) step
@@ -95,7 +98,7 @@ class DPSNR(nn.Module):
         return logits, (self.config.max_reasoning_loops, all_indices, mean_sigma)
 
     def encode_to_hidden(self, input_ids, deterministic=True, sigma_max_scale: float = 1.0,
-                         retrieved_probes=None, candidates_probe=None):
+                         retrieved_probes=None, candidates_probe=None, seq_pack_ids=None):
         """Run controller + reasoning loop and return state_hidden WITHOUT the LM head.
 
         Used by chunked_lm_loss in trainer.py to avoid materialising the full
@@ -121,6 +124,7 @@ class DPSNR(nn.Module):
             input_ids, deterministic, sigma_max_scale,
             retrieved_probes=retrieved_probes,
             candidates_probe=candidates_probe,
+            seq_pack_ids=seq_pack_ids,
         )
         return state_hidden, (
             self.config.max_reasoning_loops, all_indices, mean_sigma,
@@ -129,7 +133,7 @@ class DPSNR(nn.Module):
         )
 
     def _encode_hidden(self, input_ids, deterministic=True, sigma_max_scale: float = 1.0,
-                       retrieved_probes=None, candidates_probe=None):
+                       retrieved_probes=None, candidates_probe=None, seq_pack_ids=None):
         """Core shared encoder: controller + reasoning loop.
 
         Returns 9-tuple:
@@ -142,7 +146,7 @@ class DPSNR(nn.Module):
         # 1. Encode
         # MUST pass deterministic as a positional argument so static_argnums=(1,) catches it!
         with jax.profiler.TraceAnnotation("TinyController_Forward"):
-            hidden = self.controller(input_ids, deterministic)
+            hidden = self.controller(input_ids, deterministic, seq_pack_ids=seq_pack_ids)
         # ── Timing mark: TinyController finished ─────────────────────────────
         # jax.debug.callback fires at actual XLA execution time (not trace time).
         # 'hidden' is the trigger array — sequences the mark AFTER the controller.
@@ -385,10 +389,12 @@ class DPSNR(nn.Module):
         else:
             init_carry = (state_hidden, halt_prob, halted_mask)
 
+        _unroll = min(2, self.config.max_reasoning_loops)
         final_carry, (all_indices, sigma_per_loop, all_mu_r, all_mu_c, all_sigma_h, all_start_2d) = jax.lax.scan(
             _scan_fn,
             init_carry,
             jnp.arange(self.config.max_reasoning_loops),
+            unroll=_unroll,
         )
 
         if USE_SW:
@@ -566,10 +572,12 @@ class DPSNR(nn.Module):
         if self.config.gradient_checkpointing:
             _scan_fn = jax.checkpoint(prefetch_step)
 
+        _unroll = min(2, self.config.max_reasoning_loops)
         (state_hidden, _, _, _), _ = jax.lax.scan(
             _scan_fn,
             (hidden, halt_prob, halted_mask, candidates),
             jnp.arange(self.config.max_reasoning_loops),
+            unroll=_unroll,
         )
 
         # ── Build all_indices for sparse-Adam pool update ─────────────────────

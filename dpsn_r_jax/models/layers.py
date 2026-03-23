@@ -135,6 +135,30 @@ def _make_sliding_window_causal_bias(seq_len: int, window_size: int):
     return jnp.where(in_window, 0.0, -1e4).astype(jnp.float32)  # (T, T)
 
 
+def _make_packed_causal_bias(seq_len: int, seq_pack_ids: jnp.ndarray):
+    """Additive attention bias for packed sequences (block-diagonal causal).
+
+    Position j can be attended to by position i if:
+      - same sub-sequence (seq_pack_ids[i] == seq_pack_ids[j])
+      - causal order (j <= i)
+      - not padding (seq_pack_ids[j] >= 0)
+
+    Args:
+        seq_len:      T — total sequence length.
+        seq_pack_ids: (T,) int32 — sub-sequence id per position; -1 = padding.
+
+    Returns:
+        (T, T) float32 additive bias; 0.0 where attention is allowed, -1e4 elsewhere.
+    """
+    i = jnp.arange(seq_len)[:, None]   # (T, 1)
+    j = jnp.arange(seq_len)[None, :]   # (1, T)
+    same_seq = seq_pack_ids[i] == seq_pack_ids[j]          # (T, T) bool
+    causal   = j <= i                                       # (T, T) bool
+    not_pad  = seq_pack_ids[j] >= 0                        # (T, T) bool
+    valid    = same_seq & causal & not_pad
+    return jnp.where(valid, jnp.float32(0.0), jnp.float32(-1e4))
+
+
 # ---------------------------------------------------------------------------
 # Attention layer
 # ---------------------------------------------------------------------------
@@ -149,7 +173,7 @@ class FlashCausalSelfAttention(nn.Module):
     window_size: int = 0
 
     @nn.compact
-    def __call__(self, x, deterministic=True):
+    def __call__(self, x, deterministic=True, seq_pack_ids=None):
         B, T, _ = x.shape
         head_dim = self.hidden_dim // self.num_heads
 
@@ -171,9 +195,12 @@ class FlashCausalSelfAttention(nn.Module):
         # shard_map requires B to be divisible by device_count — if it isn't
         # (e.g. dummy batch=1 during jax.eval_shape) we fall back to standard
         # dot-product attention so the shape-inference pass doesn't crash.
+        # Packed sequences always use the fallback path — splash attention does
+        # not support dynamic per-position masks.
         _ndev = jax.device_count()
         _use_splash = (
-            _use_pallas(self.use_flash_attention, T)
+            seq_pack_ids is None
+            and _use_pallas(self.use_flash_attention, T)
             and (_ndev == 1 or (_MESH is not None and B % _ndev == 0))
         )
 
@@ -252,9 +279,14 @@ class FlashCausalSelfAttention(nn.Module):
             # ----------------------------------------------------------------
             # Standard Flax dot-product attention fallback.
             # Used on CPU/GPU, when seq_len constraints aren't met, or when
-            # batch size isn't divisible by device count (e.g. eval_shape).
+            # batch size isn't divisible by device count (e.g. eval_shape),
+            # or when seq_pack_ids is provided (packed sequences need a
+            # block-diagonal causal mask that splash attention cannot express).
             # ----------------------------------------------------------------
-            if self.window_size > 0:
+            if seq_pack_ids is not None:
+                bias = _make_packed_causal_bias(T, seq_pack_ids)
+                bias = bias[None, None, :, :]  # (1, 1, T, T) broadcast over B and H
+            elif self.window_size > 0:
                 bias = _make_sliding_window_causal_bias(T, self.window_size)
                 bias = bias[None, None, :, :]
             else:
@@ -304,7 +336,7 @@ class TinyTransformerLayer(nn.Module):
     window_size: int = 0
 
     @nn.compact
-    def __call__(self, x, deterministic=True):
+    def __call__(self, x, deterministic=True, seq_pack_ids=None):
         norm1 = nn.LayerNorm()(x)
         attn_out = FlashCausalSelfAttention(
             self.hidden_dim,
@@ -312,7 +344,7 @@ class TinyTransformerLayer(nn.Module):
             self.dropout_rate,
             self.use_flash_attention,
             self.window_size,
-        )(norm1, deterministic=deterministic)
+        )(norm1, deterministic=deterministic, seq_pack_ids=seq_pack_ids)
         x = x + attn_out
 
         norm2 = nn.LayerNorm()(x)

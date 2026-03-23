@@ -39,6 +39,7 @@ from typing import Tuple
 
 import jax
 import jax.numpy as jnp
+from jax.sharding import PartitionSpec
 
 # ── Pallas availability ───────────────────────────────────────────────────────
 try:
@@ -46,6 +47,26 @@ try:
     _PALLAS_AVAILABLE = True
 except ImportError:               # pragma: no cover
     _PALLAS_AVAILABLE = False
+
+# ── shard_map availability ────────────────────────────────────────────────────
+try:
+    from jax.experimental.shard_map import shard_map as _shard_map
+    _SHARD_MAP_AVAILABLE = True
+except Exception:
+    _shard_map = None
+    _SHARD_MAP_AVAILABLE = False
+
+# ── Mesh registration ─────────────────────────────────────────────────────────
+# Call set_mesh(mesh) from main.py after the device mesh is created.
+# _pool*_pallas_impl reads _MESH at call time to decide whether to wrap in
+# shard_map for TP multi-chip runs.
+_MESH = None
+
+
+def set_mesh(mesh):
+    """Register the device mesh for TP-aware shard_map wrapping in pool kernels."""
+    global _MESH
+    _MESH = mesh
 
 
 def _is_tpu() -> bool:
@@ -60,22 +81,35 @@ def _interpret_mode() -> bool:
     return os.environ.get("DPSN_PALLAS_INTERPRET", "0") == "1"
 
 
+def _is_tp_mesh() -> bool:
+    """Return True when a 2-D TP+DP mesh is registered (tp and dp axes both present)."""
+    return (
+        _MESH is not None
+        and "tp" in _MESH.axis_names
+        and "dp" in _MESH.axis_names
+    )
+
+
 def _use_pallas() -> bool:
     """Return True only when Pallas kernels are safe to call.
 
     Mosaic TPU kernels cannot be auto-partitioned by XLA's GSPMD, so they fail
     inside jit with a multi-chip mesh unless explicitly wrapped in shard_map.
-    We therefore restrict to single-chip TPU by default.
+    We therefore restrict to single-chip TPU by default, OR allow multi-chip
+    when a 2-D TP mesh is registered (the pool kernels wrap themselves in
+    shard_map in that case).
 
-    To enable on multi-chip (after wrapping calls in shard_map yourself):
+    To enable on multi-chip without a TP mesh:
         export DPSN_PALLAS_FORCE=1
     """
     if _interpret_mode():
         return _PALLAS_AVAILABLE  # interpret mode always safe (pure Python)
     if not _PALLAS_AVAILABLE or not _is_tpu():
         return False
-    # Multi-chip guard: disable unless the user has explicitly opted in.
-    if jax.device_count() > 1 and os.environ.get("DPSN_PALLAS_FORCE", "0") != "1":
+    if jax.device_count() > 1:
+        # Allow multi-chip when: TP mesh registered, OR force flag set
+        if _is_tp_mesh() or os.environ.get("DPSN_PALLAS_FORCE", "0") == "1":
+            return True
         return False
     return True
 
@@ -300,21 +334,42 @@ def _pool1d_pallas_impl(pool, mu, sigma, start_indices, W, Total):
     B, D = mu.shape[0], pool.shape[1]
     kernel = functools.partial(_pool1d_body, W=W, Total=Total)
 
-    return pl.pallas_call(
-        kernel,
-        out_shape=jax.ShapeDtypeStruct((B, D), jnp.float32),
-        grid_spec=pl.GridSpec(
-            grid=(B,),
-            in_specs=[
-                pl.BlockSpec((Total, D), lambda i: (0, 0)),
-                pl.BlockSpec((1,), lambda i: (i,)),
-                pl.BlockSpec((1,), lambda i: (i,)),
-                pl.BlockSpec((1,), lambda i: (i,)),
-            ],
-            out_specs=pl.BlockSpec((1, D), lambda i: (i, 0)),
-        ),
-        interpret=_interpret_mode(),
-    )(pool, start_indices, mu, sigma)
+    def _raw_pallas_call(pool_, start_indices_, mu_, sigma_):
+        _B = mu_.shape[0]
+        _D = pool_.shape[1]
+        return pl.pallas_call(
+            kernel,
+            out_shape=jax.ShapeDtypeStruct((_B, _D), jnp.float32),
+            grid_spec=pl.GridSpec(
+                grid=(_B,),
+                in_specs=[
+                    pl.BlockSpec((Total, _D), lambda i: (0, 0)),
+                    pl.BlockSpec((1,), lambda i: (i,)),
+                    pl.BlockSpec((1,), lambda i: (i,)),
+                    pl.BlockSpec((1,), lambda i: (i,)),
+                ],
+                out_specs=pl.BlockSpec((1, _D), lambda i: (i, 0)),
+            ),
+            interpret=_interpret_mode(),
+        )(pool_, start_indices_, mu_, sigma_)
+
+    # ── TP multi-chip: wrap in shard_map so each chip runs on its local data ──
+    # pool is feature-sharded on "tp" axis (last dim); batch is "dp"-sharded.
+    if jax.device_count() > 1 and _is_tp_mesh() and _SHARD_MAP_AVAILABLE:
+        return _shard_map(
+            _raw_pallas_call,
+            mesh=_MESH,
+            in_specs=(
+                PartitionSpec(None, "tp"),   # pool: (Total, D/tp) per chip
+                PartitionSpec("dp",),         # start_indices: batch-sharded
+                PartitionSpec("dp",),         # mu: batch-sharded
+                PartitionSpec("dp",),         # sigma: batch-sharded
+            ),
+            out_specs=PartitionSpec("dp", "tp"),  # (B/dp, D/tp) per chip
+            check_rep=False,
+        )(pool, start_indices, mu, sigma)
+
+    return _raw_pallas_call(pool, start_indices, mu, sigma)
 
 
 # custom_vjp: Pallas runs in the forward pass; pure-JAX VJP in the backward.
@@ -441,23 +496,46 @@ def _pool2d_pallas_impl(pool, r_start, c_start, r_center, c_center, sigma, W, R,
     B, D = sigma.shape[0], pool.shape[2]
     kernel = functools.partial(_pool2d_body, W=W, R=R, C=C)
 
-    return pl.pallas_call(
-        kernel,
-        out_shape=jax.ShapeDtypeStruct((B, D), jnp.float32),
-        grid_spec=pl.GridSpec(
-            grid=(B,),
-            in_specs=[
-                pl.BlockSpec((R, C, D), lambda i: (0, 0, 0)),
-                pl.BlockSpec((1,), lambda i: (i,)),
-                pl.BlockSpec((1,), lambda i: (i,)),
-                pl.BlockSpec((1,), lambda i: (i,)),
-                pl.BlockSpec((1,), lambda i: (i,)),
-                pl.BlockSpec((1,), lambda i: (i,)),
-            ],
-            out_specs=pl.BlockSpec((1, D), lambda i: (i, 0)),
-        ),
-        interpret=_interpret_mode(),
-    )(pool, r_start, c_start, r_center, c_center, sigma)
+    def _raw_pallas_call(pool_, r_start_, c_start_, r_center_, c_center_, sigma_):
+        _B = sigma_.shape[0]
+        _D = pool_.shape[2]
+        return pl.pallas_call(
+            kernel,
+            out_shape=jax.ShapeDtypeStruct((_B, _D), jnp.float32),
+            grid_spec=pl.GridSpec(
+                grid=(_B,),
+                in_specs=[
+                    pl.BlockSpec((R, C, _D), lambda i: (0, 0, 0)),
+                    pl.BlockSpec((1,), lambda i: (i,)),
+                    pl.BlockSpec((1,), lambda i: (i,)),
+                    pl.BlockSpec((1,), lambda i: (i,)),
+                    pl.BlockSpec((1,), lambda i: (i,)),
+                    pl.BlockSpec((1,), lambda i: (i,)),
+                ],
+                out_specs=pl.BlockSpec((1, _D), lambda i: (i, 0)),
+            ),
+            interpret=_interpret_mode(),
+        )(pool_, r_start_, c_start_, r_center_, c_center_, sigma_)
+
+    # ── TP multi-chip: wrap in shard_map so each chip runs on its local data ──
+    # pool is feature-sharded on "tp" axis (last dim); batch is "dp"-sharded.
+    if jax.device_count() > 1 and _is_tp_mesh() and _SHARD_MAP_AVAILABLE:
+        return _shard_map(
+            _raw_pallas_call,
+            mesh=_MESH,
+            in_specs=(
+                PartitionSpec(None, None, "tp"),  # pool: (R, C, D/tp) per chip
+                PartitionSpec("dp",),              # r_start: batch-sharded
+                PartitionSpec("dp",),              # c_start: batch-sharded
+                PartitionSpec("dp",),              # r_center: batch-sharded
+                PartitionSpec("dp",),              # c_center: batch-sharded
+                PartitionSpec("dp",),              # sigma: batch-sharded
+            ),
+            out_specs=PartitionSpec("dp", "tp"),   # (B/dp, D/tp) per chip
+            check_rep=False,
+        )(pool, r_start, c_start, r_center, c_center, sigma)
+
+    return _raw_pallas_call(pool, r_start, c_start, r_center, c_center, sigma)
 
 
 # custom_vjp: Pallas forward, pure-JAX backward.

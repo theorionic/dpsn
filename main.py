@@ -72,6 +72,11 @@ def log_pool_utilization(state):
 
 
 def main():
+    # ── TPU Megacore: must be set before JAX initialises devices ─────────────
+    import os as _os
+    if jax.default_backend() == "tpu":
+        _os.environ.setdefault("TPU_MEGACORE", "megacore")
+
     parser = argparse.ArgumentParser(description="Train DPSNR Model")
     parser.add_argument(
         "--tiny", action="store_true", help="Use tiny config for testing"
@@ -371,6 +376,19 @@ def main():
             "component. Ensures XLA has fully pipelined the computation. Default: 3."
         ),
     )
+    parser.add_argument(
+        "--pack_sequences",
+        action="store_true",
+        help=(
+            "Enable sequence packing: bin-pack multiple variable-length sequences "
+            "into single max_seq_len bins using first-fit-decreasing, then apply "
+            "a block-diagonal causal attention mask so packed sequences cannot "
+            "attend across boundaries. Improves TPU utilisation when training on "
+            "short-sequence datasets. Requires the dataset to return varying-length "
+            "sequences. Incompatible with --loss_chunk_size (chunked loss path) "
+            "and splash attention (falls back to standard dot-product attention)."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -485,6 +503,11 @@ def main():
     # in shard_map for multi-device TPU runs (avoids GSPMD auto-partition error).
     from dpsn_r_jax.models.layers import set_mesh as _set_mesh
     _set_mesh(mesh)
+    # Register the mesh in the kernels module so pool Pallas kernels can use
+    # shard_map for TP multi-chip runs (each chip runs the kernel on its local
+    # feature-sharded slice of the pool).
+    from dpsn_r_jax.kernels import set_mesh as _set_kernels_mesh
+    _set_kernels_mesh(mesh)
 
     # Sharding Rules:
     # 1. Batch: Split along 'shard' axis (Data Parallelism)
@@ -887,6 +910,21 @@ def main():
         _micro_batch = args.batch_size
         distributed_train_step = train_step
 
+    # ── Sequence packing collator (--pack_sequences) ─────────────────────────
+    if args.pack_sequences:
+        from dpsn_r_jax.data.packing_collator import PackingCollator
+        _packing_collator = PackingCollator(
+            max_seq_len=config.max_seq_len,
+            pad_token_id=config.pad_token_id,
+        )
+        print(
+            f"[PACK SEQUENCES] Enabled — first-fit-decreasing bin packing, "
+            f"max_seq_len={config.max_seq_len}, pad_token_id={config.pad_token_id}. "
+            f"Block-diagonal causal mask applied (splash attention disabled for packed batches)."
+        )
+    else:
+        _packing_collator = None
+
     flops_per_step = calculate_flops(config, args.batch_size)
     summarise_flops(config, args.batch_size)  # print breakdown once at startup
 
@@ -1053,6 +1091,25 @@ def main():
             current_data_wait_time = time.time() - data_start_time
             total_data_wait_time_interval += current_data_wait_time
 
+            # ── Sequence packing (--pack_sequences) ────────────────────────────
+            # PackingCollator returns packed_ids and seq_pack_ids. The latter is
+            # placed on device as a (T,) int32 array and passed to train_step so
+            # the model applies a block-diagonal causal attention mask.
+            # Note: batch from pipeline is already (B, T); packing re-bins rows.
+            _seq_pack_ids = None
+            if args.pack_sequences:
+                import numpy as _np
+                _rows = [_np.array(batch[i]) for i in range(batch.shape[0])]
+                _packed, _spi = _packing_collator(_rows)
+                # _packed: (B_packed, T), _spi: (B_packed, T)
+                batch = jax.device_put(
+                    jnp.array(_packed, dtype=jnp.int32), batch_sharding
+                )
+                # seq_pack_ids is (T,) — broadcast over batch; replicated.
+                _seq_pack_ids = jax.device_put(
+                    jnp.array(_spi[0], dtype=jnp.int32), replicated_sharding
+                )
+
             last_batch = batch   # save for component timing
             dispatch_start_time = time.time()
 
@@ -1100,6 +1157,7 @@ def main():
                     grad_accum_steps=_grad_accum,
                     prefetch_reasoning=getattr(config, 'prefetch_reasoning', False),
                     prefetch_size=getattr(config, 'prefetch_size', 0),
+                    seq_pack_ids=_seq_pack_ids,
                 )
             else:
                 # ── Standard single-step path ─────────────────────────────────
@@ -1111,6 +1169,7 @@ def main():
                     loss_chunk_size=getattr(config, 'loss_chunk_size', 0),
                     prefetch_reasoning=getattr(config, 'prefetch_reasoning', False),
                     prefetch_size=getattr(config, 'prefetch_size', 0),
+                    seq_pack_ids=_seq_pack_ids,
                 )
 
             # Bug #1 Fix: append JAX futures — NO float() / .item() here!

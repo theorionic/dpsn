@@ -237,13 +237,25 @@ def _apply_sparse_pool_adam(pool_params, pool_m, pool_v, r_starts, c_starts,
     m_slices = jax.vmap(gather_fn_m)(r_starts, c_starts).astype(jnp.float32)
     v_slices = jax.vmap(gather_fn_v)(r_starts, c_starts).astype(jnp.float32)
 
-    # ── 2. Batched Adam on (N, W, W, D) ──────────────────────────────────────
-    step_f = step.astype(jnp.float32)
-    m_new = b1 * m_slices + (1.0 - b1) * grad_slices
-    v_new = b2 * v_slices + (1.0 - b2) * grad_slices ** 2
-    m_hat = m_new / (1.0 - b1 ** step_f)
-    v_hat = v_new / (1.0 - b2 ** step_f)
-    p_new = p_slices - lr * m_hat / (jnp.sqrt(v_hat) + eps)
+    # ── 2. Fused Adam via Pallas kernel (or JAX fallback on multi-chip) ───────
+    from dpsn_r_jax.kernels import sparse_adam_pallas as _sap
+    N_flat = p_slices.shape[0] * p_slices.shape[1] * p_slices.shape[2]  # N*W*W
+    D = p_slices.shape[-1]
+    pool_grad_norm = jnp.sqrt(jnp.sum(grad_slices ** 2) + 1e-9)
+    grad_scale = jnp.minimum(jnp.float32(1.0), jnp.float32(1.0) / pool_grad_norm)
+    p_new_flat, m_new_flat, v_new_flat = _sap(
+        p_slices.reshape(N_flat, D),
+        grad_slices.reshape(N_flat, D),
+        m_slices.reshape(N_flat, D),
+        v_slices.reshape(N_flat, D),
+        lr=jnp.float32(lr) if not hasattr(lr, 'shape') else lr,
+        step=step,
+        grad_scale=grad_scale,
+        b1=b1, b2=b2, eps=eps,
+    )
+    p_new = p_new_flat.reshape(p_slices.shape)
+    m_new = m_new_flat.reshape(m_slices.shape)
+    v_new = v_new_flat.reshape(v_slices.shape)
 
     # ── 3. Build flat indices for scatter ────────────────────────────────────
     # Each event covers r_starts[i]:r_starts[i]+W, c_starts[i]:c_starts[i]+W
@@ -423,6 +435,7 @@ def train_step(
     precision_loss_weight=0.0, sigma_anneal_steps=0,
     use_bf16=False, loss_chunk_size=0,
     prefetch_reasoning=False, prefetch_size=0,
+    seq_pack_ids=None,
 ):
     """Single training step with sparse pool gradient updates."""
     print("Compiling train_step for XLA...", flush=True)
@@ -481,6 +494,8 @@ def train_step(
                     encode_kwargs["candidates_probe"] = probe_
                 else:
                     encode_kwargs["retrieved_probes"] = probe_
+                if seq_pack_ids is not None:
+                    encode_kwargs["seq_pack_ids"] = seq_pack_ids
 
                 state_hidden, (_, indices, mean_sigma,
                                all_mu_r, all_mu_c, all_sigma_h, all_start_2d,
@@ -500,10 +515,15 @@ def train_step(
                 ).astype(jnp.float32)
         else:
             with jax.profiler.TraceAnnotation("Forward_full_model"):
-                logits, (_, indices, mean_sigma) = state.apply_fn(
-                    {"params": compute_params}, batch,
+                _fwd_kwargs = dict(
                     deterministic=False, sigma_max_scale=sigma_scale,
                     rngs={"dropout": dropout_rng},
+                )
+                if seq_pack_ids is not None:
+                    _fwd_kwargs["seq_pack_ids"] = seq_pack_ids
+                logits, (_, indices, mean_sigma) = state.apply_fn(
+                    {"params": compute_params}, batch,
+                    **_fwd_kwargs,
                 )
             all_mu_r     = jnp.zeros((R_loops, B, H_dim))
             all_mu_c     = jnp.zeros((R_loops, B, H_dim))
@@ -590,6 +610,7 @@ def grad_accum_step(
     grad_accum_steps=1,
     prefetch_reasoning=False,
     prefetch_size=0,
+    seq_pack_ids=None,
 ):
     """Gradient accumulation with sparse pool gradient updates.
 
@@ -668,6 +689,8 @@ def grad_accum_step(
                         encode_kwargs["candidates_probe"] = probe_
                     else:
                         encode_kwargs["retrieved_probes"] = probe_
+                    if seq_pack_ids is not None:
+                        encode_kwargs["seq_pack_ids"] = seq_pack_ids
 
                     state_hidden, (_, indices, mean_sigma,
                                    all_mu_r, all_mu_c, all_sigma_h, all_start_2d,
@@ -689,10 +712,15 @@ def grad_accum_step(
                     ).astype(jnp.float32)
             else:
                 with jax.profiler.TraceAnnotation("Forward_full_model"):
-                    logits, (_, indices, mean_sigma) = state.apply_fn(
-                        {"params": compute_params}, micro_batch,
+                    _fwd_kwargs = dict(
                         deterministic=False, sigma_max_scale=sigma_scale,
                         rngs={"dropout": step_rng},
+                    )
+                    if seq_pack_ids is not None:
+                        _fwd_kwargs["seq_pack_ids"] = seq_pack_ids
+                    logits, (_, indices, mean_sigma) = state.apply_fn(
+                        {"params": compute_params}, micro_batch,
+                        **_fwd_kwargs,
                     )
                 all_mu_r     = jnp.zeros((R_loops, B, H_dim))
                 all_mu_c     = jnp.zeros((R_loops, B, H_dim))
