@@ -867,7 +867,7 @@ def main():
     print_tpu_memory("after model init (before first train_step compile)")
 
     from dpsn_r_jax.training.trainer import train_step, grad_accum_step, forward_only_step
-    from dpsn_r_jax.utils.metrics import summarise_flops
+    from dpsn_r_jax.utils.metrics import summarise_flops, roofline_metrics
 
     # ── Choose training function based on gradient accumulation ──────────────
     _grad_accum = getattr(args, "grad_accum_steps", 1)
@@ -1233,6 +1233,43 @@ def main():
                     f"TPS: {tokens_per_sec:.0f} | SPS: {steps_per_sec:.3f} | "
                     f"TFLOPS: {tflops:.4f} | DataWait: {avg_data_wait:.3f}s"
                 )
+
+                # ── Roofline: MXU compute utilisation vs HBM bandwidth pressure ───
+                # MFU  = actual_TFLOPS / peak_TFLOPS  → how busy the MXU is
+                # ~MBU = estimated_bytes / (step_time × peak_HBM_BW) → how hard
+                #        HBM is working.  If MBU >> MFU the MXU is stalling waiting
+                #        for data.  If both are low, the bottleneck is latency /
+                #        sequential kernel scheduling, not raw throughput.
+                # NOTE: MBU is a structural estimate from param counts — not a
+                #        hardware counter.  Treat it as a directional indicator.
+                try:
+                    _n_chips  = jax.device_count()
+                    _tp_size  = getattr(args, 'tp_size', 1)
+                    _gc       = getattr(args, 'gradient_checkpointing', False)
+                    _rl = roofline_metrics(
+                        config, args.batch_size, _n_chips, _tp_size,
+                        avg_step_time, tflops,
+                        gradient_checkpointing=_gc,
+                        tpu_gen="v5e",
+                    )
+                    _mfu_pct  = _rl["mfu"]  * 100
+                    _mbu_pct  = _rl["mbu"]  * 100
+                    _btn      = _rl["bottleneck"]
+                    _bw_GBs   = _rl["bw_GB_s"]
+                    _ideal_ms = _rl["ideal_ms"]
+                    _stall_ms = _rl["stall_ms"]
+                    print(
+                        f"[ROOFLINE] MFU: {_mfu_pct:.1f}% | ~MBU: {_mbu_pct:.1f}% | "
+                        f"Bottleneck: {_btn} | "
+                        f"~HBM: {_bw_GBs:.0f} GB/s of {819*_n_chips:.0f} GB/s peak | "
+                        f"Ideal: {_ideal_ms:.0f}ms | Stall: {_stall_ms:.0f}ms"
+                    )
+                    writer.add_scalar("Roofline/MFU_pct",       _mfu_pct,  global_step)
+                    writer.add_scalar("Roofline/MBU_pct_est",   _mbu_pct,  global_step)
+                    writer.add_scalar("Roofline/HBM_GB_s_est",  _bw_GBs,   global_step)
+                    writer.add_scalar("Roofline/Stall_ms_est",  _stall_ms, global_step)
+                except Exception as _e:
+                    pass  # never crash training over a metric
 
             # ── Component timing: forward vs backward+optimizer split ─────────
             # Runs a no-grad forward pass (forward_only_step) every TIMING_INTERVAL
