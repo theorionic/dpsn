@@ -114,6 +114,20 @@ def _use_pallas() -> bool:
     return True
 
 
+def _use_pallas_single_chip_only() -> bool:
+    """Pallas guard for kernels that have no shard_map wrapping yet.
+
+    sparse_adam_pallas operates on pre-gathered (N, D) slices whose N and D
+    dimensions are both sharded in TP mode — adding a correct shard_map is
+    non-trivial.  Fall back to JAX on any multi-chip setup.
+    """
+    if _interpret_mode():
+        return _PALLAS_AVAILABLE
+    if not _PALLAS_AVAILABLE or not _is_tpu():
+        return False
+    return jax.device_count() == 1
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Kernel 1 — Fused Sparse Adam
 # ─────────────────────────────────────────────────────────────────────────────
@@ -202,7 +216,7 @@ def sparse_adam_pallas(
     Returns:
         (p_new, m_new, v_new), each (N, D) in the same dtype as the inputs.
     """
-    if not _use_pallas():
+    if not _use_pallas_single_chip_only():
         return _sparse_adam_jax_fallback(
             p_slice, g_slice, m_slice, v_slice, lr, step, grad_scale, b1, b2, eps
         )
