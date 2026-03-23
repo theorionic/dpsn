@@ -369,7 +369,10 @@ def _pool1d_pallas_impl(pool, mu, sigma, start_indices, W, Total):
 
     # ── TP multi-chip: wrap in shard_map so each chip runs on its local data ──
     # pool is feature-sharded on "tp" axis (last dim); batch is "dp"-sharded.
-    if jax.device_count() > 1 and _is_tp_mesh() and _SHARD_MAP_AVAILABLE:
+    # Guard: B must be divisible by dp_size. When B is too small (e.g. B=1
+    # during jax.eval_shape warm-up), fall through to the single-chip path.
+    _dp_size = int(_MESH.shape["dp"]) if (_is_tp_mesh() and _MESH is not None) else 1
+    if jax.device_count() > 1 and _is_tp_mesh() and _SHARD_MAP_AVAILABLE and B % _dp_size == 0:
         return _shard_map(
             _raw_pallas_call,
             mesh=_MESH,
@@ -533,7 +536,10 @@ def _pool2d_pallas_impl(pool, r_start, c_start, r_center, c_center, sigma, W, R,
 
     # ── TP multi-chip: wrap in shard_map so each chip runs on its local data ──
     # pool is feature-sharded on "tp" axis (last dim); batch is "dp"-sharded.
-    if jax.device_count() > 1 and _is_tp_mesh() and _SHARD_MAP_AVAILABLE:
+    # Guard: B must be divisible by dp_size. When B is too small (e.g. B=1
+    # during jax.eval_shape warm-up), fall through to the single-chip path.
+    _dp_size = int(_MESH.shape["dp"]) if (_is_tp_mesh() and _MESH is not None) else 1
+    if jax.device_count() > 1 and _is_tp_mesh() and _SHARD_MAP_AVAILABLE and B % _dp_size == 0:
         return _shard_map(
             _raw_pallas_call,
             mesh=_MESH,
