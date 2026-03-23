@@ -321,6 +321,12 @@ def get_model_config(name: str) -> DPSNRConfig:
             # Precision loss: small penalty on broad sigma
             precision_loss_weight=0.01,
             use_flash_attention=True,
+            # SRAM prefetch reasoning: fetch pool vectors ONCE → all loops read from SRAM.
+            # 1 HBM fetch instead of max_reasoning_loops fetches per step.
+            # 16×16 = 256 candidates; SRAM cost = B/chip × 256 × 768 × 2 B ≈ 1.5 MB/chip.
+            prefetch_reasoning=True,
+            prefetch_size=16,          # per-axis; total K = 16² = 256 SRAM candidates
+            pool_super_window_factor=1,  # disable Opt-2 (superseded by prefetch path)
         )
 
     elif name == "xxl":

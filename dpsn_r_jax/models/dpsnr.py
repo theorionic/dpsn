@@ -83,7 +83,7 @@ class DPSNR(nn.Module):
         # ── Timing mark: encode (controller + reasoning loop) starting ────────
         ctimer.mark("00_encode_start", input_ids.astype(jnp.float32))
 
-        state_hidden, all_indices, mean_sigma, _, _, _, _ = self._encode_hidden(
+        state_hidden, all_indices, mean_sigma, _, _, _, _, _, _ = self._encode_hidden(
             input_ids, deterministic, sigma_max_scale
         )
 
@@ -94,26 +94,49 @@ class DPSNR(nn.Module):
 
         return logits, (self.config.max_reasoning_loops, all_indices, mean_sigma)
 
-    def encode_to_hidden(self, input_ids, deterministic=True, sigma_max_scale: float = 1.0, retrieved_probes=None):
+    def encode_to_hidden(self, input_ids, deterministic=True, sigma_max_scale: float = 1.0,
+                         retrieved_probes=None, candidates_probe=None):
         """Run controller + reasoning loop and return state_hidden WITHOUT the LM head.
 
         Used by chunked_lm_loss in trainer.py to avoid materialising the full
         (B, T, vocab) logits tensor.  Only the compact (B, T, D) hidden tensor
         is returned; the LM head is applied later in small batch chunks.
 
+        Args:
+            retrieved_probes:  (R, B, D) zero probe for per-loop sparse pool grad
+                               (non-prefetch path).
+            candidates_probe:  (B, K, D) zero probe for prefetch-path sparse pool
+                               grad, where K = prefetch_size².
+
         Returns:
             state_hidden: (B, T, D)
-            aux:          (max_loops, all_indices, mean_sigma, all_mu_r, all_mu_c, all_sigma_h, all_start_2d)
+            aux:          (max_loops, all_indices, mean_sigma, all_mu_r, all_mu_c,
+                           all_sigma_h, all_start_2d, pf_r_start, pf_c_start)
+                          pf_r_start / pf_c_start are (B,) int32 patch positions
+                          (zeros on the non-prefetch path).
         """
-        state_hidden, all_indices, mean_sigma, all_mu_r, all_mu_c, all_sigma_h, all_start_2d = self._encode_hidden(
-            input_ids, deterministic, sigma_max_scale, retrieved_probes=retrieved_probes
+        (state_hidden, all_indices, mean_sigma,
+         all_mu_r, all_mu_c, all_sigma_h, all_start_2d,
+         pf_r_start, pf_c_start) = self._encode_hidden(
+            input_ids, deterministic, sigma_max_scale,
+            retrieved_probes=retrieved_probes,
+            candidates_probe=candidates_probe,
         )
-        return state_hidden, (self.config.max_reasoning_loops, all_indices, mean_sigma, all_mu_r, all_mu_c, all_sigma_h, all_start_2d)
+        return state_hidden, (
+            self.config.max_reasoning_loops, all_indices, mean_sigma,
+            all_mu_r, all_mu_c, all_sigma_h, all_start_2d,
+            pf_r_start, pf_c_start,
+        )
 
-    def _encode_hidden(self, input_ids, deterministic=True, sigma_max_scale: float = 1.0, retrieved_probes=None):
+    def _encode_hidden(self, input_ids, deterministic=True, sigma_max_scale: float = 1.0,
+                       retrieved_probes=None, candidates_probe=None):
         """Core shared encoder: controller + reasoning loop.
 
-        Returns (state_hidden, all_indices, mean_sigma, all_mu_r, all_mu_c, all_sigma_h, all_start_2d).
+        Returns 9-tuple:
+            (state_hidden, all_indices, mean_sigma,
+             all_mu_r, all_mu_c, all_sigma_h, all_start_2d,
+             pf_r_start, pf_c_start)
+        pf_r_start / pf_c_start are (B,) int32 on the prefetch path, zeros otherwise.
         Called by both __call__ and encode_to_hidden so they share code.
         """
         # 1. Encode
@@ -131,16 +154,24 @@ class DPSNR(nn.Module):
         if self.config.prefetch_reasoning:
             # ── Prefetch path: one HBM fetch, all loops read from SRAM ───────
             with jax.profiler.TraceAnnotation("PrefetchReasoning"):
-                state_hidden, all_indices, mean_sigma = self._prefetch_encode(
-                    hidden, sigma_max_scale
+                state_hidden, all_indices, mean_sigma, pf_r_start, pf_c_start = (
+                    self._prefetch_encode(hidden, sigma_max_scale,
+                                         candidates_probe=candidates_probe)
                 )
             ctimer.mark("08_all_reasoning_loops_done", state_hidden)
-            # Dummy pool info — sparse gradient not supported on prefetch path
-            H_dim = max(1, self.config.num_indexer_heads // 2)
-            R = self.config.max_reasoning_loops
+            # Pool info: pack r/c starts for the trainer's sparse Adam update.
+            # all_start_2d[:, :, 0] = pf_r_start, [:, :, 1] = pf_c_start.
+            # Shapes follow the non-prefetch convention (R, B, H_dim) but only
+            # the first two slots are meaningful; trainer reads [0, :, 0/1].
+            H_dim   = max(1, self.config.num_indexer_heads // 2)
+            R       = self.config.max_reasoning_loops
             dummy_f = jnp.zeros((R, B, H_dim), dtype=jnp.float32)
             dummy_i = jnp.zeros((R, B, H_dim), dtype=jnp.int32)
-            return state_hidden, all_indices, mean_sigma, dummy_f, dummy_f, dummy_f, dummy_i
+            # pf_r_start / pf_c_start are returned directly; dummy_i is a
+            # placeholder for all_start_2d (trainer reads pf_r/c, not this).
+            return (state_hidden, all_indices, mean_sigma,
+                    dummy_f, dummy_f, dummy_f, dummy_i,
+                    pf_r_start, pf_c_start)
 
         # ── Original path: per-iteration HBM fetching ─────────────────────────
         state_hidden = hidden
@@ -374,13 +405,18 @@ class DPSNR(nn.Module):
         # mean_sigma averaged across all reasoning loops
         mean_sigma = jnp.mean(sigma_per_loop)
 
-        return state_hidden, all_indices, mean_sigma, all_mu_r, all_mu_c, all_sigma_h, all_start_2d
+        # Non-prefetch path: no patch positions → return zero sentinels
+        zero_starts = jnp.zeros((B,), dtype=jnp.int32)
+        return (state_hidden, all_indices, mean_sigma,
+                all_mu_r, all_mu_c, all_sigma_h, all_start_2d,
+                zero_starts, zero_starts)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Prefetch Reasoning path
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _prefetch_encode(self, hidden, sigma_max_scale: float = 1.0):
+    def _prefetch_encode(self, hidden, sigma_max_scale: float = 1.0,
+                         candidates_probe=None):
         """Prefetch-once, reason-in-SRAM encoding path.
 
         Design
@@ -388,6 +424,10 @@ class DPSNR(nn.Module):
         Stage 1  One indexer forward pass → initial (mu_r, mu_c) coordinates.
         Stage 2  ONE lax.dynamic_slice call fetches a patch_size × patch_size
                  region from HBM into a (B, K, D) tensor where K = patch_size².
+                 If candidates_probe (B, K, D) is provided, it is added to the
+                 fetched candidates *before* the scan so that autograd can
+                 differentiate through the cross-attention to the pool without
+                 materialising the full (R_pool, C_pool, D) gradient tensor.
         Stage 3  lax.scan carries that tensor as part of its carry pytree.
                  XLA keeps carry tensors in on-chip SRAM across iterations, so
                  every reasoning step reads from SRAM (~1 ns) instead of HBM
@@ -398,14 +438,19 @@ class DPSNR(nn.Module):
                  reused unchanged.
 
         Args:
-            hidden:          (B, T, D) — controller output.
-            sigma_max_scale: Sigma annealing multiplier (1.0 = full range).
+            hidden:           (B, T, D) — controller output.
+            sigma_max_scale:  Sigma annealing multiplier (1.0 = full range).
+            candidates_probe: (B, K, D) zero tensor whose gradient gives
+                              ∂loss/∂candidates — used by the trainer to
+                              compute sparse pool gradients without an 805 MB
+                              gradient buffer.  None during inference.
 
         Returns:
-            state_hidden: (B, T, D)
-            all_indices:  (B, max_reasoning_loops) flat patch-start indices
-                          for sparse-Adam pool update.
-            mean_sigma:   scalar — mean sigma from the initial indexer call.
+            state_hidden:    (B, T, D)
+            all_indices:     (B, max_reasoning_loops) flat patch-start indices.
+            mean_sigma:      scalar — mean sigma from the initial indexer call.
+            patch_r_start:   (B,) int32 — row start of the prefetched patch.
+            patch_c_start:   (B,) int32 — col start of the prefetched patch.
         """
         B, T, D = hidden.shape
         model_dtype = hidden.dtype
@@ -429,6 +474,15 @@ class DPSNR(nn.Module):
         # Reshape spatial dims → (B, K, D)  K = patch_size²
         K          = patch_size * patch_size
         candidates = candidates_2d.reshape(B, K, D).astype(model_dtype)
+
+        # ── Probe injection: add zero probe so autograd reaches the pool ──────
+        # grad w.r.t. candidates_probe = ∂loss/∂candidates (shape B, K, D).
+        # Because pool params are stop-gradient'd in the trainer, we need this
+        # explicit probe channel to compute pool gradients without the 805 MB
+        # full gradient tensor.
+        if candidates_probe is not None:
+            candidates = candidates + candidates_probe.astype(model_dtype)
+
         ctimer.mark("05_pool_retrieval_done", candidates)
 
         # ── Stage 3: Warm-up calls before lax.scan ────────────────────────────
@@ -437,7 +491,6 @@ class DPSNR(nn.Module):
         halt_prob   = jnp.zeros((B, T, 1), dtype=model_dtype)
         halted_mask = jnp.zeros((B, T, 1), dtype=model_dtype)
 
-        _dummy_candidates = jnp.zeros((B, K, D), dtype=model_dtype)
         _dummy_attn  = self.prefetch_query_attn(hidden)                        # (B, T, 1)
         _dummy_q     = self.prefetch_query_proj(jnp.zeros((B, D), dtype=model_dtype))
         _dummy_integ = self.retrieval_integrator(
@@ -520,16 +573,13 @@ class DPSNR(nn.Module):
         )
 
         # ── Build all_indices for sparse-Adam pool update ─────────────────────
-        # The "touched" pool region is the pre-fetched patch.  We report its
-        # flat start position so the trainer updates those pool vectors.
         flat_patch_start = (
             patch_r_start * self.config.pool_grid_cols + patch_c_start
         )                                                                  # (B,)
-        # Tile to (B, max_reasoning_loops) to match the trainer's expected shape
         all_indices = jnp.tile(
             flat_patch_start[:, None],
             (1, self.config.max_reasoning_loops),
         )
 
         mean_sigma = jnp.mean(sigma_init)
-        return state_hidden, all_indices, mean_sigma
+        return state_hidden, all_indices, mean_sigma, patch_r_start, patch_c_start

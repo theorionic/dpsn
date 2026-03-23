@@ -1098,6 +1098,8 @@ def main():
                     use_bf16=getattr(config, 'use_bf16', False),
                     loss_chunk_size=getattr(config, 'loss_chunk_size', 0),
                     grad_accum_steps=_grad_accum,
+                    prefetch_reasoning=getattr(config, 'prefetch_reasoning', False),
+                    prefetch_size=getattr(config, 'prefetch_size', 0),
                 )
             else:
                 # ── Standard single-step path ─────────────────────────────────
@@ -1107,6 +1109,8 @@ def main():
                     sigma_anneal_steps=getattr(config, 'sigma_anneal_steps', 0),
                     use_bf16=getattr(config, 'use_bf16', False),
                     loss_chunk_size=getattr(config, 'loss_chunk_size', 0),
+                    prefetch_reasoning=getattr(config, 'prefetch_reasoning', False),
+                    prefetch_size=getattr(config, 'prefetch_size', 0),
                 )
 
             # Bug #1 Fix: append JAX futures — NO float() / .item() here!
