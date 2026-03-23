@@ -26,6 +26,7 @@ class DPSNR(nn.Module):
         self.controller = controller_cls(self.config)
         self.indexer = LearnedIndexer(
             self.config.controller_hidden_dim,
+            indexer_hidden_dim=self.config.indexer_hidden_dim,
             num_heads=self.config.num_indexer_heads,
             sigma_min=self.config.sigma_min,
             sigma_max=self.config.sigma_max,

@@ -88,6 +88,10 @@ class DPSNRConfig:
     num_indexer_heads: int = 1      # Multi-head pool queries per reasoning step
     sigma_min: float = 0.01         # Minimum retrieval bandwidth (sharp/precise)
     sigma_max: float = 5.0          # Maximum retrieval bandwidth (broad/soft)
+    # MLP width inside LearnedIndexer.  0 = use controller_hidden_dim (default,
+    # backward-compat).  Set to a large value to give the indexer its own
+    # independent parameter budget (e.g. 10240 → ~62M params with D=1024).
+    indexer_hidden_dim: int = 0
     finetune: Optional[FineTuningConfig] = None
 
     # ── Precision Routing ──────────────────────────────────────────────────
@@ -187,6 +191,12 @@ def get_model_config(name: str) -> DPSNRConfig:
     Precision-routing variants (same param count, better pool addressing):
     - precise_tiny:  tiny  + 2D pool + sigma annealing (for quick experiments)
     - precise_large: large + 2D pool + sigma annealing + precision loss
+
+    Pool-dominant design (tiny controller + massive pool, custom 8K tokenizer):
+    - mini_pool: ~84M controller + ~63M indexer + ~1.07B pool  (TPU v5e-8)
+                 8192-vocab tokenizer keeps controller embedding small;
+                 oversized indexer acts as a deep feature extractor for precise
+                 pool addressing; pool carries the bulk of world knowledge.
     """
     if name == "tiny":
         return DPSNRConfig(
@@ -386,6 +396,80 @@ def get_model_config(name: str) -> DPSNRConfig:
             use_flash_attention=True,
             pool_super_window_factor=2,
             learning_rate=1e-4,
+        )
+
+    elif name == "mini_pool":
+        # ── Pool-dominant design for custom 8K-vocab tokenizer ─────────────────
+        #
+        # Philosophy: keep the controller tiny (cheap to run, easy to train)
+        # and push almost all capacity into the pool + a deep indexer that can
+        # precisely address it.  The small 8 192-token vocabulary reduces the
+        # embedding / LM-head cost so the controller stays under 100 M params
+        # even at D=1024.
+        #
+        # Parameter breakdown:
+        #   Controller  : D=1024, 6 layers, 8 heads  →  ~84 M
+        #     Embedding : 8 192 × 1 024              =   8.4 M
+        #     6 × layer : (4+8) × 1 024²             =  75.5 M (tied LM head: +0)
+        #
+        #   Indexer MLP : D_in=1024 → 10 240 → 5 120 → num_heads
+        #     Dense(10240): 1 024 × 10 240 + 10 240  =  10.5 M
+        #     Dense(5120) : 10 240 × 5 120 +  5 120  =  52.5 M
+        #     Total                                  ≈  63 M   (> 50 M target)
+        #
+        #   Pool        : 1 024 × 1 024 × 1 024      =  1.07 B (> 1 B target)
+        #     Stored bfloat16 → 2.15 GB HBM (sharded across 8 chips: 269 MB/chip)
+        #
+        # Per-chip HBM estimate (8 × TPU v5e chips, 16 GB each):
+        #   Controller + Adam m/v (replicated) : ~1.0 GB/chip
+        #   Indexer    + Adam m/v (replicated) : ~0.76 GB/chip
+        #   Pool       + Adam m/v (sharded)    : ~0.81 GB/chip
+        #   Static total                       : ~2.6 GB/chip
+        #   Available for activations          : ~13 GB/chip  ← very comfortable
+        #   → batch=16/chip (128 total) is achievable
+        #
+        # Training notes:
+        #   - Train a BPE/Unigram tokenizer on your domain corpus first, target
+        #     8 192 tokens (8192 = 64 × 128, MXU-aligned — no padding wasted).
+        #   - use_bf16=True is required for the pool to stay in bfloat16.
+        #   - loss_chunk_size=64 keeps the (B, T, 8192) logits tensor from
+        #     ever being fully materialised on-chip.
+        #   - attn_window_size=512 makes the controller O(T×512) instead of O(T²)
+        #     at seq_len=4096; the pool handles all long-range recall.
+        return DPSNRConfig(
+            vocab_size=8192,               # 64 × 128, MXU-aligned for 8K tokenizer
+            controller_hidden_dim=1024,
+            controller_num_layers=6,
+            controller_num_heads=8,        # head_dim = 128, MXU-aligned
+            controller_ff_multiplier=4.0,
+            max_seq_len=4096,
+            attn_window_size=512,          # local attention; pool covers long-range
+            dropout=0.0,
+            # ── Indexer: deep MLP trunk independent of controller width ──────
+            # indexer_hidden_dim=10240 gives ~63 M indexer params (> 50 M target)
+            indexer_hidden_dim=10240,
+            num_indexer_heads=8,           # 8 independent (µ_r, µ_c, σ) per step
+            sigma_min=0.005,
+            sigma_max=5.0,
+            sigma_anneal_steps=50_000,
+            sigma_target=0.03,
+            precision_loss_weight=0.01,
+            # ── Pool: 1024 × 1024 × 1024 = 1.07 B parameters ────────────────
+            pool_grid_rows=1024,
+            pool_grid_cols=1024,
+            pool_hidden_dim=1024,          # kept for config compat; model uses controller_hidden_dim
+            pool_total_vectors=1024 * 1024,
+            max_k=64,
+            max_reasoning_loops=6,
+            min_reasoning_loops=2,
+            # ── Memory & compute optimisations ────────────────────────────────
+            gradient_checkpointing=True,
+            use_bf16=True,
+            use_flash_attention=True,
+            loss_chunk_size=64,            # 8192-vocab × B × T in chunks of 64
+            pool_super_window_factor=2,
+            # ── Learning rate ─────────────────────────────────────────────────
+            learning_rate=2e-4,
         )
 
     else:

@@ -34,14 +34,19 @@ class LearnedIndexer(nn.Module):
        tightens without any parameter changes.
 
     Args:
-        hidden_dim:  Hidden dimension D of the controller.
-        num_heads:   Number of independent (µ, σ) pairs. Default 1 is fully
-                     backward-compatible with the original single-head behaviour.
-        sigma_min:   Hard lower bound on σ.  Default 0.01.
-        sigma_max:   Hard upper bound on σ before scaling.  Default 5.0.
+        hidden_dim:        Hidden dimension D of the controller (input size).
+        indexer_hidden_dim: Width of the MLP trunk inside the indexer.  0 (default)
+                           falls back to hidden_dim for backward compatibility.
+                           Set to a large value (e.g. 10240) to give the indexer
+                           its own large parameter budget independent of the controller.
+        num_heads:         Number of independent (µ, σ) pairs. Default 1 is fully
+                           backward-compatible with the original single-head behaviour.
+        sigma_min:         Hard lower bound on σ.  Default 0.01.
+        sigma_max:         Hard upper bound on σ before scaling.  Default 5.0.
     """
 
     hidden_dim: int
+    indexer_hidden_dim: int = 0   # 0 = use hidden_dim (backward compat)
     num_heads: int = 1
     sigma_min: float = 0.01
     sigma_max: float = 5.0
@@ -68,9 +73,12 @@ class LearnedIndexer(nn.Module):
         pooled = jnp.sum(attn_weights * hidden_states, axis=1)       # (B, D)
 
         # ── 2. Shared feature extraction trunk ──────────────────────────────
-        x = nn.Dense(self.hidden_dim)(pooled)
+        # mlp_dim may be set independently of the controller width so the
+        # indexer can carry its own large parameter budget (e.g. 50M+).
+        mlp_dim = self.indexer_hidden_dim if self.indexer_hidden_dim > 0 else self.hidden_dim
+        x = nn.Dense(mlp_dim)(pooled)
         x = nn.gelu(x)
-        x = nn.Dense(self.hidden_dim // 2)(x)
+        x = nn.Dense(mlp_dim // 2)(x)
         x = nn.gelu(x)
 
         # ── 3. Multi-head coordinate prediction ─────────────────────────────
