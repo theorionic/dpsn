@@ -56,6 +56,10 @@ class DPSNRConfig:
     controller_hidden_dim: int = 64
     controller_num_layers: int = 2
     controller_num_heads: int = 2
+    # GQA: number of KV heads shared across query heads.
+    # 0 = full MHA (num_kv_heads == num_heads).
+    # Typical: num_heads // 4  (e.g. 12 Q heads → 3 KV heads, 4x KV memory savings).
+    controller_num_kv_heads: int = 0
     controller_ff_multiplier: float = 2.0
     max_seq_len: int = 64
     dropout: float = 0.1

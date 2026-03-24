@@ -42,6 +42,7 @@ class TinyController(nn.Module):
                 self.config.dropout,
                 self.config.use_flash_attention,
                 self.config.attn_window_size,
+                num_kv_heads=self.config.controller_num_kv_heads,
             )
             for _ in range(self.config.controller_num_layers)
         ]

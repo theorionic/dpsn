@@ -190,6 +190,14 @@ def main():
              "Avoids materialising full (B,T,V) logits; recommended: 16 for TPU v5e-8.",
     )
     parser.add_argument(
+        "--num_kv_heads",
+        type=int,
+        default=0,
+        help="GQA: number of KV heads shared across query heads (0 = full MHA). "
+             "Must evenly divide --controller_num_heads. "
+             "Typical: num_heads // 4 (e.g. 3 for precise_large with 12 heads).",
+    )
+    parser.add_argument(
         "--grad_accum_steps",
         type=int,
         default=1,
@@ -464,6 +472,13 @@ def main():
 
     if args.loss_chunk_size > 0:
         config.loss_chunk_size = args.loss_chunk_size
+
+    if args.num_kv_heads > 0:
+        assert config.controller_num_heads % args.num_kv_heads == 0, (
+            f"--num_kv_heads {args.num_kv_heads} must evenly divide "
+            f"controller_num_heads {config.controller_num_heads}."
+        )
+        config.controller_num_kv_heads = args.num_kv_heads
 
     # Create device mesh - handles 1 to N devices automatically
     _tp_size = args.tp_size

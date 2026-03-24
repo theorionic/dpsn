@@ -171,25 +171,40 @@ class FlashCausalSelfAttention(nn.Module):
     # 0 = full causal attention; >0 = sliding window of this many tokens.
     # Set to ~512 for large context models — the pool handles long-range memory.
     window_size: int = 0
+    # GQA: number of KV heads. 0 = full MHA (num_kv_heads == num_heads).
+    # Must evenly divide num_heads. Typical: num_heads // 4.
+    # KV projections shrink by (num_heads / num_kv_heads)x; Q projection unchanged.
+    num_kv_heads: int = 0
 
     @nn.compact
     def __call__(self, x, deterministic=True, seq_pack_ids=None):
         B, T, _ = x.shape
         head_dim = self.hidden_dim // self.num_heads
+        num_kv = self.num_kv_heads if self.num_kv_heads > 0 else self.num_heads
 
-        # QKV projection
-        qkv = nn.Dense(3 * self.hidden_dim, use_bias=False)(x)
-        q, k, v = jnp.split(qkv, 3, axis=-1)
+        # Q projection: full num_heads
+        q = nn.Dense(self.num_heads * head_dim, use_bias=False)(x)
+        # KV projection: num_kv heads only (smaller when GQA is active)
+        kv = nn.Dense(2 * num_kv * head_dim, use_bias=False)(x)
+        k, v = jnp.split(kv, 2, axis=-1)
 
         # Reshape: (B, T, H*D) → (B, T, H, D)
         q = q.reshape(B, T, self.num_heads, head_dim)
-        k = k.reshape(B, T, self.num_heads, head_dim)
-        v = v.reshape(B, T, self.num_heads, head_dim)
+        k = k.reshape(B, T, num_kv, head_dim)
+        v = v.reshape(B, T, num_kv, head_dim)
 
-        # ── Apply RoPE to Q and K (B, T, H, D) ──────────────────────────────
+        # ── Apply RoPE to Q (all heads) and K (kv heads) ─────────────────────
         # Computed at trace time: T and head_dim are static shapes in JIT.
         cos, sin = _precompute_rope(T, head_dim)
         q, k = _apply_rope(q, k, cos, sin)
+
+        # ── GQA head expansion ────────────────────────────────────────────────
+        # Repeat each KV head (num_heads // num_kv) times so Q, K, V all share
+        # shape (B, T, num_heads, head_dim) for the attention kernel.
+        if num_kv != self.num_heads:
+            groups = self.num_heads // num_kv
+            k = jnp.repeat(k, groups, axis=2)   # (B, T, num_heads, head_dim)
+            v = jnp.repeat(v, groups, axis=2)
 
         # Decide which attention path to take.
         # shard_map requires B to be divisible by device_count — if it isn't
@@ -334,6 +349,7 @@ class TinyTransformerLayer(nn.Module):
     dropout_rate: float = 0.0
     use_flash_attention: bool = False
     window_size: int = 0
+    num_kv_heads: int = 0  # 0 = full MHA; >0 = GQA with this many KV heads
 
     @nn.compact
     def __call__(self, x, deterministic=True, seq_pack_ids=None):
@@ -344,6 +360,7 @@ class TinyTransformerLayer(nn.Module):
             self.dropout_rate,
             self.use_flash_attention,
             self.window_size,
+            num_kv_heads=self.num_kv_heads,
         )(norm1, deterministic=deterministic, seq_pack_ids=seq_pack_ids)
         x = x + attn_out
 
