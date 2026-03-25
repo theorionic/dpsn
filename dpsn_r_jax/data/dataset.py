@@ -428,6 +428,8 @@ class ChunkedHFDataset:
         batch_size: int = 8,
         num_tokenizer_workers: int = 4,
         text_columns: Optional[List[str]] = None,
+        skip_rows: int = 0,
+        hf_state: Optional[dict] = None,
     ):
         self.dataset_name = dataset_name
         self.tokenizer_name = tokenizer_name
@@ -447,8 +449,34 @@ class ChunkedHFDataset:
         self._current_chunk: Optional[np.ndarray] = None
         self._read_pos: int = 0
 
+        # Total sequences served (used for grain_state.json resume)
+        self._rows_consumed: int = 0
+
+        # Reference to the HF IterableDataset (kept for state_dict / load_state_dict)
+        self._hf_ds = None
+
         # Persistent HF iterator — advanced across all chunks so we never repeat rows
-        self._hf_iter = self._make_iterator()
+        self._hf_iter = self._make_iterator(hf_state=hf_state)
+
+        # ── Fast-forward via islice when no hf_state available (slower fallback) ──
+        if hf_state is None and skip_rows > 0:
+            print(
+                f"[ChunkedHFDataset] Skipping {skip_rows:,} rows to resume data position "
+                f"(this may take a while for large skip counts)..."
+            )
+            remaining = skip_rows
+            skipped = 0
+            while remaining > 0:
+                n = min(remaining, chunk_size)
+                consumed = sum(1 for _ in islice(self._hf_iter, n))
+                skipped += consumed
+                remaining -= consumed
+                if consumed < n:
+                    # Iterator exhausted mid-skip — restart
+                    self._hf_iter = self._make_iterator()
+                    remaining = 0  # stop; we've wrapped around
+            self._rows_consumed = skipped
+            print(f"[ChunkedHFDataset] Fast-forward complete — skipped {skipped:,} rows.")
 
         # ── Synchronous first chunk (training cannot start until it's ready) ──
         print(
@@ -476,8 +504,12 @@ class ChunkedHFDataset:
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 
-    def _make_iterator(self):
-        """Create a fresh HF streaming iterator, with split fallback."""
+    def _make_iterator(self, hf_state: Optional[dict] = None):
+        """Create a fresh HF streaming iterator, with split fallback.
+
+        If hf_state is provided, calls ds.load_state_dict() before iterating
+        for O(1) seek to a previously saved position.
+        """
         try:
             ds = load_dataset(
                 self.dataset_name, name=self.subset, split=self.split, streaming=True
@@ -505,7 +537,34 @@ class ChunkedHFDataset:
                     raise
             else:
                 raise
+
+        if hf_state is not None:
+            try:
+                ds.load_state_dict(hf_state)
+                print("[ChunkedHFDataset] Restored HF iterator position from state_dict (O(1) seek).")
+            except Exception as e:
+                print(f"[ChunkedHFDataset] Warning: could not load hf_state ({e}); starting from beginning.")
+
+        self._hf_ds = ds
         return iter(ds)
+
+    def get_state(self) -> dict:
+        """Return the current data loader state for grain_state.json.
+
+        Compatible with the fine-tuning-v2 grain_state format:
+        {"dataset_idx": 0, "sample_idx": N, "hf_state": {...}, "rows_consumed": N}
+        """
+        state = {
+            "dataset_idx": 0,
+            "sample_idx": self._rows_consumed,
+            "rows_consumed": self._rows_consumed,
+        }
+        if self._hf_ds is not None:
+            try:
+                state["hf_state"] = self._hf_ds.state_dict()
+            except Exception as e:
+                print(f"[ChunkedHFDataset] Warning: could not capture hf_state ({e}).")
+        return state
 
     def _extract_text(self, item: dict) -> str:
         for col in self.text_columns:
@@ -651,6 +710,7 @@ class ChunkedHFDataset:
 
         batch = self._current_chunk[self._read_pos : self._read_pos + bs].copy()
         self._read_pos += bs
+        self._rows_consumed += bs
         return batch
 
     def stop(self) -> None:

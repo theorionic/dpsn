@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import signal
 import sys
@@ -69,6 +70,36 @@ def log_pool_utilization(state):
         f"Pool Utilization: {percentage:.2f}% ({int(num_touched)} / {total_vectors} vectors touched)"
     )
     return float(percentage)
+
+
+def _grain_state_path(args) -> str:
+    """Resolve the grain_state.json path (in checkpoint_dir if set)."""
+    if args.checkpoint_dir:
+        return os.path.join(os.path.abspath(args.checkpoint_dir), "grain_state.json")
+    return os.path.abspath(args.resume_data_path)
+
+
+def _save_grain_state(path: str, step: int, dataset) -> None:
+    """Save data loader position to grain_state.json."""
+    # Unwrap DevicePrefetchIterator → ChunkedHFDataset
+    inner = getattr(dataset, 'data_source', dataset)
+    if hasattr(inner, 'get_state'):
+        state = inner.get_state()
+    else:
+        rows_consumed = getattr(inner, '_rows_consumed', 0)
+        state = {"dataset_idx": 0, "sample_idx": int(rows_consumed), "rows_consumed": int(rows_consumed)}
+    state["step"] = int(step)
+    with open(path, "w") as f:
+        json.dump(state, f, indent=2)
+    print(f"[grain_state] Saved: step={int(step)}, rows_consumed={state.get('rows_consumed', '?')}")
+
+
+def _load_grain_state(path: str) -> dict:
+    """Load grain_state.json; returns {} if not found."""
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    return {}
 
 
 def main():
@@ -796,6 +827,23 @@ def main():
     else:
         loader_start_step = 0
 
+    # Resolve grain_state path and load if resuming data position
+    _grain_state_file = _grain_state_path(args)
+    _grain_skip_rows = 0
+    _grain_hf_state = None
+    if args.resume_data:
+        _gs = _load_grain_state(_grain_state_file)
+        if _gs:
+            _grain_hf_state = _gs.get("hf_state")         # O(1) seek via state_dict
+            _grain_skip_rows = _gs.get("rows_consumed", _gs.get("sample_idx", 0))
+            method = "hf_state (O(1) seek)" if _grain_hf_state else "skip_rows (row replay)"
+            print(
+                f"[grain_state] Loaded: step={_gs.get('step', '?')}, "
+                f"rows_consumed={_grain_skip_rows:,}, method={method}"
+            )
+        else:
+            print("[grain_state] No grain_state.json found — data will start from the beginning.")
+
     # ── Detect sequential NPY mode ─────────────────────────────────────────
     npy_files = expand_npy_paths(args.dataset_path) if args.dataset_path else []
     use_sequential_npy = len(npy_files) > 0
@@ -832,6 +880,8 @@ def main():
                 batch_size=args.batch_size,
                 num_tokenizer_workers=args.num_workers,
                 text_columns=args.hf_text_column or None,
+                hf_state=_grain_hf_state,       # O(1) seek if available
+                skip_rows=_grain_skip_rows,      # row-replay fallback
             )
         else:
             # Fallback: original loader path for non-chunked HF or non-NPY datasets
@@ -1247,6 +1297,7 @@ def main():
             ):
                 print(f"Saving checkpoint at step {global_step}...")
                 checkpoint_manager.save(global_step, state)
+                _save_grain_state(_grain_state_file, global_step, dataset)
 
             if step % LOG_INTERVAL == 0:
                 # Bug #1 Fix: ONE blocking sync per LOG_INTERVAL steps.
@@ -1567,6 +1618,7 @@ def main():
             if checkpoint_manager:
                 print(f"Saving checkpoint at end of epoch {epoch + 1} (step {global_step})...")
                 checkpoint_manager.save(global_step, state)
+                _save_grain_state(_grain_state_file, global_step, dataset)
 
     # ══════════════════════════════════════════════════════════════════════════
     #  ORIGINAL SINGLE-PIPELINE TRAINING
@@ -1594,6 +1646,7 @@ def main():
             if checkpoint_manager:
                 print(f"Saving checkpoint at end of epoch {epoch + 1} (step {global_step})...")
                 checkpoint_manager.save(global_step, state)
+                _save_grain_state(_grain_state_file, global_step, dataset)
 
         # ── Gracefully shut down ChunkedHFDataset background thread ──────────
         # The DevicePrefetchIterator wraps the dataset; reach through to stop().
@@ -1607,6 +1660,7 @@ def main():
         if checkpoint_manager:
             print(f"[Interrupted] Saving checkpoint at step {global_step}...")
             checkpoint_manager.save(global_step, state)
+            _save_grain_state(_grain_state_file, global_step, dataset)
             print(f"[Interrupted] Checkpoint saved. Exiting.")
         else:
             print("[Interrupted] No checkpoint_dir configured — checkpoint not saved. Exiting.")
