@@ -816,6 +816,16 @@ def main():
             else:
                 print("No checkpoint found to resume from. Starting from scratch.")
                 global_step = jnp.array(0, dtype=jnp.int32)
+
+        # ── Free pre-restore random param tensors before JIT compilation ─────
+        # During restore, both the old (random init) params and the new checkpoint
+        # params occupy HBM simultaneously (~6.2 GB peak on mini_pool/8 chips).
+        # The XLA compiled train_step needs 9.82 GB contiguous at the bottom of
+        # HBM, but only 9.8 GB is available while the old tensors are alive.
+        # Forcing GC here drops live HBM back to ~3.1 GB, giving XLA 12.9 GB —
+        # enough room to load the compiled program without OOM.
+        import gc
+        gc.collect()
     else:
         global_step = jnp.array(0, dtype=jnp.int32)
 
