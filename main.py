@@ -781,6 +781,39 @@ def main():
     state = jax.tree_util.tree_map(bound_to_mesh, state)
 
 
+    # ── PRE-WARM JIT BEFORE CHECKPOINT RESTORE ───────────────────────────────
+    # Problem: on resume, checkpoint_manager.restore() temporarily doubles HBM
+    # usage (old random params + new checkpoint params = ~6.2 GB on mini_pool).
+    # When the first train_step is called after restore, XLA tries to load the
+    # compiled program (9.82 GB) at the bottom of HBM — but only 9.8 GB is
+    # available (16 - 6.2), failing by ~20 MB.
+    #
+    # Fix: trigger JIT compilation NOW (with random params) before restore so
+    # the XLA program claims the HBM bottom first. The checkpoint is then loaded
+    # into the space above the compiled program. On subsequent training steps
+    # the program is already loaded — no re-allocation needed.
+    if args.resume and checkpoint_manager and checkpoint_manager.latest_step() is not None:
+        print("Pre-warming JIT compilation before checkpoint restore (resume OOM fix)...")
+        from dpsn_r_jax.training.trainer import train_step as _warmup_step
+        _warmup_batch = jax.device_put(
+            jnp.zeros((args.batch_size, config.max_seq_len), dtype=jnp.int32),
+            batch_sharding,
+        )
+        _warmup_sigma = float(getattr(config, 'sigma_target', 0.05) / max(getattr(config, 'sigma_max', 5.0), 1e-8))
+        _warmup_state, _, _, _ = _warmup_step(
+            state, _warmup_batch, float(config.learning_rate), _warmup_sigma,
+            config.pad_token_id,
+            precision_loss_weight=0.0,
+            sigma_anneal_steps=0,
+            use_bf16=getattr(config, 'use_bf16', False),
+            loss_chunk_size=getattr(config, 'loss_chunk_size', 0),
+            prefetch_reasoning=getattr(config, 'prefetch_reasoning', False),
+            prefetch_size=getattr(config, 'prefetch_size', 0),
+        )
+        del _warmup_batch, _warmup_state
+        jax.effects_barrier()
+        print("JIT pre-warm complete. Loading checkpoint...")
+
     # RESTORE CHECKPOINT IF REQUESTED
     if args.resume and checkpoint_manager:
         latest_step = checkpoint_manager.latest_step()
@@ -817,15 +850,6 @@ def main():
                 print("No checkpoint found to resume from. Starting from scratch.")
                 global_step = jnp.array(0, dtype=jnp.int32)
 
-        # ── Free pre-restore random param tensors before JIT compilation ─────
-        # During restore, both the old (random init) params and the new checkpoint
-        # params occupy HBM simultaneously (~6.2 GB peak on mini_pool/8 chips).
-        # The XLA compiled train_step needs 9.82 GB contiguous at the bottom of
-        # HBM, but only 9.8 GB is available while the old tensors are alive.
-        # Forcing GC here drops live HBM back to ~3.1 GB, giving XLA 12.9 GB —
-        # enough room to load the compiled program without OOM.
-        import gc
-        gc.collect()
     else:
         global_step = jnp.array(0, dtype=jnp.int32)
 
