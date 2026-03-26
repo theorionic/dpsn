@@ -56,7 +56,7 @@ from dpsn_r_jax.data.grain_loader import (
 )
 from dpsn_r_jax.data.prefetch import DevicePrefetchIterator
 from dpsn_r_jax.data.ram_cache import TokenizedRAMCache
-from dpsn_r_jax.utils.generation import generate, clear_generation_cache
+from dpsn_r_jax.utils.generation import generate, generate_fast, clear_generation_cache
 from dpsn_r_jax.utils.metrics import calculate_flops
 from dpsn_r_jax.utils.memory_debug import print_tpu_memory, print_param_memory
 
@@ -1531,16 +1531,17 @@ def main():
 
                 for prompt in prompts_to_use:
                     print(f"Input: {prompt}")
-                    output = generate(
+                    output = generate_fast(
                         state,
                         prompt,
                         tokenizer,
                         max_len=config.generation_max_tokens,
                         temperature=0.7,
                         repetition_penalty=1.2,
+                        max_seq_len=config.max_seq_len,
+                        verbose=True,
                     )
                     print(f"Output: {output}")
-                clear_generation_cache()
                 print("---------------------------------------")
 
             # Reset start_time for next interval

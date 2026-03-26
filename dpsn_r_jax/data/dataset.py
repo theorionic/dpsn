@@ -458,6 +458,12 @@ class ChunkedHFDataset:
         # Persistent HF iterator — advanced across all chunks so we never repeat rows
         self._hf_iter = self._make_iterator(hf_state=hf_state)
 
+        # Restore rows_consumed counter so get_state() reports the correct absolute position.
+        # When hf_state restores the iterator via O(1) seek, skip_rows still carries
+        # the total rows consumed from the grain_state — use it to seed the counter.
+        if hf_state is not None and skip_rows > 0:
+            self._rows_consumed = skip_rows
+
         # ── Fast-forward via islice when no hf_state available (slower fallback) ──
         if hf_state is None and skip_rows > 0:
             print(
@@ -479,9 +485,10 @@ class ChunkedHFDataset:
             print(f"[ChunkedHFDataset] Fast-forward complete — skipped {skipped:,} rows.")
 
         # ── Synchronous first chunk (training cannot start until it's ready) ──
+        _resume_label = f"rows {self._rows_consumed:,}+" if self._rows_consumed > 0 else "beginning"
         print(
-            f"[ChunkedHFDataset] Downloading first chunk ({chunk_size:,} rows) "
-            f"from '{dataset_name}'..."
+            f"[ChunkedHFDataset] Fetching chunk ({chunk_size:,} rows) "
+            f"from '{dataset_name}' (resuming from {_resume_label})..."
         )
         first = self._fetch_and_tokenize_chunk()
         if first is None or len(first) == 0:
@@ -492,7 +499,7 @@ class ChunkedHFDataset:
         self._current_chunk = first
         self._read_pos = 0
         print(
-            f"[ChunkedHFDataset] First chunk ready — {len(first):,} sequences "
+            f"[ChunkedHFDataset] Chunk ready — {len(first):,} sequences "
             f"({len(first) * seq_len * 4 / 1e6:.1f} MB). Training starts now!"
         )
 
