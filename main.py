@@ -137,6 +137,16 @@ def main():
         "--max_steps", type=int, default=None, help="Max training steps"
     )
     parser.add_argument(
+        "--max_duration_minutes",
+        type=float,
+        default=None,
+        help=(
+            "Stop training after this many minutes of wall-clock time and save a "
+            "checkpoint. Use this instead of --max_steps to limit session length "
+            "so the LR schedule always decays correctly over the full --max_steps target."
+        ),
+    )
+    parser.add_argument(
         "--hf_dataset", type=str, default=None, help="HuggingFace dataset name (legacy)"
     )
     parser.add_argument(
@@ -1176,6 +1186,17 @@ def main():
                 hit_max_steps = True
                 break
 
+            if args.max_duration_minutes:
+                elapsed_minutes = (time.time() - _wall_start_time) / 60
+                if elapsed_minutes >= args.max_duration_minutes:
+                    print(
+                        f"[Duration limit] {elapsed_minutes:.1f} min elapsed "
+                        f"(limit: {args.max_duration_minutes:.1f} min) — "
+                        f"stopping at step {global_step} and saving checkpoint."
+                    )
+                    _stop_requested[0] = True
+                    break
+
             if args.profile_dir and global_step == args.profile_steps[0]:
                 print(f"\n[PROFILER] 🟢 STARTING JAX XLA PROFILER AT STEP {global_step} 🟢")
                 jax.profiler.start_trace(args.profile_dir)
@@ -1563,6 +1584,10 @@ def main():
 
     signal.signal(signal.SIGINT, _sigint_handler)
 
+    _wall_start_time = time.time()
+    if args.max_duration_minutes:
+        print(f"[Duration limit] Will stop after {args.max_duration_minutes:.1f} minutes of training.")
+
     start_time = time.time()
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1590,6 +1615,17 @@ def main():
                 if args.max_steps and global_step >= args.max_steps:
                     hit_max_steps = True
                     break
+
+                if args.max_duration_minutes:
+                    elapsed_minutes = (time.time() - _wall_start_time) / 60
+                    if elapsed_minutes >= args.max_duration_minutes:
+                        print(
+                            f"[Duration limit] {elapsed_minutes:.1f} min elapsed "
+                            f"(limit: {args.max_duration_minutes:.1f} min) — "
+                            f"stopping at step {global_step} and saving checkpoint."
+                        )
+                        _stop_requested[0] = True
+                        break
 
                 file_label = f"[File {file_idx+1}/{len(npy_files)}] "
                 print(f"\n{'='*60}")
