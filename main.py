@@ -684,7 +684,9 @@ def main():
         abs_checkpoint_dir = os.path.abspath(args.checkpoint_dir)
         options = orbax.checkpoint.CheckpointManagerOptions(max_to_keep=2, create=True)
         checkpoint_manager = orbax.checkpoint.CheckpointManager(
-            abs_checkpoint_dir, orbax.checkpoint.PyTreeCheckpointer(), options
+            abs_checkpoint_dir,
+            orbax.checkpoint.AsyncCheckpointer(orbax.checkpoint.PyTreeCheckpointHandler()),
+            options,
         )
 
     # Initialize state with sharding constraints
@@ -1729,6 +1731,7 @@ def main():
         if checkpoint_manager:
             print(f"[Interrupted] Saving checkpoint at step {global_step}...")
             checkpoint_manager.save(global_step, state)
+            checkpoint_manager.wait_until_finished()
             _save_grain_state(_grain_state_file, global_step, dataset)
             print(f"[Interrupted] Checkpoint saved. Exiting.")
         else:
