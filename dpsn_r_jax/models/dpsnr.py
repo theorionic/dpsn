@@ -96,7 +96,7 @@ class DPSNR(nn.Module):
         # ── Timing mark: LM-head decode done (full forward complete) ─────────
         ctimer.mark("09_decode_done", logits)
 
-        return logits, (self.config.max_reasoning_loops, all_indices, mean_sigma)
+        return logits, (self.config.max_reasoning_loops, all_indices, mean_sigma, state_hidden)
 
     def encode_to_hidden(self, input_ids, deterministic=True, sigma_max_scale: float = 1.0,
                          retrieved_probes=None, candidates_probe=None, seq_pack_ids=None):

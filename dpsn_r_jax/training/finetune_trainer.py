@@ -179,7 +179,7 @@ def finetune_step(
     current_lr = state.learning_rate_fn(state.step)
 
     def loss_fn(params):
-        logits, (_, indices) = state.apply_fn(
+        logits, (_, indices, *_) = state.apply_fn(
             {"params": params},
             input_ids,
             deterministic=False,

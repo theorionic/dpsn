@@ -521,7 +521,7 @@ def train_step(
                 )
                 if seq_pack_ids is not None:
                     _fwd_kwargs["seq_pack_ids"] = seq_pack_ids
-                logits, (_, indices, mean_sigma) = state.apply_fn(
+                logits, (_, indices, mean_sigma, _hidden) = state.apply_fn(
                     {"params": compute_params}, batch,
                     **_fwd_kwargs,
                 )
@@ -718,7 +718,7 @@ def grad_accum_step(
                     )
                     if seq_pack_ids is not None:
                         _fwd_kwargs["seq_pack_ids"] = seq_pack_ids
-                    logits, (_, indices, mean_sigma) = state.apply_fn(
+                    logits, (_, indices, mean_sigma, _hidden) = state.apply_fn(
                         {"params": compute_params}, micro_batch,
                         **_fwd_kwargs,
                     )
