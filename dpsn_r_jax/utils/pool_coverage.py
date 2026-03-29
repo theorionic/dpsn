@@ -257,7 +257,7 @@ def save_coverage_report(coverage_tracker: PoolCoverageTracker,
     report_path = Path(checkpoint_dir) / f"pool_coverage_step_{step}.json"
 
     report = {
-        "step": step,
+        "step": int(step),
         "coverage_data": coverage_tracker.to_dict(),
         "summary": coverage_tracker.get_coverage(),
     }
