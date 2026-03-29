@@ -1314,7 +1314,6 @@ def main():
                     prefetch_size=getattr(config, 'prefetch_size', 0),
                     seq_pack_ids=_seq_pack_ids,
                 )
-                coverage_tracker.record_access(all_mu_r, all_mu_c)
             else:
                 # ── Standard single-step path ─────────────────────────────────
                 state, loss, mean_sigma, pool_grad_norm, all_mu_r, all_mu_c = distributed_train_step(
@@ -1327,7 +1326,10 @@ def main():
                     prefetch_size=getattr(config, 'prefetch_size', 0),
                     seq_pack_ids=_seq_pack_ids,
                 )
-                coverage_tracker.record_access(all_mu_r, all_mu_c)
+            # Keep latest mu arrays as JAX futures — no D2H transfer here.
+            # record_access() is called inside the LOG_INTERVAL block after
+            # block_until_ready() has already stalled, so there's no extra sync.
+            _last_mu_r, _last_mu_c = all_mu_r, all_mu_c
 
             # Bug #1 Fix: append JAX futures — NO float() / .item() here!
             # These are enqueued as async device operations; the TPU keeps running.
@@ -1391,11 +1393,11 @@ def main():
                 checkpoint_manager.save(global_step, state)
                 _save_grain_state(_grain_state_file, global_step, dataset)
 
-                # Save pool coverage report
+                # Save pool coverage report (cumulative — never reset so totals
+                # accumulate across the entire training run)
                 print_coverage_report(coverage_tracker, global_step, title="Pool Coverage at Checkpoint")
                 if args.checkpoint_dir:
                     save_coverage_report(coverage_tracker, args.checkpoint_dir, global_step)
-                coverage_tracker.reset()  # Reset for next interval
 
             if step % LOG_INTERVAL == 0:
                 # Bug #1 Fix: ONE blocking sync per LOG_INTERVAL steps.
@@ -1435,12 +1437,9 @@ def main():
                 writer.add_scalar("Perf/DataWaitTime_s", avg_data_wait, global_step)
                 writer.add_scalar("GradNorm/pool", grad_norm_val, global_step)
 
-                # Pool coverage metrics
-                coverage_stats = coverage_tracker.get_coverage()
-                writer.add_scalar("PoolCoverage/coordinate_pct", coverage_stats["coordinate_coverage_pct"], global_step)
-                writer.add_scalar("PoolCoverage/vector_pct", coverage_stats["vector_coverage_pct"], global_step)
-                writer.add_scalar("PoolCoverage/concentration", coverage_stats["access_concentration"], global_step)
-                print(coverage_tracker.get_summary_string())
+                # Pool coverage — record here after block_until_ready so
+                # the D2H transfer is folded into the existing sync stall.
+                coverage_tracker.record_access(_last_mu_r, _last_mu_c)
 
                 # TPU memory utilization — aggregate across all devices
                 _mem_in_use = _mem_limit = 0

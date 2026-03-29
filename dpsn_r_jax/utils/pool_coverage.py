@@ -172,45 +172,36 @@ class PoolCoverageTracker:
         self.total_vectors_accessed_count = 0
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert coverage data to dictionary for checkpoint saving.
-
-        Returns:
-            Dictionary with all coverage information
-        """
-        stats = self.get_coverage()
-
+        """Convert coverage data to dictionary for checkpoint saving."""
         return {
-            "stats": stats,
-            "heatmap": self.get_heatmap().tolist(),  # Convert to list for JSON serialization
+            "window_size": self.window_size,
+            "total_accesses": self.total_accesses,
             "access_frequency": {
                 f"{r},{c}": count for (r, c), count in self.access_frequency.items()
-            }
+            },
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any], grid_rows: int, grid_cols: int) -> "PoolCoverageTracker":
-        """Restore coverage tracker from saved dictionary.
+        """Restore coverage tracker from saved dictionary."""
+        window_size = data.get("window_size", 4)
+        tracker = cls(grid_rows, grid_cols, window_size=window_size)
 
-        Args:
-            data: Dictionary from to_dict()
-            grid_rows: Pool grid rows
-            grid_cols: Pool grid cols
+        freq = data.get("access_frequency", {})
+        for key, count in freq.items():
+            r, c = int(key.split(",")[0]), int(key.split(",")[1])
+            coord = (r, c)
+            tracker.access_frequency[coord] = count
+            tracker.accessed_coordinates.add(coord)
+            # Re-expand the retrieval window so accessed_indices is fully restored
+            w_half = window_size // 2
+            for dr in range(-w_half, w_half + 1):
+                for dc in range(-w_half, w_half + 1):
+                    r_win = (r + dr) % grid_rows
+                    c_win = (c + dc) % grid_cols
+                    tracker.accessed_indices.add(r_win * grid_cols + c_win)
 
-        Returns:
-            Restored PoolCoverageTracker instance
-        """
-        tracker = cls(grid_rows, grid_cols)
-
-        if "heatmap" in data:
-            heatmap = np.array(data["heatmap"])
-            # Reconstruct access frequency from heatmap
-            for r in range(grid_rows):
-                for c in range(grid_cols):
-                    if heatmap[r, c] > 0:
-                        tracker.access_frequency[(r, c)] = int(heatmap[r, c])
-                        tracker.accessed_coordinates.add((r, c))
-                        tracker.total_accesses += int(heatmap[r, c])
-
+        tracker.total_accesses = data.get("total_accesses", sum(freq.values()))
         return tracker
 
 
