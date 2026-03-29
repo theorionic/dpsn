@@ -125,7 +125,7 @@ class PoolCoverageTracker:
             "unique_vectors": len(self.accessed_indices),
             "total_vectors": total_coords,
             "vector_coverage_pct": float(vector_coverage),
-            "total_accesses": self.total_accesses,
+            "total_accesses": int(self.total_accesses),
             "access_concentration": float(access_concentration),  # 0=uniform, high=concentrated
         }
 
@@ -174,10 +174,10 @@ class PoolCoverageTracker:
     def to_dict(self) -> Dict[str, Any]:
         """Convert coverage data to dictionary for checkpoint saving."""
         return {
-            "window_size": self.window_size,
-            "total_accesses": self.total_accesses,
+            "window_size": int(self.window_size),
+            "total_accesses": int(self.total_accesses),
             "access_frequency": {
-                f"{r},{c}": count for (r, c), count in self.access_frequency.items()
+                f"{r},{c}": int(count) for (r, c), count in self.access_frequency.items()
             },
         }
 
