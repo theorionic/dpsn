@@ -574,7 +574,7 @@ def train_step(
         r_starts, c_starts, grad_slices,
         new_rng, current_lr,
     )
-    return new_state, loss, mean_sigma, pool_grad_norm
+    return new_state, loss, mean_sigma, pool_grad_norm, all_mu_r, all_mu_c
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -812,7 +812,7 @@ def grad_accum_step(
         r_starts, c_starts, grad_slices,
         new_rng, current_lr,
     )
-    return new_state, avg_loss, avg_sigma, pool_grad_norm
+    return new_state, avg_loss, avg_sigma, pool_grad_norm, all_mu_r, all_mu_c
 
 
 # ─────────────────────────────────────────────────────────────────────────────

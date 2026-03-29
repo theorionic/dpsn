@@ -59,6 +59,7 @@ from dpsn_r_jax.data.ram_cache import TokenizedRAMCache
 from dpsn_r_jax.utils.generation import generate, clear_generation_cache
 from dpsn_r_jax.utils.metrics import calculate_flops
 from dpsn_r_jax.utils.memory_debug import print_tpu_memory, print_param_memory
+from dpsn_r_jax.utils.pool_coverage import PoolCoverageTracker, print_coverage_report, save_coverage_report
 
 
 def log_pool_utilization(state):
@@ -792,6 +793,17 @@ def main():
 
     state = jax.tree_util.tree_map(bound_to_mesh, state)
 
+    # ── Initialize Pool Coverage Tracker ──────────────────────────────────────
+    # Track which regions of the pool are accessed during training to ensure
+    # efficient utilization of the 1.07B pool parameters.
+    R_pool, C_pool, D_pool = pool_params.shape
+    _axis_w = max(2, int(config.max_k ** 0.5))  # same formula as trainer.py's axis_W
+    coverage_tracker = PoolCoverageTracker(
+        pool_grid_rows=R_pool,
+        pool_grid_cols=C_pool,
+        window_size=_axis_w,
+    )
+    print(f"Initialized pool coverage tracker: {R_pool}×{C_pool} grid, {_axis_w}×{_axis_w} retrieval window")
 
     # ── PRE-WARM JIT BEFORE CHECKPOINT RESTORE ───────────────────────────────
     # Problem: on resume, checkpoint_manager.restore() temporarily doubles HBM
@@ -812,7 +824,7 @@ def main():
             batch_sharding,
         )
         _warmup_sigma = float(getattr(config, 'sigma_target', 0.05) / max(getattr(config, 'sigma_max', 5.0), 1e-8))
-        _warmup_state, _, _, _ = _warmup_step(
+        _warmup_state, _, _, _, _, _ = _warmup_step(
             state, _warmup_batch, float(config.learning_rate), _warmup_sigma,
             config.pad_token_id,
             precision_loss_weight=0.0,
@@ -861,6 +873,27 @@ def main():
             else:
                 print("No checkpoint found to resume from. Starting from scratch.")
                 global_step = jnp.array(0, dtype=jnp.int32)
+
+        # Restore pool coverage tracker from last saved report
+        if args.checkpoint_dir:
+            _cov_step = int(global_step)
+            _cov_path = os.path.join(
+                os.path.abspath(args.checkpoint_dir),
+                f"pool_coverage_step_{_cov_step}.json",
+            )
+            if os.path.exists(_cov_path):
+                try:
+                    with open(_cov_path) as _f:
+                        _cov_data = json.load(_f)
+                    coverage_tracker = PoolCoverageTracker.from_dict(
+                        _cov_data.get("coverage_data", {}), R_pool, C_pool
+                    )
+                    print(f"Restored pool coverage tracker from {_cov_path}")
+                    print(coverage_tracker.get_summary_string())
+                except Exception as _e:
+                    print(f"[Coverage] Could not restore tracker from {_cov_path}: {_e}")
+            else:
+                print(f"[Coverage] No coverage file at step {_cov_step}, starting fresh.")
 
     else:
         global_step = jnp.array(0, dtype=jnp.int32)
@@ -1269,7 +1302,7 @@ def main():
                     _batch_rep.reshape(_grad_accum, micro_batch_size, config.max_seq_len),
                     NamedSharding(mesh, PartitionSpec(None, _dp_axis, None)),
                 )
-                state, loss, mean_sigma, pool_grad_norm = grad_accum_step(
+                state, loss, mean_sigma, pool_grad_norm, all_mu_r, all_mu_c = grad_accum_step(
                     state, micro_batches, current_lr_val, sigma_scale_val,
                     pad_token_id=config.pad_token_id,
                     precision_loss_weight=getattr(config, 'precision_loss_weight', 0.0),
@@ -1281,9 +1314,10 @@ def main():
                     prefetch_size=getattr(config, 'prefetch_size', 0),
                     seq_pack_ids=_seq_pack_ids,
                 )
+                coverage_tracker.record_access(all_mu_r, all_mu_c)
             else:
                 # ── Standard single-step path ─────────────────────────────────
-                state, loss, mean_sigma, pool_grad_norm = distributed_train_step(
+                state, loss, mean_sigma, pool_grad_norm, all_mu_r, all_mu_c = distributed_train_step(
                     state, batch, current_lr_val, sigma_scale_val, config.pad_token_id,
                     precision_loss_weight=getattr(config, 'precision_loss_weight', 0.0),
                     sigma_anneal_steps=getattr(config, 'sigma_anneal_steps', 0),
@@ -1293,6 +1327,7 @@ def main():
                     prefetch_size=getattr(config, 'prefetch_size', 0),
                     seq_pack_ids=_seq_pack_ids,
                 )
+                coverage_tracker.record_access(all_mu_r, all_mu_c)
 
             # Bug #1 Fix: append JAX futures — NO float() / .item() here!
             # These are enqueued as async device operations; the TPU keeps running.
@@ -1356,6 +1391,12 @@ def main():
                 checkpoint_manager.save(global_step, state)
                 _save_grain_state(_grain_state_file, global_step, dataset)
 
+                # Save pool coverage report
+                print_coverage_report(coverage_tracker, global_step, title="Pool Coverage at Checkpoint")
+                if args.checkpoint_dir:
+                    save_coverage_report(coverage_tracker, args.checkpoint_dir, global_step)
+                coverage_tracker.reset()  # Reset for next interval
+
             if step % LOG_INTERVAL == 0:
                 # Bug #1 Fix: ONE blocking sync per LOG_INTERVAL steps.
                 # block_until_ready() stalls the host until the TPU has
@@ -1393,6 +1434,13 @@ def main():
                 writer.add_scalar("Perf/TFLOPS", tflops, global_step)
                 writer.add_scalar("Perf/DataWaitTime_s", avg_data_wait, global_step)
                 writer.add_scalar("GradNorm/pool", grad_norm_val, global_step)
+
+                # Pool coverage metrics
+                coverage_stats = coverage_tracker.get_coverage()
+                writer.add_scalar("PoolCoverage/coordinate_pct", coverage_stats["coordinate_coverage_pct"], global_step)
+                writer.add_scalar("PoolCoverage/vector_pct", coverage_stats["vector_coverage_pct"], global_step)
+                writer.add_scalar("PoolCoverage/concentration", coverage_stats["access_concentration"], global_step)
+                print(coverage_tracker.get_summary_string())
 
                 # TPU memory utilization — aggregate across all devices
                 _mem_in_use = _mem_limit = 0
