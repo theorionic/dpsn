@@ -455,9 +455,9 @@ def get_model_config(name: str) -> DPSNRConfig:
             num_indexer_heads=8,           # 8 independent (µ_r, µ_c, σ) per step
             sigma_min=0.005,
             sigma_max=5.0,
-            sigma_anneal_steps=50_000,
-            sigma_target=0.03,
-            precision_loss_weight=0.01,
+            sigma_anneal_steps=200_000,  # anneal over 40% of a 500k run
+            sigma_target=0.1,            # never get tighter than this
+            precision_loss_weight=0.0,   # disabled: let indexer explore freely; enable after coverage >10%
             # ── Pool: 1024 × 1024 × 1024 = 1.07 B parameters ────────────────
             pool_grid_rows=1024,
             pool_grid_cols=1024,

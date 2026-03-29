@@ -127,6 +127,12 @@ def main():
         help="Override sigma annealing steps (0 = disabled; default from config)",
     )
     parser.add_argument(
+        "--coverage_threshold",
+        type=float,
+        default=5.0,
+        help="Min vector coverage %% before tightening sigma (adaptive sigma). Default: 5.0%%",
+    )
+    parser.add_argument(
         "--epochs", type=int, default=1, help="Number of training epochs"
     )
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
@@ -321,6 +327,62 @@ def main():
         default=0,
         help="Run forward_only_step every N steps to measure fwd/bwd time split (0=disabled). "
              "Loads a second JIT program — disable on memory-constrained configs like xxl.",
+    )
+    parser.add_argument(
+        "--val_dataset",
+        type=str,
+        default=None,
+        help="HF dataset name for validation (e.g. 'wikitext'). Optional.",
+    )
+    parser.add_argument(
+        "--val_subset",
+        type=str,
+        default=None,
+        help="HF dataset subset/config name (e.g. 'wikitext-2-raw-v1').",
+    )
+    parser.add_argument(
+        "--val_split",
+        type=str,
+        default="validation",
+        help="Dataset split to use for validation (default: 'validation'). "
+             "Falls back to 'test' then 'train' if split not found.",
+    )
+    parser.add_argument(
+        "--val_text_column",
+        type=str,
+        default=None,
+        help="Text column name in validation dataset. If not set, auto-detects "
+             "from common names: text, content, sentence, passage, document.",
+    )
+    parser.add_argument(
+        "--val_tokenizer",
+        type=str,
+        default=None,
+        help="Tokenizer for validation dataset. Defaults to same as --hf_tokenizer.",
+    )
+    parser.add_argument(
+        "--val_chunk_size",
+        type=int,
+        default=5000,
+        help="Rows to stream per chunk for validation dataset (default: 5000).",
+    )
+    parser.add_argument(
+        "--val_interval",
+        type=int,
+        default=None,
+        help="Run validation every N steps. Defaults to --save_interval if not set.",
+    )
+    parser.add_argument(
+        "--val_steps",
+        type=int,
+        default=50,
+        help="Number of batches to average for validation loss (default: 50).",
+    )
+    parser.add_argument(
+        "--max_checkpoints",
+        type=int,
+        default=5,
+        help="Max number of checkpoints to keep. Default: 5.",
     )
     parser.add_argument(
         "--profile_components",
@@ -683,12 +745,18 @@ def main():
     checkpoint_manager = None
     if args.checkpoint_dir:
         abs_checkpoint_dir = os.path.abspath(args.checkpoint_dir)
-        options = orbax.checkpoint.CheckpointManagerOptions(max_to_keep=2, create=True)
+        options = orbax.checkpoint.CheckpointManagerOptions(max_to_keep=args.max_checkpoints, create=True)
         checkpoint_manager = orbax.checkpoint.CheckpointManager(
             abs_checkpoint_dir,
             orbax.checkpoint.AsyncCheckpointer(orbax.checkpoint.PyTreeCheckpointHandler()),
             options,
         )
+
+    # Separate checkpointer for best-val-loss checkpoint
+    _best_val_loss = float('inf')
+    _best_val_step = 0
+    _best_ckpt_dir = os.path.join(os.path.abspath(args.checkpoint_dir), "best") if args.checkpoint_dir else None
+    _best_checkpointer = orbax.checkpoint.PyTreeCheckpointer() if _best_ckpt_dir else None
 
     # Initialize state with sharding constraints
     # We first create the raw variables distributedly
@@ -804,6 +872,50 @@ def main():
         window_size=_axis_w,
     )
     print(f"Initialized pool coverage tracker: {R_pool}×{C_pool} grid, {_axis_w}×{_axis_w} retrieval window")
+
+    # ── Validation dataset (optional) ────────────────────────────────────────
+    _val_dataset = None
+    _val_interval = args.val_interval or args.save_interval or 1000
+    if args.val_dataset:
+        _val_tok = args.val_tokenizer or tokenizer_name
+        # Auto-detect text column: explicit arg → common fallback list
+        _val_text_cols = (
+            [args.val_text_column]
+            if args.val_text_column
+            else ["text", "content", "sentence", "passage", "document"]
+        )
+        print(
+            f"Loading validation dataset: {args.val_dataset}"
+            f"{f'/{args.val_subset}' if args.val_subset else ''}"
+            f" split='{args.val_split}' col={_val_text_cols[0] if args.val_text_column else 'auto'} ..."
+        )
+        try:
+            _val_dataset = ChunkedHFDataset(
+                dataset_name=args.val_dataset,
+                tokenizer_name=_val_tok,
+                subset=args.val_subset,
+                split=args.val_split,
+                seq_len=config.max_seq_len,
+                batch_size=args.batch_size,
+                chunk_size=args.val_chunk_size,
+                text_columns=_val_text_cols,
+            )
+            print(
+                f"Validation dataset ready. "
+                f"Evaluating every {_val_interval} steps over {args.val_steps} batches."
+            )
+        except Exception as _e:
+            print(f"[Val] Could not load validation dataset: {_e}. Skipping validation.")
+            _val_dataset = None
+
+    # ── Health monitoring state ───────────────────────────────────────────────
+    _health_loss_history = []       # rolling window of LOG_INTERVAL loss values
+    _health_zero_gradnorm_streak = 0
+
+    # ── Adaptive sigma state ──────────────────────────────────────────────────
+    # Multiplier applied to sigma_scale each step.
+    # > 1.0 forces broader exploration when coverage is poor.
+    _adaptive_sigma_mult = 1.0
 
     # ── PRE-WARM JIT BEFORE CHECKPOINT RESTORE ───────────────────────────────
     # Problem: on resume, checkpoint_manager.restore() temporarily doubles HBM
@@ -1201,6 +1313,8 @@ def main():
         """Run training steps using the given data pipeline.
         Returns (state, global_step, epoch_loss, start_time, total_data_wait_time_interval, hit_max_steps).
         """
+        nonlocal _adaptive_sigma_mult, _health_loss_history, _health_zero_gradnorm_streak
+        nonlocal _best_val_loss, _best_val_step
         # Bug #1 Fix: accumulate loss as a JAX future (no blocking DtH transfer).
         # We only call float() / block_until_ready() inside the LOG_INTERVAL block,
         # keeping the TPU pipeline bubble-free between logging events.
@@ -1272,6 +1386,12 @@ def main():
             # jnp.float32(jax_scalar) calls __float__ → np.asarray → D2H stall.
             current_lr_val = lr_schedule(global_step).astype(jnp.float32)
             sigma_scale_val = sigma_anneal_fn(global_step).astype(jnp.float32)
+            # Adaptive sigma: widen when pool coverage is poor (updated at LOG_INTERVAL)
+            if _adaptive_sigma_mult != 1.0:
+                sigma_scale_val = jnp.minimum(
+                    jnp.float32(1.0),
+                    sigma_scale_val * jnp.float32(_adaptive_sigma_mult),
+                )
 
             if _grad_accum > 1:
                 # ── Gradient accumulation path ────────────────────────────────
@@ -1331,12 +1451,25 @@ def main():
             # block_until_ready() has already stalled, so there's no extra sync.
             _last_mu_r, _last_mu_c = all_mu_r, all_mu_c
 
+            # ── NaN/Inf guard ─────────────────────────────────────────────────
+            # jnp.isnan/isinf on a future is safe — triggers D2H only when needed.
+            # Checked AFTER appending futures so the TPU pipeline stays full.
+
             # Bug #1 Fix: append JAX futures — NO float() / .item() here!
             # These are enqueued as async device operations; the TPU keeps running.
             epoch_loss     = epoch_loss + loss
             last_loss      = loss
             last_sigma     = mean_sigma
             last_grad_norm = pool_grad_norm
+
+            # NaN/Inf check — only blocks if actually NaN (rare path)
+            if bool(jnp.isnan(loss)) or bool(jnp.isinf(loss)):
+                print(f"[HEALTH] ⚠️  NaN/Inf loss at step {global_step}! Saving emergency checkpoint...")
+                if checkpoint_manager:
+                    checkpoint_manager.save(global_step, state)
+                    checkpoint_manager.wait_until_finished()
+                _stop_requested[0] = True
+                break
             dispatch_time = time.time() - dispatch_start_time
 
             # ── Detailed per-step timing breakdown (--profile_detailed) ──────
@@ -1399,6 +1532,44 @@ def main():
                 if args.checkpoint_dir:
                     save_coverage_report(coverage_tracker, args.checkpoint_dir, global_step)
 
+                # ── Validation loss ───────────────────────────────────────────
+                if _val_dataset is not None and global_step % _val_interval == 0:
+                    print(f"[Val] Running validation over {args.val_steps} batches...")
+                    _val_losses = []
+                    _val_sigma  = float(sigma_anneal_fn(global_step))
+                    for _vi in range(args.val_steps):
+                        try:
+                            _val_batch = _val_dataset.get_batch(args.batch_size)
+                        except (StopIteration, Exception):
+                            break
+                        _val_batch = jax.device_put(_val_batch, batch_sharding)
+                        _val_out, _ = forward_only_step(
+                            state, _val_batch,
+                            sigma_scale=jnp.float32(_val_sigma),
+                            use_bf16=getattr(config, 'use_bf16', False),
+                            loss_chunk_size=getattr(config, 'loss_chunk_size', 0),
+                        )
+                        jax.block_until_ready(_val_out)
+                        _val_losses.append(float(_val_out))
+
+                    if _val_losses:
+                        _val_loss = sum(_val_losses) / len(_val_losses)
+                        _val_ppl  = float(jnp.exp(jnp.float32(_val_loss)))
+                        print(f"[Val] Step {global_step} | Val Loss: {_val_loss:.4f} | Val PPL: {_val_ppl:.4f}")
+                        writer.add_scalar("Loss/val", _val_loss, global_step)
+                        writer.add_scalar("PPL/val",  _val_ppl,  global_step)
+
+                        # Save best checkpoint
+                        if _val_loss < _best_val_loss and _best_checkpointer and _best_ckpt_dir:
+                            _best_val_loss = _val_loss
+                            _best_val_step = global_step
+                            os.makedirs(_best_ckpt_dir, exist_ok=True)
+                            _best_checkpointer.save(
+                                os.path.join(_best_ckpt_dir, "best"),
+                                state,
+                            )
+                            print(f"[Val] ✓ New best val loss {_val_loss:.4f} — saved best checkpoint to {_best_ckpt_dir}")
+
             if step % LOG_INTERVAL == 0:
                 # Bug #1 Fix: ONE blocking sync per LOG_INTERVAL steps.
                 # block_until_ready() stalls the host until the TPU has
@@ -1441,6 +1612,41 @@ def main():
                 # the D2H transfer is folded into the existing sync stall.
                 coverage_tracker.record_access(_last_mu_r, _last_mu_c)
                 print(coverage_tracker.get_summary_string())
+
+                # ── Adaptive sigma control ────────────────────────────────────
+                _cov_stats = coverage_tracker.get_coverage()
+                _cov_pct   = _cov_stats["vector_coverage_pct"]
+                _conc      = _cov_stats["access_concentration"]
+                if _cov_pct < args.coverage_threshold:
+                    _adaptive_sigma_mult = 3.0   # force broad exploration
+                elif _cov_pct < args.coverage_threshold * 2:
+                    _adaptive_sigma_mult = 1.5   # moderate push
+                elif _conc > 5.0:
+                    _adaptive_sigma_mult = 1.2   # slight widen to break concentration
+                else:
+                    _adaptive_sigma_mult = 1.0   # normal annealing
+                writer.add_scalar("Adaptive/sigma_mult",   _adaptive_sigma_mult, global_step)
+                writer.add_scalar("Adaptive/coverage_pct", _cov_pct,             global_step)
+                if _adaptive_sigma_mult > 1.0:
+                    print(f"[AdaptiveSigma] coverage={_cov_pct:.1f}% conc={_conc:.2f} → sigma_mult={_adaptive_sigma_mult}x (forcing exploration)")
+
+                # ── Health monitoring ─────────────────────────────────────────
+                _health_loss_history.append(loss_val)
+                if len(_health_loss_history) > 20:
+                    _health_loss_history.pop(0)
+
+                if grad_norm_val < 1e-6:
+                    _health_zero_gradnorm_streak += 1
+                    if _health_zero_gradnorm_streak >= 5:
+                        print(f"[HEALTH] ⚠️  GradNorm≈0 for {_health_zero_gradnorm_streak} consecutive log intervals — pool may be frozen")
+                else:
+                    _health_zero_gradnorm_streak = 0
+
+                if len(_health_loss_history) == 20:
+                    _recent_min  = min(_health_loss_history[10:])
+                    _earlier_min = min(_health_loss_history[:10])
+                    if _recent_min >= _earlier_min - 0.001:
+                        print(f"[HEALTH] ⚠️  Loss stuck: recent_min={_recent_min:.4f}, earlier_min={_earlier_min:.4f} (no improvement over last {10 * LOG_INTERVAL} steps)")
 
                 # TPU memory utilization — aggregate across all devices
                 _mem_in_use = _mem_limit = 0
