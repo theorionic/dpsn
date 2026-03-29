@@ -1440,6 +1440,7 @@ def main():
                 # Pool coverage — record here after block_until_ready so
                 # the D2H transfer is folded into the existing sync stall.
                 coverage_tracker.record_access(_last_mu_r, _last_mu_c)
+                print(coverage_tracker.get_summary_string())
 
                 # TPU memory utilization — aggregate across all devices
                 _mem_in_use = _mem_limit = 0
