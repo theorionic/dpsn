@@ -292,32 +292,38 @@ class FlashCausalSelfAttention(nn.Module):
 
         else:
             # ----------------------------------------------------------------
-            # Standard Flax dot-product attention fallback.
-            # Used on CPU/GPU, when seq_len constraints aren't met, or when
-            # batch size isn't divisible by device count (e.g. eval_shape),
-            # or when seq_pack_ids is provided (packed sequences need a
-            # block-diagonal causal mask that splash attention cannot express).
+            # Attention fallback path.
+            #
+            # Packed sequences (seq_pack_ids != None): must use Flax's
+            # nn.dot_product_attention with a block-diagonal causal bias —
+            # jax.nn.dot_product_attention does not support dynamic per-position
+            # masks of this kind.
+            #
+            # All other cases: use jax.nn.dot_product_attention which lowers to
+            # Flash Attention on TPU (Pallas-based, O(seq) HBM not O(T²)).
+            # This avoids the 8 GB [B, H, T, T] intermediate that
+            # nn.dot_product_attention materialises during the backward pass
+            # under gradient checkpointing (remat), which causes OOM at T=4096.
             # ----------------------------------------------------------------
             if seq_pack_ids is not None:
                 bias = _make_packed_causal_bias(T, seq_pack_ids)
                 bias = bias[None, None, :, :]  # (1, 1, T, T) broadcast over B and H
+                # Flax path: dropout_rate=0.0 avoids TracerBoolConversionError
+                # with gradient checkpointing (static_argnums=(2,) in remat).
+                y = nn.dot_product_attention(
+                    q, k, v, bias=bias, dropout_rate=0.0, deterministic=True,
+                )
             elif self.window_size > 0:
-                bias = _make_sliding_window_causal_bias(T, self.window_size)
-                bias = bias[None, None, :, :]
+                # Causal sliding-window mask: token i attends to
+                # [max(0, i-window_size+1), i].  Boolean True = attend.
+                _i = jnp.arange(T)[:, None]
+                _j = jnp.arange(T)[None, :]
+                _mask = ((_j <= _i) & (_j >= _i - self.window_size + 1))[None, None]
+                y = jax.nn.dot_product_attention(q, k, v, mask=_mask)
             else:
-                causal = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
-                bias = jnp.where(causal, 0.0, -1e4)[None, None, :, :]
-
-            # Pass dropout_rate=0.0 to avoid Flax's internal `if not deterministic:`
-            # Python branch (TracerBoolConversionError with gradient checkpointing).
-            y = nn.dot_product_attention(
-                q,
-                k,
-                v,
-                bias=bias,
-                dropout_rate=0.0,
-                deterministic=True,
-            )
+                # Full causal attention — is_causal=True lets JAX use the most
+                # efficient kernel (no mask allocation at all).
+                y = jax.nn.dot_product_attention(q, k, v, is_causal=True)
 
         y = y.reshape(B, T, self.hidden_dim)
         y = nn.Dense(self.hidden_dim, use_bias=False)(y)
