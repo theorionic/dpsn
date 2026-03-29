@@ -1145,7 +1145,7 @@ def main():
                        loss_chunk_size=getattr(config, 'loss_chunk_size', 0))
     print_tpu_memory("after model init (before first train_step compile)")
 
-    from dpsn_r_jax.training.trainer import train_step, grad_accum_step, forward_only_step
+    from dpsn_r_jax.training.trainer import train_step, grad_accum_step, forward_only_step, eval_step
     from dpsn_r_jax.utils.metrics import summarise_flops, roofline_metrics
 
     # ── Choose training function based on gradient accumulation ──────────────
@@ -1543,9 +1543,10 @@ def main():
                         except (StopIteration, Exception):
                             break
                         _val_batch = jax.device_put(_val_batch, batch_sharding)
-                        _val_out, _ = forward_only_step(
+                        _val_out = eval_step(
                             state, _val_batch,
                             sigma_scale=jnp.float32(_val_sigma),
+                            pad_token_id=getattr(config, 'pad_token_id', 0),
                             use_bf16=getattr(config, 'use_bf16', False),
                             loss_chunk_size=getattr(config, 'loss_chunk_size', 0),
                         )

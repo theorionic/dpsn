@@ -855,3 +855,51 @@ def forward_only_step(state, batch, sigma_scale, use_bf16=False, loss_chunk_size
                 rngs={"dropout": dropout_rng},
             )
         return logits, aux
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# eval_step — forward pass + scalar loss, no grad, no optimizer update.
+# Used for validation loss computation.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@functools.partial(
+    jax.jit,
+    static_argnames=["pad_token_id", "use_bf16", "loss_chunk_size"],
+)
+def eval_step(state, batch, sigma_scale, pad_token_id=0, use_bf16=False, loss_chunk_size=0):
+    """Forward pass with scalar loss — for validation. No gradients, no optimizer."""
+    dropout_rng, _ = random.split(state.rng)
+    compute_params = (
+        jax.tree_util.tree_map(lambda x: x.astype(jnp.bfloat16), state.params)
+        if use_bf16 else state.params
+    )
+
+    if loss_chunk_size > 0:
+        state_hidden, _ = state.apply_fn(
+            {"params": compute_params}, batch,
+            deterministic=True, sigma_max_scale=sigma_scale,
+            rngs={"dropout": dropout_rng},
+            method=lambda mod, *a, **kw: mod.encode_to_hidden(*a, **kw),
+        )
+        def decode_fn(chunk_h):
+            return state.apply_fn(
+                {"params": compute_params}, chunk_h,
+                method=lambda mod, h: mod.controller.decode(h),
+            )
+        loss = chunked_lm_loss(
+            state_hidden, batch, decode_fn, pad_token_id, loss_chunk_size
+        ).astype(jnp.float32)
+    else:
+        logits, _ = state.apply_fn(
+            {"params": compute_params}, batch,
+            deterministic=True, sigma_max_scale=sigma_scale,
+            rngs={"dropout": dropout_rng},
+        )
+        logits = logits.astype(jnp.float32)
+        shift_logits = logits[:, :-1, :]
+        shift_labels = batch[:, 1:]
+        lm_loss = optax.softmax_cross_entropy_with_integer_labels(shift_logits, shift_labels)
+        mask = (shift_labels != pad_token_id).astype(jnp.float32)
+        loss = (lm_loss * mask).sum() / (mask.sum() + 1e-9)
+
+    return loss
