@@ -1619,12 +1619,12 @@ def main():
                 _cov_stats = coverage_tracker.get_coverage()
                 _cov_pct   = _cov_stats["vector_coverage_pct"]
                 _conc      = _cov_stats["access_concentration"]
-                if _cov_pct < args.coverage_threshold:
+                if _cov_pct < args.coverage_threshold or _conc > 15.0:
                     _adaptive_sigma_mult = 3.0   # force broad exploration
-                elif _cov_pct < args.coverage_threshold * 2:
-                    _adaptive_sigma_mult = 1.5   # moderate push
+                elif _cov_pct < args.coverage_threshold * 2 or _conc > 10.0:
+                    _adaptive_sigma_mult = 2.0   # strong push
                 elif _conc > 5.0:
-                    _adaptive_sigma_mult = 1.2   # slight widen to break concentration
+                    _adaptive_sigma_mult = 1.5   # moderate widen
                 else:
                     _adaptive_sigma_mult = 1.0   # normal annealing
                 writer.add_scalar("Adaptive/sigma_mult",   _adaptive_sigma_mult, global_step)
