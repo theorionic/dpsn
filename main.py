@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import shutil
 import signal
 import sys
 import time
@@ -1565,10 +1566,10 @@ def main():
                             _best_val_loss = _val_loss
                             _best_val_step = global_step
                             os.makedirs(_best_ckpt_dir, exist_ok=True)
-                            _best_checkpointer.save(
-                                os.path.join(_best_ckpt_dir, "best"),
-                                state,
-                            )
+                            _best_ckpt_path = os.path.join(_best_ckpt_dir, "best")
+                            if os.path.exists(_best_ckpt_path):
+                                shutil.rmtree(_best_ckpt_path)
+                            _best_checkpointer.save(_best_ckpt_path, state)
                             print(f"[Val] ✓ New best val loss {_val_loss:.4f} — saved best checkpoint to {_best_ckpt_dir}")
 
             if step % LOG_INTERVAL == 0:
