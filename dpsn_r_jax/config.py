@@ -456,7 +456,7 @@ def get_model_config(name: str) -> DPSNRConfig:
             sigma_min=0.005,
             sigma_max=5.0,
             sigma_anneal_steps=200_000,  # anneal over 40% of a 500k run
-            sigma_target=0.1,            # never get tighter than this
+            sigma_target=0.5,            # never get tighter than this — keeps indexer exploring for new data types
             precision_loss_weight=0.0,   # disabled: let indexer explore freely; enable after coverage >10%
             # ── Pool: 1024 × 1024 × 1024 = 1.07 B parameters ────────────────
             pool_grid_rows=1024,

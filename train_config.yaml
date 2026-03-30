@@ -1,0 +1,74 @@
+# DPSN Training Configuration
+# All settings can be overridden by CLI args
+
+model:
+  config: mini_pool
+  num_kv_heads: 2
+
+training:
+  max_steps: 500000
+  batch_size: 128
+  grad_accum_steps: 1
+  loss_chunk_size: 64
+  bf16: true
+  log_interval: 50
+  save_interval: 200
+  max_checkpoints: 5
+  generation_steps: 200
+  generation_max_tokens: 50
+  custom_prompts:
+    - "The meaning of life is"
+    - "Hello,"
+
+data:
+  tokenizer: "EleutherAI/gpt-neo-125m"
+  chunk_size: 50000
+  num_workers: 4
+  epochs: 1
+  datasets:
+    - name: "openbmb/Ultra-FineWeb"
+      subset: "default"
+      text_column: "content"
+      split: "train"
+      ratio: 0.60
+    - name: "bigcode/the-stack-dedup"
+      subset: "data/python"
+      text_column: "content"
+      split: "train"
+      ratio: 0.15
+    - name: "togethercomputer/RedPajama-Data-1T"
+      subset: "arxiv"
+      text_column: "text"
+      split: "train"
+      ratio: 0.10
+    - name: "togethercomputer/RedPajama-Data-1T"
+      subset: "book"
+      text_column: "text"
+      split: "train"
+      ratio: 0.10
+    - name: "wikipedia"
+      subset: "20220301.en"
+      text_column: "text"
+      split: "train"
+      ratio: 0.05
+
+validation:
+  dataset: "wikitext"
+  subset: "wikitext-103-raw-v1"
+  split: "validation"
+  text_column: "text"
+  steps: 40
+  interval: 200
+
+infra:
+  checkpoint_dir: "/kaggle/working/dpsn/checkpoints_xxl/"
+  xla_cache_dir: "/kaggle/working/jax_cache/"
+  tp_size: 1
+  coverage_threshold: 5.0
+
+# Pool indexer sigma settings
+# sigma_target controls how tight the indexer routing becomes at the end of training.
+# Keep this at 0.5+ so the indexer never fully locks — it will always search a
+# meaningful radius around its predicted coordinate. This allows new data types
+# to auto-expand into fresh pool regions instead of getting stuck in already-trained areas.
+# sigma_target: 0.5  (set in mini_pool config by default — override here if needed)

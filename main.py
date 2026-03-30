@@ -7,6 +7,11 @@ import sys
 import time
 import warnings
 
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
 # Suppress annoying Kaggle/Colab PyTorch XLA vs TensorFlow warning
 warnings.filterwarnings("ignore", message=".*tensorflow.*conflict with.*torch-xla.*")
 # Suppress Transparent Hugepages warning
@@ -61,6 +66,62 @@ from dpsn_r_jax.utils.generation import generate, clear_generation_cache
 from dpsn_r_jax.utils.metrics import calculate_flops
 from dpsn_r_jax.utils.memory_debug import print_tpu_memory, print_param_memory
 from dpsn_r_jax.utils.pool_coverage import PoolCoverageTracker, print_coverage_report, save_coverage_report
+
+
+def load_yaml_config(path):
+    if yaml is None:
+        raise ImportError("pyyaml is required to use --train_config. Install with: pip install pyyaml")
+    with open(path) as f:
+        cfg = yaml.safe_load(f)
+    flat = {}
+    model = cfg.get("model", {})
+    if "config" in model:
+        flat["config"] = model["config"]
+    if "num_kv_heads" in model:
+        flat["num_kv_heads"] = model["num_kv_heads"]
+    training = cfg.get("training", {})
+    for key in ("max_steps", "batch_size", "grad_accum_steps", "loss_chunk_size",
+                "bf16", "log_interval", "save_interval", "max_checkpoints",
+                "generation_steps", "generation_max_tokens", "custom_prompts"):
+        if key in training:
+            flat[key] = training[key]
+    data = cfg.get("data", {})
+    if "tokenizer" in data:
+        flat["hf_tokenizer"] = data["tokenizer"]
+    for key in ("chunk_size", "num_workers", "epochs"):
+        if key in data:
+            flat[key] = data[key]
+    if "datasets" in data:
+        flat["yaml_datasets"] = data["datasets"]
+    validation = cfg.get("validation", {})
+    _val_map = {
+        "dataset": "val_dataset",
+        "subset": "val_subset",
+        "split": "val_split",
+        "text_column": "val_text_column",
+        "steps": "val_steps",
+        "interval": "val_interval",
+    }
+    for src, dst in _val_map.items():
+        if src in validation:
+            flat[dst] = validation[src]
+    infra = cfg.get("infra", {})
+    _infra_map = {
+        "checkpoint_dir": "checkpoint_dir",
+        "xla_cache_dir": "xla_cache_dir",
+        "tp_size": "tp_size",
+        "coverage_threshold": "coverage_threshold",
+    }
+    for src, dst in _infra_map.items():
+        if src in infra:
+            flat[dst] = infra[src]
+    return flat
+
+
+def _was_cli_set(parser, args, key):
+    """Return True if arg was explicitly set on CLI (not just default)."""
+    defaults = vars(parser.parse_args([]))
+    return vars(args).get(key) != defaults.get(key)
 
 
 def log_pool_utilization(state):
@@ -502,8 +563,20 @@ def main():
             "and splash attention (falls back to standard dot-product attention)."
         ),
     )
+    parser.add_argument("--train_config", type=str, default=None,
+        help="Path to YAML training config file. CLI args override YAML values.")
 
     args = parser.parse_args()
+
+    # Load YAML config — CLI args take precedence over YAML
+    if args.train_config:
+        _yaml_cfg = load_yaml_config(args.train_config)
+        for _k, _v in _yaml_cfg.items():
+            if _k == "yaml_datasets":
+                args.yaml_datasets = _v  # store dataset list separately
+            elif not _was_cli_set(parser, args, _k):
+                setattr(args, _k, _v)
+        print(f"[Config] Loaded YAML config from {args.train_config}")
 
     # ── Component timing setup ───────────────────────────────────────────────
     # Import the singleton that dpsnr.py's jax.debug.callbacks write into.
@@ -1050,7 +1123,27 @@ def main():
         # falling back to the first entry in --hf_datasets.
         primary_hf = args.hf_dataset or (args.hf_datasets[0] if getattr(args, "hf_datasets", None) else None)
 
-        if getattr(args, "chunk_size", 0) > 0 and primary_hf:
+        # ── Multi-dataset YAML mode ──────────────────────────────────────────────
+        if hasattr(args, 'yaml_datasets') and args.yaml_datasets:
+            from dpsn_r_jax.data.mixed_dataset import MixedDataset
+            _ds_list = []
+            _ratio_list = []
+            for _ds_cfg in args.yaml_datasets:
+                _ds = ChunkedHFDataset(
+                    dataset_name=_ds_cfg["name"],
+                    tokenizer_name=tokenizer_name,
+                    chunk_size=args.chunk_size,
+                    subset=_ds_cfg.get("subset"),
+                    split=_ds_cfg.get("split", "train"),
+                    seq_len=config.max_seq_len,
+                    batch_size=args.batch_size,
+                    num_tokenizer_workers=args.num_workers,
+                    text_columns=[_ds_cfg.get("text_column", "text")],
+                )
+                _ds_list.append(_ds)
+                _ratio_list.append(float(_ds_cfg.get("ratio", 1.0)))
+            dataset = MixedDataset(_ds_list, _ratio_list)
+        elif getattr(args, "chunk_size", 0) > 0 and primary_hf:
             # ── Chunk-based mode (recommended for TPU): ──────────────────────
             # Downloads `chunk_size` rows at once via the HF streaming iterator,
             # tokenizes them in parallel across `num_workers` CPU cores,
