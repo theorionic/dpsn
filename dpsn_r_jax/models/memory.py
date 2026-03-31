@@ -56,7 +56,7 @@ class LearnedIndexer(nn.Module):
     coord_margin: float = 0.05
 
     @nn.compact
-    def __call__(self, hidden_states, sigma_max_scale: float = 1.0):
+    def __call__(self, hidden_states, sigma_max_scale: float = 1.0, deterministic: bool = True):
         """
         Args:
             hidden_states:    (B, T, D) – full encoded sequence from controller.
@@ -95,6 +95,16 @@ class LearnedIndexer(nn.Module):
         # corners are physically unreachable.  Prevents sigmoid saturation
         # from routing everything to (0,0)/(R-1,C-1) corner coordinates.
         mu_01 = jax.nn.sigmoid(mu_raw)            # (B, num_heads) in (0, 1)
+
+        # During training: add coord-space noise to prevent routing collapse.
+        # Added AFTER sigmoid so the model can't compensate with larger mu_raw.
+        # std=0.15 spreads a collapsed coord ~±150 grid cells in each direction.
+        if not deterministic:
+            mu_01 = mu_01 + jax.random.normal(
+                self.make_rng('dropout'), mu_01.shape, dtype=jnp.float32
+            ) * jnp.float32(0.15)
+            mu_01 = jnp.clip(mu_01, jnp.float32(0.0), jnp.float32(1.0))
+
         mu = self.coord_margin + (1.0 - 2.0 * self.coord_margin) * mu_01
 
         # ── 4. σ with dynamic scale for annealed precision routing ───────────

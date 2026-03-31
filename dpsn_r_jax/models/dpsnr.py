@@ -230,7 +230,7 @@ class DPSNR(nn.Module):
             )
 
             # Run real initial indexer pass to anchor the super-window
-            _mu_init, _ = self.indexer(state_hidden, sigma_max_scale=sigma_max_scale)
+            _mu_init, _ = self.indexer(state_hidden, sigma_max_scale=sigma_max_scale, deterministic=deterministic)
             heads_per_dim = max(1, H // 2)
             _mu_r0 = _mu_init[:, 0]
             _mu_c0 = _mu_init[:, min(heads_per_dim, H - 1)]
@@ -255,7 +255,7 @@ class DPSNR(nn.Module):
 
             # ── 1. Multi-head indexing with runtime sigma scale ─────────────
             with jax.profiler.TraceAnnotation("LearnedIndexer_Forward"):
-                mu, sigma = self.indexer(s_hidden, sigma_max_scale=sigma_max_scale)
+                mu, sigma = self.indexer(s_hidden, sigma_max_scale=sigma_max_scale, deterministic=deterministic)
             # mu: (B, H), sigma: (B, H)
             # ── Timing mark: indexer done ─────────────────────────────────────
             ctimer.mark("04_indexer_done", mu)
@@ -464,7 +464,7 @@ class DPSNR(nn.Module):
         model_dtype = hidden.dtype
 
         # ── Stage 1: single indexer pass (one HBM probe, outside the scan) ───
-        mu_init, sigma_init = self.indexer(hidden, sigma_max_scale=sigma_max_scale)
+        mu_init, sigma_init = self.indexer(hidden, sigma_max_scale=sigma_max_scale, deterministic=deterministic)
         ctimer.mark("04_indexer_done", mu_init)
 
         H             = self.config.num_indexer_heads

@@ -541,10 +541,21 @@ def train_step(
                 mask = (shift_labels != pad_token_id).astype(jnp.float32)
                 lm_loss = (lm_loss * mask).sum() / (mask.sum() + 1e-9)
 
-        # Routing diversity: penalize low mu variance → indexer spreads across pool.
-        # Subtracting reward for spread so optimizer maximizes it.
-        diversity_loss = -jnp.float32(routing_diversity_weight) * (
-            jnp.var(all_mu_r) + jnp.var(all_mu_c)
+        # Routing diversity: prevent the indexer from collapsing to one coord.
+        #
+        # grad(var) = 2*(x_i - mean)/n → 0 when all x_i are equal (vanishes).
+        # grad(-log(std)) = -(x_i-mean)/(n*std^2) → also 0 when collapsed.
+        #
+        # Centering term (mean - 0.5)^2 does NOT vanish: when collapsed at 0.95,
+        # grad = 2*(0.95 - 0.5)/n = 0.9/n per sample — non-zero and pushes mu
+        # back toward 0.5. The -var term then spreads from the new center.
+        _mu_r_f = all_mu_r.reshape(-1).astype(jnp.float32)
+        _mu_c_f = all_mu_c.reshape(-1).astype(jnp.float32)
+        diversity_loss = jnp.float32(routing_diversity_weight) * (
+            (jnp.mean(_mu_r_f) - jnp.float32(0.5)) ** 2
+            + (jnp.mean(_mu_c_f) - jnp.float32(0.5)) ** 2
+            - jnp.var(_mu_r_f)
+            - jnp.var(_mu_c_f)
         )
         return (
             lm_loss + effective_precision_weight * jnp.float32(mean_sigma) + diversity_loss,
@@ -744,9 +755,12 @@ def grad_accum_step(
                     mask = (shift_labels != pad_token_id).astype(jnp.float32)
                     lm_loss = (per_token * mask).sum() / (mask.sum() + 1e-9)
 
-            # Routing diversity: penalize low mu variance → indexer spreads across pool.
-            diversity_loss = -jnp.float32(routing_diversity_weight) * (
-                jnp.var(all_mu_r) + jnp.var(all_mu_c)
+            # Routing diversity: -log(std + eps) — strong gradient even at collapse.
+            _mu_r_f = all_mu_r.reshape(-1).astype(jnp.float32)
+            _mu_c_f = all_mu_c.reshape(-1).astype(jnp.float32)
+            diversity_loss = jnp.float32(routing_diversity_weight) * (
+                -jnp.log(jnp.std(_mu_r_f) + jnp.float32(1e-4))
+                - jnp.log(jnp.std(_mu_c_f) + jnp.float32(1e-4))
             )
             return (
                 lm_loss + effective_precision_weight * jnp.float32(mean_sigma) + diversity_loss,
