@@ -224,11 +224,14 @@ class PoolCoverageTracker:
         stats = self.get_coverage()
 
         ws = self.get_window_stats()
-        top1 = stats['top_hotspots'][0] if stats['top_hotspots'] else None
-        top1_str = (
-            f"coord={top1['coord']} {top1['count']:,}hits ({top1['pct']:.1f}%)"
-            if top1 else "n/a"
-        )
+        hotspots = stats['top_hotspots'][:5]
+        if hotspots:
+            hotspot_lines = "  Hotspots:    " + " | ".join(
+                f"{h['coord']} {h['count']:,}×({h['pct']:.1f}%)"
+                for h in hotspots
+            )
+        else:
+            hotspot_lines = "  Hotspots:    n/a"
         summary = (
             f"Pool Coverage Summary:\n"
             f"  Coordinates: {stats['unique_coordinates']:,}/{stats['total_coordinates']:,} "
@@ -240,7 +243,7 @@ class PoolCoverageTracker:
             f"(0=uniform, high=concentrated)\n"
             f"  Interval:    fresh={ws['freshness_rate']*100:.2f}%  "
             f"collision={ws['collision_rate']*100:.1f}%\n"
-            f"  Top hotspot: {top1_str}"
+            f"{hotspot_lines}"
         )
         return summary
 
