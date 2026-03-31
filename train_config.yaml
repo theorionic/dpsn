@@ -9,12 +9,12 @@ training:
   max_steps: 500000
   batch_size: 128
   grad_accum_steps: 1
-  loss_chunk_size: 64
+  loss_chunk_size: 2048
   bf16: true
   log_interval: 50
-  save_interval: 200
-  max_checkpoints: 5
-  generation_steps: 200
+  save_interval: 1000
+  max_checkpoints: 2
+  generation_steps: 1000
   generation_max_tokens: 50
   custom_prompts:
     - "The meaning of life is"
@@ -25,6 +25,7 @@ data:
   chunk_size: 50000
   num_workers: 4
   epochs: 1
+  dataset_size: 1290261453
   datasets:
     - name: "openbmb/Ultra-FineWeb"
       subset: "default"
@@ -32,15 +33,14 @@ data:
       split: "train"
       ratio: 1
 
-
-
 validation:
   dataset: "wikitext"
   subset: "wikitext-103-raw-v1"
   split: "validation"
   text_column: "text"
-  steps: 40
-  interval: 200
+  steps: 100
+  interval: 1000
+  chunk_size: 50000
 
 infra:
   checkpoint_dir: "/kaggle/working/dpsn/checkpoints_xxl/"
