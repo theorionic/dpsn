@@ -45,6 +45,13 @@ class PoolCoverageTracker:
         self.total_accesses = 0
         self.total_vectors_accessed_count = 0
 
+        # ── Per-interval sliding window (call reset_window() each log interval)
+        # collision_rate: intra-window repeat hits / window accesses
+        # freshness_rate: globally-new coords found / window accesses
+        self._window_hits: Dict[Tuple[int, int], int] = {}
+        self._window_accesses: int = 0
+        self._window_new_global: int = 0
+
     def record_access(self, mu_r: np.ndarray, mu_c: np.ndarray,
                      window_size: Optional[int] = None) -> None:
         """Record pool accesses from one reasoning step.
@@ -80,8 +87,15 @@ class PoolCoverageTracker:
 
                 # Record center coordinate
                 coord = (r_int, c_int)
+                is_global_new = coord not in self.accessed_coordinates
                 self.accessed_coordinates.add(coord)
                 self.access_frequency[coord] = self.access_frequency.get(coord, 0) + 1
+
+                # Window tracking
+                self._window_hits[coord] = self._window_hits.get(coord, 0) + 1
+                self._window_accesses += 1
+                if is_global_new:
+                    self._window_new_global += 1
 
                 # Record vectors in the retrieval window
                 w_half = window_size // 2
@@ -97,6 +111,53 @@ class PoolCoverageTracker:
             except (ValueError, TypeError) as e:
                 # Skip invalid values
                 continue
+
+    def reset_window(self) -> None:
+        """Reset per-interval window counters. Call at the start of each log interval."""
+        self._window_hits.clear()
+        self._window_accesses = 0
+        self._window_new_global = 0
+
+    def get_window_stats(self) -> Dict[str, Any]:
+        """Stats for the current log interval window.
+
+        Returns:
+            freshness_rate: fraction of window accesses that found a brand-new coord
+            collision_rate: fraction of window accesses that were intra-window repeats
+            top1_pct:       all-time top coord as % of total accesses
+            top1_coord:     (r, c) of the hottest coord ever
+            top1_count:     total all-time hits on that coord
+        """
+        if self._window_accesses == 0:
+            return {
+                "freshness_rate": 0.0,
+                "collision_rate": 0.0,
+                "top1_pct": 0.0,
+                "top1_coord": None,
+                "top1_count": 0,
+            }
+
+        # intra-window collisions: every hit beyond the first per coord
+        intra_repeat = sum(max(0, c - 1) for c in self._window_hits.values())
+        collision_rate = intra_repeat / self._window_accesses
+
+        freshness_rate = self._window_new_global / self._window_accesses
+
+        # All-time hottest coord
+        if self.access_frequency:
+            top_coord = max(self.access_frequency, key=lambda k: self.access_frequency[k])
+            top_count = self.access_frequency[top_coord]
+            top1_pct = top_count / self.total_accesses * 100 if self.total_accesses else 0.0
+        else:
+            top_coord, top_count, top1_pct = None, 0, 0.0
+
+        return {
+            "freshness_rate": float(freshness_rate),
+            "collision_rate": float(collision_rate),
+            "top1_pct": float(top1_pct),
+            "top1_coord": top_coord,
+            "top1_count": int(top_count),
+        }
 
     def get_coverage(self) -> Dict[str, Any]:
         """Get comprehensive coverage statistics.
@@ -118,6 +179,16 @@ class PoolCoverageTracker:
         else:
             access_concentration = 0.0
 
+        # Top-20 hottest coordinates (sorted by hit count descending)
+        top_hotspots = sorted(
+            self.access_frequency.items(), key=lambda x: x[1], reverse=True
+        )[:20]
+        top_hotspots_out = [
+            {"coord": list(coord), "count": int(cnt),
+             "pct": float(cnt / self.total_accesses * 100) if self.total_accesses else 0.0}
+            for coord, cnt in top_hotspots
+        ]
+
         return {
             "unique_coordinates": len(self.accessed_coordinates),
             "total_coordinates": total_coords,
@@ -127,6 +198,7 @@ class PoolCoverageTracker:
             "vector_coverage_pct": float(vector_coverage),
             "total_accesses": int(self.total_accesses),
             "access_concentration": float(access_concentration),  # 0=uniform, high=concentrated
+            "top_hotspots": top_hotspots_out,
         }
 
     def get_heatmap(self) -> np.ndarray:
@@ -151,6 +223,12 @@ class PoolCoverageTracker:
         """
         stats = self.get_coverage()
 
+        ws = self.get_window_stats()
+        top1 = stats['top_hotspots'][0] if stats['top_hotspots'] else None
+        top1_str = (
+            f"coord={top1['coord']} {top1['count']:,}hits ({top1['pct']:.1f}%)"
+            if top1 else "n/a"
+        )
         summary = (
             f"Pool Coverage Summary:\n"
             f"  Coordinates: {stats['unique_coordinates']:,}/{stats['total_coordinates']:,} "
@@ -159,7 +237,10 @@ class PoolCoverageTracker:
             f"({stats['vector_coverage_pct']:.1f}%)\n"
             f"  Accesses:    {stats['total_accesses']:,}\n"
             f"  Concentration: {stats['access_concentration']:.3f} "
-            f"(0=uniform, high=concentrated)"
+            f"(0=uniform, high=concentrated)\n"
+            f"  Interval:    fresh={ws['freshness_rate']*100:.2f}%  "
+            f"collision={ws['collision_rate']*100:.1f}%\n"
+            f"  Top hotspot: {top1_str}"
         )
         return summary
 

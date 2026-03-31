@@ -1707,6 +1707,7 @@ def main():
 
                 # Pool coverage — record here after block_until_ready so
                 # the D2H transfer is folded into the existing sync stall.
+                coverage_tracker.reset_window()
                 coverage_tracker.record_access(_last_mu_r, _last_mu_c)
                 print(coverage_tracker.get_summary_string())
 
@@ -1727,8 +1728,14 @@ def main():
                 if _adaptive_sigma_mult > 1.0:
                     print(f"[AdaptiveSigma] coverage={_cov_pct:.1f}% conc={_conc:.2f} → sigma_mult={_adaptive_sigma_mult}x (forcing exploration)")
 
-                # Concentration logged alongside coverage for TensorBoard
-                writer.add_scalar("Routing/concentration", _conc, global_step)
+                # Concentration + interval override/freshness metrics
+                _win = coverage_tracker.get_window_stats()
+                writer.add_scalar("Routing/concentration",  _conc,                      global_step)
+                writer.add_scalar("Routing/freshness_rate", _win["freshness_rate"] * 100, global_step)
+                writer.add_scalar("Routing/collision_rate", _win["collision_rate"] * 100, global_step)
+                writer.add_scalar("Routing/top1_pct",       _win["top1_pct"],            global_step)
+                if _win["top1_coord"] is not None and _win["top1_pct"] > 5.0:
+                    print(f"[Coverage] ⚠️  hotspot {_win['top1_coord']} = {_win['top1_pct']:.1f}% of all accesses ({_win['top1_count']:,} hits)")
 
                 # ── Health monitoring ─────────────────────────────────────────
                 _health_loss_history.append(loss_val)
