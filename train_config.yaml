@@ -35,22 +35,8 @@ data:
       subset: "data/python"
       text_column: "content"
       split: "train"
-      ratio: 0.15
-    - name: "togethercomputer/RedPajama-Data-1T"
-      subset: "arxiv"
-      text_column: "text"
-      split: "train"
-      ratio: 0.10
-    - name: "togethercomputer/RedPajama-Data-1T"
-      subset: "book"
-      text_column: "text"
-      split: "train"
-      ratio: 0.10
-    - name: "wikipedia"
-      subset: "20220301.en"
-      text_column: "text"
-      split: "train"
-      ratio: 0.05
+      ratio: 1
+
 
 validation:
   dataset: "wikitext"
