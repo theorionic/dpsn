@@ -30,12 +30,8 @@ data:
       subset: "default"
       text_column: "content"
       split: "train"
-      ratio: 0.60
-    - name: "bigcode/the-stack-dedup"
-      subset: "data/python"
-      text_column: "content"
-      split: "train"
       ratio: 1
+
 
 
 validation:
