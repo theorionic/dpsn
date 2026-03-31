@@ -197,6 +197,13 @@ def main():
         help="Min vector coverage %% before tightening sigma (adaptive sigma). Default: 5.0%%",
     )
     parser.add_argument(
+        "--routing_diversity_weight",
+        type=float,
+        default=0.05,
+        help="Weight for routing diversity loss: penalizes low mu variance to prevent "
+             "pool collapse to a single coord. 0 disables. Default: 0.05",
+    )
+    parser.add_argument(
         "--epochs", type=int, default=1, help="Number of training epochs"
     )
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
@@ -1529,6 +1536,7 @@ def main():
                     prefetch_reasoning=getattr(config, 'prefetch_reasoning', False),
                     prefetch_size=getattr(config, 'prefetch_size', 0),
                     seq_pack_ids=_seq_pack_ids,
+                    routing_diversity_weight=args.routing_diversity_weight,
                 )
             else:
                 # ── Standard single-step path ─────────────────────────────────
@@ -1541,6 +1549,7 @@ def main():
                     prefetch_reasoning=getattr(config, 'prefetch_reasoning', False),
                     prefetch_size=getattr(config, 'prefetch_size', 0),
                     seq_pack_ids=_seq_pack_ids,
+                    routing_diversity_weight=args.routing_diversity_weight,
                 )
             # Keep latest mu arrays as JAX futures — no D2H transfer here.
             # record_access() is called inside the LOG_INTERVAL block after
@@ -1730,10 +1739,12 @@ def main():
 
                 # Concentration + interval override/freshness metrics
                 _win = coverage_tracker.get_window_stats()
-                writer.add_scalar("Routing/concentration",  _conc,                      global_step)
+                _mu_spread = float(jnp.var(_last_mu_r) + jnp.var(_last_mu_c))
+                writer.add_scalar("Routing/concentration",  _conc,                       global_step)
                 writer.add_scalar("Routing/freshness_rate", _win["freshness_rate"] * 100, global_step)
                 writer.add_scalar("Routing/collision_rate", _win["collision_rate"] * 100, global_step)
-                writer.add_scalar("Routing/top1_pct",       _win["top1_pct"],            global_step)
+                writer.add_scalar("Routing/top1_pct",       _win["top1_pct"],             global_step)
+                writer.add_scalar("Routing/mu_spread",      _mu_spread,                   global_step)
                 if _win["top1_coord"] is not None and _win["top1_pct"] > 5.0:
                     print(f"[Coverage] ⚠️  hotspot {_win['top1_coord']} = {_win['top1_pct']:.1f}% of all accesses ({_win['top1_count']:,} hits)")
 

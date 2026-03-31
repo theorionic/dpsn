@@ -426,7 +426,7 @@ def _apply_optimizer_update_sparse(state, dense_grads, dense_params, pool_params
     static_argnames=[
         "pad_token_id", "precision_loss_weight",
         "sigma_anneal_steps", "use_bf16", "loss_chunk_size",
-        "prefetch_reasoning", "prefetch_size",
+        "prefetch_reasoning", "prefetch_size", "routing_diversity_weight",
     ],
     donate_argnums=(0,),
 )
@@ -435,7 +435,7 @@ def train_step(
     precision_loss_weight=0.0, sigma_anneal_steps=0,
     use_bf16=False, loss_chunk_size=0,
     prefetch_reasoning=False, prefetch_size=0,
-    seq_pack_ids=None,
+    seq_pack_ids=None, routing_diversity_weight=0.0,
 ):
     """Single training step with sparse pool gradient updates."""
     print("Compiling train_step for XLA...", flush=True)
@@ -541,8 +541,13 @@ def train_step(
                 mask = (shift_labels != pad_token_id).astype(jnp.float32)
                 lm_loss = (lm_loss * mask).sum() / (mask.sum() + 1e-9)
 
+        # Routing diversity: penalize low mu variance → indexer spreads across pool.
+        # Subtracting reward for spread so optimizer maximizes it.
+        diversity_loss = -jnp.float32(routing_diversity_weight) * (
+            jnp.var(all_mu_r) + jnp.var(all_mu_c)
+        )
         return (
-            lm_loss + effective_precision_weight * jnp.float32(mean_sigma),
+            lm_loss + effective_precision_weight * jnp.float32(mean_sigma) + diversity_loss,
             (indices, mean_sigma, all_mu_r, all_mu_c, all_sigma_h, all_start_2d,
              pf_r_start, pf_c_start),
         )
@@ -593,7 +598,7 @@ def train_step(
     static_argnames=[
         "pad_token_id", "precision_loss_weight",
         "sigma_anneal_steps", "use_bf16", "loss_chunk_size", "grad_accum_steps",
-        "prefetch_reasoning", "prefetch_size",
+        "prefetch_reasoning", "prefetch_size", "routing_diversity_weight",
     ],
     donate_argnums=(0,),
 )
@@ -611,6 +616,7 @@ def grad_accum_step(
     prefetch_reasoning=False,
     prefetch_size=0,
     seq_pack_ids=None,
+    routing_diversity_weight=0.0,
 ):
     """Gradient accumulation with sparse pool gradient updates.
 
@@ -738,8 +744,12 @@ def grad_accum_step(
                     mask = (shift_labels != pad_token_id).astype(jnp.float32)
                     lm_loss = (per_token * mask).sum() / (mask.sum() + 1e-9)
 
+            # Routing diversity: penalize low mu variance → indexer spreads across pool.
+            diversity_loss = -jnp.float32(routing_diversity_weight) * (
+                jnp.var(all_mu_r) + jnp.var(all_mu_c)
+            )
             return (
-                lm_loss + effective_precision_weight * jnp.float32(mean_sigma),
+                lm_loss + effective_precision_weight * jnp.float32(mean_sigma) + diversity_loss,
                 (indices, mean_sigma, all_mu_r, all_mu_c, all_sigma_h, all_start_2d,
                  pf_r_start, pf_c_start),
             )
