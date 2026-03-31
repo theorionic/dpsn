@@ -30,6 +30,7 @@ class DPSNR(nn.Module):
             num_heads=self.config.num_indexer_heads,
             sigma_min=self.config.sigma_min,
             sigma_max=self.config.sigma_max,
+            coord_margin=self.config.coord_margin,
         )
 
         # 2D Grid Pool: each coordinate only needs 1/sqrt(N) precision.

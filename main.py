@@ -1481,11 +1481,11 @@ def main():
             current_lr_val = lr_schedule(global_step).astype(jnp.float32)
             sigma_scale_val = sigma_anneal_fn(global_step).astype(jnp.float32)
             # Adaptive sigma: widen when pool coverage is poor (updated at LOG_INTERVAL)
+            # NOTE: no upper cap — when exploration is needed, sigma_scale_val must
+            # be allowed to exceed 1.0 so effective_sigma_max > config.sigma_max.
+            # The old jnp.minimum(1.0, ...) cap silently killed the multiplier.
             if _adaptive_sigma_mult != 1.0:
-                sigma_scale_val = jnp.minimum(
-                    jnp.float32(1.0),
-                    sigma_scale_val * jnp.float32(_adaptive_sigma_mult),
-                )
+                sigma_scale_val = sigma_scale_val * jnp.float32(_adaptive_sigma_mult)
 
             if _grad_accum > 1:
                 # ── Gradient accumulation path ────────────────────────────────
@@ -1724,6 +1724,9 @@ def main():
                 writer.add_scalar("Adaptive/coverage_pct", _cov_pct,             global_step)
                 if _adaptive_sigma_mult > 1.0:
                     print(f"[AdaptiveSigma] coverage={_cov_pct:.1f}% conc={_conc:.2f} → sigma_mult={_adaptive_sigma_mult}x (forcing exploration)")
+
+                # Concentration logged alongside coverage for TensorBoard
+                writer.add_scalar("Routing/concentration", _conc, global_step)
 
                 # ── Health monitoring ─────────────────────────────────────────
                 _health_loss_history.append(loss_val)

@@ -50,6 +50,10 @@ class LearnedIndexer(nn.Module):
     num_heads: int = 1
     sigma_min: float = 0.01
     sigma_max: float = 5.0
+    # Fraction of grid to exclude at each boundary.
+    # With margin=0.05: mu maps to (0.05, 0.95) → rows [51, 972] on a 1024 grid.
+    # Prevents sigmoid saturation from collapsing all routes to grid corners.
+    coord_margin: float = 0.05
 
     @nn.compact
     def __call__(self, hidden_states, sigma_max_scale: float = 1.0):
@@ -87,8 +91,11 @@ class LearnedIndexer(nn.Module):
         mu_raw    = nn.Dense(self.num_heads)(x)   # (B, num_heads)
         sigma_raw = nn.Dense(self.num_heads)(x)   # (B, num_heads)
 
-        # µ: sigmoid → strictly in (0, 1) for valid pool addressing
-        mu = jax.nn.sigmoid(mu_raw)               # (B, num_heads)
+        # µ: sigmoid → (0,1), then squeeze into (margin, 1-margin) so grid
+        # corners are physically unreachable.  Prevents sigmoid saturation
+        # from routing everything to (0,0)/(R-1,C-1) corner coordinates.
+        mu_01 = jax.nn.sigmoid(mu_raw)            # (B, num_heads) in (0, 1)
+        mu = self.coord_margin + (1.0 - 2.0 * self.coord_margin) * mu_01
 
         # ── 4. σ with dynamic scale for annealed precision routing ───────────
         # effective_sigma_max shrinks over training via sigma_max_scale.

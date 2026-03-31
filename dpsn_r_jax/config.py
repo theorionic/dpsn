@@ -92,6 +92,9 @@ class DPSNRConfig:
     num_indexer_heads: int = 1      # Multi-head pool queries per reasoning step
     sigma_min: float = 0.01         # Minimum retrieval bandwidth (sharp/precise)
     sigma_max: float = 5.0          # Maximum retrieval bandwidth (broad/soft)
+    # Fraction of grid excluded at each boundary to prevent sigmoid saturation
+    # from collapsing coordinates to corners (e.g. 0.05 → mu ∈ (0.05, 0.95)).
+    coord_margin: float = 0.05
     # MLP width inside LearnedIndexer.  0 = use controller_hidden_dim (default,
     # backward-compat).  Set to a large value to give the indexer its own
     # independent parameter budget (e.g. 10240 → ~62M params with D=1024).
