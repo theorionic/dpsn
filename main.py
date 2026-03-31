@@ -88,7 +88,7 @@ def load_yaml_config(path):
     data = cfg.get("data", {})
     if "tokenizer" in data:
         flat["hf_tokenizer"] = data["tokenizer"]
-    for key in ("chunk_size", "num_workers", "epochs"):
+    for key in ("chunk_size", "num_workers", "epochs", "dataset_size"):
         if key in data:
             flat[key] = data[key]
     if "datasets" in data:
@@ -101,6 +101,7 @@ def load_yaml_config(path):
         "text_column": "val_text_column",
         "steps": "val_steps",
         "interval": "val_interval",
+        "chunk_size": "val_chunk_size",
     }
     for src, dst in _val_map.items():
         if src in validation:
@@ -111,6 +112,7 @@ def load_yaml_config(path):
         "xla_cache_dir": "xla_cache_dir",
         "tp_size": "tp_size",
         "coverage_threshold": "coverage_threshold",
+        "resume": "resume",
     }
     for src, dst in _infra_map.items():
         if src in infra:
@@ -1315,7 +1317,7 @@ def main():
     # estimate (for local .npy and synthetic datasets).
     is_hf_streaming = (
         not use_sequential_npy
-        and (args.hf_dataset or args.hf_datasets)
+        and (args.hf_dataset or args.hf_datasets or getattr(args, "yaml_datasets", None))
     )
     if is_hf_streaming and args.max_steps:
         steps_per_epoch = args.max_steps

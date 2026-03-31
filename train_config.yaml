@@ -47,6 +47,7 @@ infra:
   xla_cache_dir: "/kaggle/working/jax_cache/"
   tp_size: 1
   coverage_threshold: 5.0
+  resume: true
 
 # Pool indexer sigma settings
 # sigma_target controls how tight the indexer routing becomes at the end of training.
