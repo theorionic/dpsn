@@ -6,6 +6,7 @@ from dpsn_r_jax.models.controller import TinyController
 from dpsn_r_jax.models.memory import (
     CoordinateMassivePool2D,
     LearnedIndexer,
+    ContentAwareRouterHead,
 )
 import jax.profiler
 from dpsn_r_jax.models.reasoning import AdaptiveComputeController
@@ -56,6 +57,24 @@ class DPSNR(nn.Module):
                 nn.LayerNorm(),
             ]
         )
+
+        # ── Content-Aware Router Head ────────────────────────────────────────────
+        # When enabled, produces region offsets that are added to indexer coordinates.
+        # This guides similar content to similar pool regions, preventing collapse.
+        if self.config.use_router_head:
+            self.router_head = ContentAwareRouterHead(
+                hidden_dim=self.config.controller_hidden_dim,
+                router_hidden_dim=self.config.router_hidden_dim,
+                region_scale=self.config.router_region_scale,
+                num_heads=self.config.num_indexer_heads,
+            )
+            # Learned blending weight: alpha controls router vs indexer influence.
+            # Initialized to router_alpha_init (e.g., 0.3 = 30% router, 70% indexer).
+            self.router_alpha = self.param(
+                "router_alpha",
+                nn.initializers.constant(self.config.router_alpha_init),
+                (),  # scalar parameter
+            )
 
         # ── Prefetch reasoning query projections (only when enabled) ──────────
         # Two lightweight Dense layers used inside the prefetch scan body.
@@ -186,7 +205,7 @@ class DPSNR(nn.Module):
 
         # ── Warm-up calls: required for Flax to trace sub-modules before scan ──
         # These dummy calls ensure Flax registers parameter bindings for all
-        # sub-modules (indexer, pool, retrieval_integrator, acc) BEFORE
+        # sub-modules (indexer, pool, retrieval_integrator, acc, router_head) BEFORE
         # jax.lax.scan runs.  Without them, Dense layers inside the scan body
         # hold a reference to an intermediate tracer created outside the scan,
         # causing an UnexpectedTracerError.  The warm-up outputs are discarded;
@@ -201,6 +220,9 @@ class DPSNR(nn.Module):
             jnp.zeros((B, T, D + self.config.controller_hidden_dim))
         )
         _ = self.acc(state_hidden, state_hidden, 0, halt_prob, halted_mask)
+        # Warm-up for router_head (if enabled)
+        if self.config.use_router_head:
+            _ = self.router_head(jnp.zeros((B, T, D), dtype=hidden.dtype))
         # ── Timing mark: warm-up tracing finished, reasoning scan about to start ─
         ctimer.mark("02_warmup_done__scan_starting", state_hidden)
 
@@ -232,6 +254,15 @@ class DPSNR(nn.Module):
             # Run real initial indexer pass to anchor the super-window
             _mu_init, _ = self.indexer(state_hidden, sigma_max_scale=sigma_max_scale, deterministic=deterministic)
             heads_per_dim = max(1, H // 2)
+            # Apply router head offsets if enabled
+            if self.config.use_router_head:
+                _region_r, _region_c = self.router_head(state_hidden)
+                _alpha = jax.nn.sigmoid(self.router_alpha.astype(jnp.float32))
+                _mu_r_base = _mu_init[:, :heads_per_dim]
+                _mu_c_base = _mu_init[:, heads_per_dim:]
+                _mu_r_adj = jnp.clip(_mu_r_base + _alpha * _region_r, jnp.float32(0.0), jnp.float32(1.0))
+                _mu_c_adj = jnp.clip(_mu_c_base + _alpha * _region_c, jnp.float32(0.0), jnp.float32(1.0))
+                _mu_init = jnp.concatenate([_mu_r_adj, _mu_c_adj], axis=-1)
             _mu_r0 = _mu_init[:, 0]
             _mu_c0 = _mu_init[:, min(heads_per_dim, H - 1)]
             init_sw, init_sw_r, init_sw_c = self.pool.fetch_super_window_2d(
@@ -259,6 +290,26 @@ class DPSNR(nn.Module):
             # mu: (B, H), sigma: (B, H)
             # ── Timing mark: indexer done ─────────────────────────────────────
             ctimer.mark("04_indexer_done", mu)
+
+            # ── 1b. Content-Aware Router Head (optional) ───────────────────────
+            # Produces region offsets that guide similar content to similar pool areas.
+            # Applied BEFORE mu splitting so router influences both row and column heads.
+            if self.config.use_router_head:
+                region_r, region_c = self.router_head(s_hidden)  # (B, heads_per_dim), (B, heads_per_dim)
+                # Apply sigmoid to alpha for smooth blending: alpha in (0, 1)
+                alpha = jax.nn.sigmoid(self.router_alpha.astype(jnp.float32))
+                # Apply offsets to the correct parts of mu
+                # mu[:, :heads_per_dim] are row coordinates, mu[:, heads_per_dim:] are column coordinates
+                heads_per_dim = max(1, H // 2)
+                mu_r_base = mu[:, :heads_per_dim]
+                mu_c_base = mu[:, heads_per_dim:]
+                # Blend: mu_final = mu_indexer + alpha * region_offset
+                mu_r_adj = mu_r_base + alpha * region_r
+                mu_c_adj = mu_c_base + alpha * region_c
+                # Clip to valid range to prevent out-of-bounds after offset
+                mu_r_adj = jnp.clip(mu_r_adj, jnp.float32(0.0), jnp.float32(1.0))
+                mu_c_adj = jnp.clip(mu_c_adj, jnp.float32(0.0), jnp.float32(1.0))
+                mu = jnp.concatenate([mu_r_adj, mu_c_adj], axis=-1)  # (B, H)
 
             # ── 2. Per-head pool retrieval — vectorized with jax.vmap ─────────
             heads_per_dim = max(1, H // 2)
@@ -485,6 +536,17 @@ class DPSNR(nn.Module):
 
         H             = self.config.num_indexer_heads
         heads_per_dim = max(1, H // 2)
+
+        # Apply router head offsets if enabled
+        if self.config.use_router_head:
+            region_r, region_c = self.router_head(hidden)
+            alpha = jax.nn.sigmoid(self.router_alpha.astype(jnp.float32))
+            mu_r_base = mu_init[:, :heads_per_dim]
+            mu_c_base = mu_init[:, heads_per_dim:]
+            mu_r_adj = jnp.clip(mu_r_base + alpha * region_r, jnp.float32(0.0), jnp.float32(1.0))
+            mu_c_adj = jnp.clip(mu_c_base + alpha * region_c, jnp.float32(0.0), jnp.float32(1.0))
+            mu_init = jnp.concatenate([mu_r_adj, mu_c_adj], axis=-1)
+
         mu_r = mu_init[:, 0]
         mu_c = mu_init[:, min(heads_per_dim, H - 1)]
 
