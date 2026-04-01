@@ -79,6 +79,10 @@ def load_yaml_config(path):
         flat["config"] = model["config"]
     if "num_kv_heads" in model:
         flat["num_kv_heads"] = model["num_kv_heads"]
+    # Router head options
+    for key in ("use_router_head", "router_hidden_dim", "router_region_scale", "router_alpha_init"):
+        if key in model:
+            flat[key] = model[key]
     training = cfg.get("training", {})
     for key in ("max_steps", "batch_size", "grad_accum_steps", "loss_chunk_size",
                 "bf16", "log_interval", "save_interval", "max_checkpoints",

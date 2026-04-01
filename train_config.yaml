@@ -4,6 +4,12 @@
 model:
   config: mini_pool
   num_kv_heads: 2
+  # Content-Aware Router Head: routes similar content to similar pool regions
+  # Prevents coordinate collapse through learned semantic organization
+  use_router_head: true
+  router_hidden_dim: 0          # 0 = auto (controller_hidden_dim // 2)
+  router_region_scale: 0.1      # Max offset as fraction of grid (±10%)
+  router_alpha_init: 0.3        # Initial blending weight (0.3 = 30% router, 70% indexer)
 
 training:
   max_steps: 500000
