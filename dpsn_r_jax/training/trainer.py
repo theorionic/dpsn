@@ -551,11 +551,14 @@ def train_step(
         # back toward 0.5. The -var term then spreads from the new center.
         _mu_r_f = all_mu_r.reshape(-1).astype(jnp.float32)
         _mu_c_f = all_mu_c.reshape(-1).astype(jnp.float32)
+        target_var = jnp.float32(1.0 / 12.0)
+        var_loss_r = jax.nn.relu(target_var - jnp.var(_mu_r_f))
+        var_loss_c = jax.nn.relu(target_var - jnp.var(_mu_c_f))
         diversity_loss = jnp.float32(routing_diversity_weight) * (
             (jnp.mean(_mu_r_f) - jnp.float32(0.5)) ** 2
             + (jnp.mean(_mu_c_f) - jnp.float32(0.5)) ** 2
-            - jnp.var(_mu_r_f)
-            - jnp.var(_mu_c_f)
+            + var_loss_r
+            + var_loss_c
         )
         return (
             lm_loss + effective_precision_weight * jnp.float32(mean_sigma) + diversity_loss,
