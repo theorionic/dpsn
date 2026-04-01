@@ -299,6 +299,22 @@ class DPSNR(nn.Module):
             retrieved     = jnp.mean(retrieved_all, axis=1)  # (B, D)
             start_indices = start_all.reshape(-1)             # (B*P,)
 
+            # ── STE: give mu a gradient from the LM loss ─────────────────────
+            # Hard retrieval (Pallas / dynamic_slice) has zero d/d(mu) due to
+            # integer indexing. Bilinear interpolation passes a gradient through
+            # the fractional weights wr/wc so d(loss)/d(mu) ≠ 0 during training.
+            # Pool storage is already stop_gradient'd by the trainer so no
+            # 805 MB pool gradient is created. STE = 0 in forward pass.
+            if retrieved_probes is not None:
+                mu_r_mean = jnp.mean(mu_r, axis=1)  # (B,) mean across heads
+                mu_c_mean = jnp.mean(mu_c, axis=1)
+                retrieved_soft = self.pool.bilinear_retrieve(
+                    mu_r_mean, mu_c_mean,
+                ).astype(retrieved.dtype)
+                retrieved = retrieved + (
+                    retrieved_soft - jax.lax.stop_gradient(retrieved_soft)
+                )
+
             # ── Sparse-gradient probe injection ──────────────────────────────────────
             # When training with sparse pool gradients, retrieved_probes is a (R, B, D)
             # zero tensor. By differentiating w.r.t. probe, we get ∂loss/∂retrieved

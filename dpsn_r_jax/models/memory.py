@@ -346,6 +346,46 @@ class CoordinateMassivePool2D(nn.Module):
         flat_start = r_start * C + c_start
         return aggregated, flat_start
 
+    def bilinear_retrieve(self, mu_row: jnp.ndarray, mu_col: jnp.ndarray) -> jnp.ndarray:
+        """Differentiable bilinear retrieval for Straight-Through Estimator.
+
+        Used only in the backward pass:
+            retrieved = retrieved_hard + (retrieved_soft - stop_gradient(retrieved_soft))
+        Forward value is zero (STE identity). Backward gives d(loss)/d(mu) ≠ 0
+        through the fractional interpolation weights (wr, wc).
+
+        Pool storage is already stop_gradient'd by the trainer so this does NOT
+        create the 805 MB pool gradient — only mu gets a gradient.
+
+        Args:
+            mu_row: (B,) normalised row coordinate in (0, 1)
+            mu_col: (B,) normalised col coordinate in (0, 1)
+        Returns:
+            (B, D) bilinearly interpolated pool vectors in float32
+        """
+        storage = self.params_storage.astype(jnp.float32)  # (R, C, D)
+        R, C = self.rows, self.cols
+
+        r_f = mu_row.astype(jnp.float32) * (R - 1)  # (B,)
+        c_f = mu_col.astype(jnp.float32) * (C - 1)  # (B,)
+
+        r_lo = jnp.clip(jnp.floor(r_f).astype(jnp.int32), 0, R - 2)  # (B,)
+        c_lo = jnp.clip(jnp.floor(c_f).astype(jnp.int32), 0, C - 2)  # (B,)
+
+        # Fractional weights — gradient of loss flows through wr/wc → mu
+        wr = (r_f - r_lo.astype(jnp.float32))[:, None]  # (B, 1)
+        wc = (c_f - c_lo.astype(jnp.float32))[:, None]  # (B, 1)
+
+        # Gather 4 corner vectors with advanced indexing (B, D each)
+        # d/d(storage) = 0 (stopped by trainer); d/d(wr), d/d(wc) ≠ 0
+        v00 = storage[r_lo,     c_lo    ]
+        v10 = storage[r_lo + 1, c_lo    ]
+        v01 = storage[r_lo,     c_lo + 1]
+        v11 = storage[r_lo + 1, c_lo + 1]
+
+        return ((1 - wr) * (1 - wc) * v00 + wr * (1 - wc) * v10
+                + (1 - wr) * wc * v01 + wr * wc * v11)  # (B, D)
+
     # ── Super-window helpers for 2D pool (Opt-2 support) ─────────────────────
     def fetch_super_window_2d(
         self,
