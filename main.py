@@ -1783,7 +1783,7 @@ def main():
                 print(
                     f"{file_label}Epoch {epoch + 1} | Step {step} | Global Step {global_step} | "
                     f"Loss: {loss_val:.4f} | PPL: {ppl_val:.4f} | LR: {current_lr:.2e} | "
-                    f"sigma={sigma_val:.3f} ({precision_tag}) | GradNorm: {grad_norm_val:.4f} | "
+                    f"sigma={sigma_val:.3f} ({precision_tag}) | GradNorm: {grad_norm_val:.2e} | "
                     f"TPS: {tokens_per_sec:.0f} | SPS: {steps_per_sec:.3f} | "
                     f"TFLOPS: {tflops:.4f} | DataWait: {avg_data_wait:.3f}s"
                 )

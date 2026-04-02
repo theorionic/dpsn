@@ -13,7 +13,7 @@ from dpsn_r_jax.utils.component_timer import ctimer
 
 # Set to True to print per-loop reasoning stats to stdout (via jax.debug.print).
 # Works inside JIT/lax.scan. Disable for production to avoid print overhead.
-DEBUG_REASONING_LOOPS: bool = False
+DEBUG_REASONING_LOOPS: bool = True
 
 
 class DPSNR(nn.Module):

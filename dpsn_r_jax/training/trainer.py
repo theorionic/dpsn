@@ -570,6 +570,14 @@ def train_step(
 
     dense_grads, grad_probe = grads
 
+    # ── Diagnostic: log exact grad_probe magnitude (inside JIT via debug.print) ─
+    jax.debug.print(
+        "[POOL_GRAD_DIAG] grad_probe: max={mx:.6e} l2={l2:.6e} shape={sh}",
+        mx=jnp.max(jnp.abs(grad_probe)),
+        l2=jnp.sqrt(jnp.sum(grad_probe.astype(jnp.float32) ** 2)),
+        sh=grad_probe.shape[0],
+    )
+
     # ── Pool gradient computation ────────────────────────────────────────────
     if prefetch_reasoning:
         # grad_probe: (B, K, D) = ∂loss/∂candidates; reshape to (B, PS, PS, D)
