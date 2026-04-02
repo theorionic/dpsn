@@ -300,14 +300,6 @@ class DPSNR(nn.Module):
             retrieved     = jnp.mean(retrieved_all, axis=1)  # (B, D)
             start_indices = start_all.reshape(-1)             # (B*P,)
 
-            # ── Normalize pool output to fixed scale ──────────────────────────
-            # Random-init pool produces L2~0.0008 vs hidden L2~1.0, so model
-            # learns to ignore pool. Normalizing to 0.5 forces equal contribution
-            # and amplifies the gradient to pool by 1/0.0008 ≈ 1250x.
-            _r_l2 = jnp.linalg.norm(retrieved.astype(jnp.float32), axis=-1, keepdims=True)
-            retrieved = (retrieved.astype(jnp.float32) / (_r_l2 + jnp.float32(1e-8))
-                         * jnp.float32(0.5)).astype(retrieved.dtype)
-
             # ── STE: give mu a gradient from the LM loss ─────────────────────
             # Hard retrieval (Pallas / dynamic_slice) has zero d/d(mu) due to
             # integer indexing. Bilinear interpolation passes a gradient through
@@ -333,6 +325,15 @@ class DPSNR(nn.Module):
                 retrieved = retrieved + lax.dynamic_index_in_dim(
                     retrieved_probes, i, axis=0, keepdims=False
                 )
+
+            # ── Normalize pool output to fixed scale ──────────────────────────
+            # MUST be AFTER STE and probe injection so the normalization Jacobian
+            # (≈625x amplification at init) flows back to both pool params (via
+            # probe) and indexer mu (via STE). If normalized before probe/STE,
+            # grad_probe only sees ∂loss/∂retrieved_normalized (small signal).
+            _r_l2 = jnp.linalg.norm(retrieved.astype(jnp.float32), axis=-1, keepdims=True)
+            retrieved = (retrieved.astype(jnp.float32) / (_r_l2 + jnp.float32(1e-8))
+                         * jnp.float32(0.5)).astype(retrieved.dtype)
 
             # ── Timing mark: pool retrieval done ─────────────────────────────
             ctimer.mark("05_pool_retrieval_done", retrieved)
