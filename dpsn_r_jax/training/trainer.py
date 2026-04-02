@@ -543,22 +543,17 @@ def train_step(
 
         # Routing diversity: prevent the indexer from collapsing to one coord.
         #
-        # grad(var) = 2*(x_i - mean)/n → 0 when all x_i are equal (vanishes).
-        # grad(-log(std)) = -(x_i-mean)/(n*std^2) → also 0 when collapsed.
-        #
-        # Centering term (mean - 0.5)^2 does NOT vanish: when collapsed at 0.95,
-        # grad = 2*(0.95 - 0.5)/n = 0.9/n per sample — non-zero and pushes mu
-        # back toward 0.5. The -var term then spreads from the new center.
+        # -log(std + eps): strong non-zero gradient even at collapse (std≈0).
+        # (mean - 0.5)^2 centering: pushes attractor-stuck coords back to pool center
+        #   before spread can help. At collapse at 0.95: grad = 2*(0.95-0.5)/n = 0.9/n.
+        # Both terms are applied jointly for maximum escape force from attractors.
         _mu_r_f = all_mu_r.reshape(-1).astype(jnp.float32)
         _mu_c_f = all_mu_c.reshape(-1).astype(jnp.float32)
-        target_var = jnp.float32(1.0 / 12.0)
-        var_loss_r = jax.nn.relu(target_var - jnp.var(_mu_r_f))
-        var_loss_c = jax.nn.relu(target_var - jnp.var(_mu_c_f))
         diversity_loss = jnp.float32(routing_diversity_weight) * (
-            (jnp.mean(_mu_r_f) - jnp.float32(0.5)) ** 2
+            -jnp.log(jnp.std(_mu_r_f) + jnp.float32(1e-4))
+            - jnp.log(jnp.std(_mu_c_f) + jnp.float32(1e-4))
+            + (jnp.mean(_mu_r_f) - jnp.float32(0.5)) ** 2
             + (jnp.mean(_mu_c_f) - jnp.float32(0.5)) ** 2
-            + var_loss_r
-            + var_loss_c
         )
         return (
             lm_loss + effective_precision_weight * jnp.float32(mean_sigma) + diversity_loss,

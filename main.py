@@ -79,10 +79,6 @@ def load_yaml_config(path):
         flat["config"] = model["config"]
     if "num_kv_heads" in model:
         flat["num_kv_heads"] = model["num_kv_heads"]
-    # Router head options
-    for key in ("use_router_head", "router_hidden_dim", "router_region_scale", "router_alpha_init"):
-        if key in model:
-            flat[key] = model[key]
     training = cfg.get("training", {})
     for key in ("max_steps", "batch_size", "grad_accum_steps", "loss_chunk_size",
                 "bf16", "log_interval", "save_interval", "max_checkpoints",
@@ -531,18 +527,6 @@ def main():
             "Larger patch = broader pool coverage per step, higher SRAM use."
         ),
     )
-    # ── Content-Aware Router Head ─────────────────────────────────────────────
-    parser.add_argument(
-        "--use_router_head",
-        action="store_true",
-        help=(
-            "Enable Content-Aware Router Head for semantic pool organization. "
-            "The router learns to route similar content to similar pool regions, "
-            "preventing coordinate collapse through learned semantic organization "
-            "instead of forced exploration. Config options (router_hidden_dim, "
-            "router_region_scale, router_alpha_init) can be set in YAML config."
-        ),
-    )
     parser.add_argument(
         "--profile_model",
         action="store_true",
@@ -672,15 +656,6 @@ def main():
                 f"[PREFETCH REASONING] WARNING: {_sram_per_chip_mb:.0f} MB/chip "
                 f"may exceed VMEM (128 MB). Consider --prefetch_size 32 or 48."
             )
-
-    if args.use_router_head:
-        config.use_router_head = True
-        print(
-            f"[ROUTER HEAD] Enabled\n"
-            f"  hidden_dim  : {config.router_hidden_dim or config.controller_hidden_dim // 2}\n"
-            f"  region_scale: {config.router_region_scale} (±{config.router_region_scale * 100:.0f}% of grid)\n"
-            f"  alpha_init  : {config.router_alpha_init} (sigmoid → {1 / (1 + 2.71828 ** (-config.router_alpha_init)):.2f})"
-        )
 
     if args.loss_chunk_size > 0:
         config.loss_chunk_size = args.loss_chunk_size

@@ -100,20 +100,6 @@ class DPSNRConfig:
     # independent parameter budget (e.g. 10240 → ~62M params with D=1024).
     indexer_hidden_dim: int = 0
 
-    # ── Content-Aware Router Head ─────────────────────────────────────────
-    # When enabled, a separate module learns to route similar content to similar
-    # pool regions. The router produces (row_offset, col_offset) that are added
-    # to the indexer's coordinates, guiding semantic organization of the pool.
-    use_router_head: bool = False
-    # Hidden dimension for router MLP. 0 = use controller_hidden_dim // 2.
-    router_hidden_dim: int = 0
-    # Maximum offset as fraction of grid (0.1 = router can shift ±10% of grid).
-    # Larger values = more routing freedom but risk of destabilizing training.
-    router_region_scale: float = 0.1
-    # Initial value for learned alpha weight that blends indexer + router.
-    # alpha=0.5 means equal influence from both. Learned during training.
-    router_alpha_init: float = 0.3
-
     finetune: Optional[FineTuningConfig] = None
 
     # ── Precision Routing ──────────────────────────────────────────────────
