@@ -541,24 +541,33 @@ def train_step(
                 mask = (shift_labels != pad_token_id).astype(jnp.float32)
                 lm_loss = (lm_loss * mask).sum() / (mask.sum() + 1e-9)
 
-        # Routing diversity: pairwise repulsion to prevent indexer collapse.
+        # Routing diversity: soft histogram entropy for uniform coverage.
         #
-        # -log(dist^2) Coulomb-like repulsion: pushes every pair of coordinates
-        # apart, giving each coordinate a unique escape direction. Unlike the old
-        # -log(std) which only cared about aggregate spread, this creates O(N^2)
-        # pairwise forces that directly fight clustering.
-        # (mean - 0.5)^2 centering: keeps the coordinate cloud near pool center.
-        _mu_r_f = all_mu_r.reshape(-1, 1).astype(jnp.float32)
-        _mu_c_f = all_mu_c.reshape(-1, 1).astype(jnp.float32)
-        coords = jnp.concatenate([_mu_r_f, _mu_c_f], axis=-1)  # (N, 2)
-        diff = coords[:, None, :] - coords[None, :, :]         # (N, N, 2)
-        dist_sq = jnp.sum(diff ** 2, axis=-1) + jnp.float32(1e-6)
-        # Clamp dist_sq floor to 0.01 so max per-pair repulsion is ~4.6,
-        # preventing log-singularity from creating enormous early gradients.
-        repulsion = -jnp.mean(jnp.log(jnp.maximum(dist_sq, jnp.float32(0.01))))
-        centering = ((jnp.mean(_mu_r_f) - jnp.float32(0.5)) ** 2
-                   + (jnp.mean(_mu_c_f) - jnp.float32(0.5)) ** 2)
-        diversity_loss = jnp.float32(routing_diversity_weight) * (repulsion + centering)
+        # Discretize [0,1] into K bins per axis, compute soft occupancy via
+        # Gaussian kernels, and maximize entropy of the bin distribution.
+        # Unlike pairwise repulsion (which packs corners) or -log(std) (which
+        # is too coarse), entropy directly rewards uniform grid coverage.
+        _mu_r_f = all_mu_r.reshape(-1).astype(jnp.float32)   # (N,)
+        _mu_c_f = all_mu_c.reshape(-1).astype(jnp.float32)   # (N,)
+        _K = 32
+        _bin_centers = jnp.linspace(jnp.float32(0.05), jnp.float32(0.95), _K)
+        _sigma_bin = jnp.float32(0.5 / _K)
+        # Soft assignment: (N, K) — each coord distributes weight across bins
+        _w_r = jnp.exp(jnp.float32(-0.5) * ((_mu_r_f[:, None] - _bin_centers[None, :]) / _sigma_bin) ** 2)
+        _w_r = _w_r / (_w_r.sum(axis=-1, keepdims=True) + jnp.float32(1e-8))
+        _p_r = jnp.mean(_w_r, axis=0) + jnp.float32(1e-8)
+        _p_r = _p_r / _p_r.sum()
+        _entropy_r = -jnp.sum(_p_r * jnp.log(_p_r))
+        _w_c = jnp.exp(jnp.float32(-0.5) * ((_mu_c_f[:, None] - _bin_centers[None, :]) / _sigma_bin) ** 2)
+        _w_c = _w_c / (_w_c.sum(axis=-1, keepdims=True) + jnp.float32(1e-8))
+        _p_c = jnp.mean(_w_c, axis=0) + jnp.float32(1e-8)
+        _p_c = _p_c / _p_c.sum()
+        _entropy_c = -jnp.sum(_p_c * jnp.log(_p_c))
+        # Minimize gap to max entropy (log K ≈ 3.47 for K=32)
+        _max_entropy = jnp.log(jnp.float32(_K))
+        diversity_loss = jnp.float32(routing_diversity_weight) * (
+            (_max_entropy - _entropy_r) + (_max_entropy - _entropy_c)
+        )
         return (
             lm_loss + effective_precision_weight * jnp.float32(mean_sigma) + diversity_loss,
             (indices, mean_sigma, all_mu_r, all_mu_c, all_sigma_h, all_start_2d,
@@ -575,11 +584,11 @@ def train_step(
     dense_grads, grad_probe = grads
 
     # ── Diagnostic: log exact grad_probe magnitude (inside JIT via debug.print) ─
-    jax.debug.print(
-        "[POOL_GRAD_DIAG] grad_probe max={mx} l2={l2}",
-        mx=jnp.max(jnp.abs(grad_probe.astype(jnp.float32))),
-        l2=jnp.sqrt(jnp.sum(grad_probe.astype(jnp.float32) ** 2)),
-    )
+#    jax.debug.print(
+#       "[POOL_GRAD_DIAG] grad_probe max={mx} l2={l2}",
+#        mx=jnp.max(jnp.abs(grad_probe.astype(jnp.float32))),
+#        l2=jnp.sqrt(jnp.sum(grad_probe.astype(jnp.float32) ** 2)),
+#    )
 
     # ── Pool gradient computation ────────────────────────────────────────────
     if prefetch_reasoning:
@@ -764,16 +773,26 @@ def grad_accum_step(
                     mask = (shift_labels != pad_token_id).astype(jnp.float32)
                     lm_loss = (per_token * mask).sum() / (mask.sum() + 1e-9)
 
-            # Routing diversity: pairwise repulsion + centering (same as train_step).
-            _mu_r_f = all_mu_r.reshape(-1, 1).astype(jnp.float32)
-            _mu_c_f = all_mu_c.reshape(-1, 1).astype(jnp.float32)
-            coords = jnp.concatenate([_mu_r_f, _mu_c_f], axis=-1)  # (N, 2)
-            diff = coords[:, None, :] - coords[None, :, :]         # (N, N, 2)
-            dist_sq = jnp.sum(diff ** 2, axis=-1) + jnp.float32(1e-6)
-            repulsion = -jnp.mean(jnp.log(jnp.maximum(dist_sq, jnp.float32(0.01))))
-            centering = ((jnp.mean(_mu_r_f) - jnp.float32(0.5)) ** 2
-                       + (jnp.mean(_mu_c_f) - jnp.float32(0.5)) ** 2)
-            diversity_loss = jnp.float32(routing_diversity_weight) * (repulsion + centering)
+            # Routing diversity: soft histogram entropy (same as train_step).
+            _mu_r_f = all_mu_r.reshape(-1).astype(jnp.float32)
+            _mu_c_f = all_mu_c.reshape(-1).astype(jnp.float32)
+            _K = 32
+            _bin_centers = jnp.linspace(jnp.float32(0.05), jnp.float32(0.95), _K)
+            _sigma_bin = jnp.float32(0.5 / _K)
+            _w_r = jnp.exp(jnp.float32(-0.5) * ((_mu_r_f[:, None] - _bin_centers[None, :]) / _sigma_bin) ** 2)
+            _w_r = _w_r / (_w_r.sum(axis=-1, keepdims=True) + jnp.float32(1e-8))
+            _p_r = jnp.mean(_w_r, axis=0) + jnp.float32(1e-8)
+            _p_r = _p_r / _p_r.sum()
+            _entropy_r = -jnp.sum(_p_r * jnp.log(_p_r))
+            _w_c = jnp.exp(jnp.float32(-0.5) * ((_mu_c_f[:, None] - _bin_centers[None, :]) / _sigma_bin) ** 2)
+            _w_c = _w_c / (_w_c.sum(axis=-1, keepdims=True) + jnp.float32(1e-8))
+            _p_c = jnp.mean(_w_c, axis=0) + jnp.float32(1e-8)
+            _p_c = _p_c / _p_c.sum()
+            _entropy_c = -jnp.sum(_p_c * jnp.log(_p_c))
+            _max_entropy = jnp.log(jnp.float32(_K))
+            diversity_loss = jnp.float32(routing_diversity_weight) * (
+                (_max_entropy - _entropy_r) + (_max_entropy - _entropy_c)
+            )
             return (
                 lm_loss + effective_precision_weight * jnp.float32(mean_sigma) + diversity_loss,
                 (indices, mean_sigma, all_mu_r, all_mu_c, all_sigma_h, all_start_2d,
