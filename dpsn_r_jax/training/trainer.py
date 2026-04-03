@@ -553,7 +553,9 @@ def train_step(
         coords = jnp.concatenate([_mu_r_f, _mu_c_f], axis=-1)  # (N, 2)
         diff = coords[:, None, :] - coords[None, :, :]         # (N, N, 2)
         dist_sq = jnp.sum(diff ** 2, axis=-1) + jnp.float32(1e-6)
-        repulsion = -jnp.mean(jnp.log(dist_sq + jnp.float32(1e-4)))
+        # Clamp dist_sq floor to 0.01 so max per-pair repulsion is ~4.6,
+        # preventing log-singularity from creating enormous early gradients.
+        repulsion = -jnp.mean(jnp.log(jnp.maximum(dist_sq, jnp.float32(0.01))))
         centering = ((jnp.mean(_mu_r_f) - jnp.float32(0.5)) ** 2
                    + (jnp.mean(_mu_c_f) - jnp.float32(0.5)) ** 2)
         diversity_loss = jnp.float32(routing_diversity_weight) * (repulsion + centering)
@@ -768,7 +770,7 @@ def grad_accum_step(
             coords = jnp.concatenate([_mu_r_f, _mu_c_f], axis=-1)  # (N, 2)
             diff = coords[:, None, :] - coords[None, :, :]         # (N, N, 2)
             dist_sq = jnp.sum(diff ** 2, axis=-1) + jnp.float32(1e-6)
-            repulsion = -jnp.mean(jnp.log(dist_sq + jnp.float32(1e-4)))
+            repulsion = -jnp.mean(jnp.log(jnp.maximum(dist_sq, jnp.float32(0.01))))
             centering = ((jnp.mean(_mu_r_f) - jnp.float32(0.5)) ** 2
                        + (jnp.mean(_mu_c_f) - jnp.float32(0.5)) ** 2)
             diversity_loss = jnp.float32(routing_diversity_weight) * (repulsion + centering)
