@@ -91,7 +91,7 @@ class LearnedIndexer(nn.Module):
         mu_raw    = nn.Dense(                       # (B, num_heads)
             self.num_heads,
             kernel_init=nn.initializers.normal(stddev=1.0),
-            bias_init=nn.initializers.zeros_init(),
+            bias_init=nn.initializers.zeros,
         )(x)
         sigma_raw = nn.Dense(self.num_heads)(x)   # (B, num_heads)
 
