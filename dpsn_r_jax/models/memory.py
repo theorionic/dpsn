@@ -88,7 +88,11 @@ class LearnedIndexer(nn.Module):
         # ── 3. Multi-head coordinate prediction ─────────────────────────────
         # One Dense produces ALL heads' raw µ values; same for σ.
         # This shares the trunk while keeping head-specific final projections.
-        mu_raw    = nn.Dense(self.num_heads)(x)   # (B, num_heads)
+        mu_raw    = nn.Dense(                       # (B, num_heads)
+            self.num_heads,
+            kernel_init=nn.initializers.normal(stddev=2.0),
+            bias_init=nn.initializers.uniform(scale=4.0),
+        )(x)
         sigma_raw = nn.Dense(self.num_heads)(x)   # (B, num_heads)
 
         # µ: sigmoid → (0,1), then squeeze into (margin, 1-margin) so grid
