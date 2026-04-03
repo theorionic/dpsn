@@ -148,6 +148,98 @@ def _routing_diversity_loss(
     return jnp.float32(weight) * (gap_r + gap_c)
 
 
+def _cross_loop_diversity_loss(
+    all_mu_r: jnp.ndarray,
+    all_mu_c: jnp.ndarray,
+    weight: float,
+) -> jnp.ndarray:
+    """Penalise each batch item routing to the same pool coordinate in every
+    reasoning loop iteration (cross-loop / per-item collapse).
+
+    The existing _routing_diversity_loss measures entropy across the flattened
+    (loops × batch × heads) distribution — it catches global collapse (all
+    values pile at one coordinate) but misses the case where each batch item
+    individually repeats the same coordinate across loops while different items
+    happen to go to different places (giving adequate global entropy).
+
+    This loss fills that gap: for each (batch item, head) pair it computes the
+    variance of the routed coordinate across the R loop iterations.  If an item
+    always goes to the same place, its per-item variance is 0 → high loss.
+
+    Form:  weight * exp(-mean_per_item_variance / 0.01)
+      At full collapse (var=0):   loss = weight          (maximum penalty)
+      At var=0.01 (modest spread): loss ≈ 0.37 * weight
+      At var >> 0.01:             loss → 0               (no penalty)
+    The exponential form bounds the loss to [0, weight] — no gradient explosion.
+
+    Args:
+        all_mu_r: (R, B, H) — row coordinates across loops, batch items, heads.
+        all_mu_c: (R, B, H) — col coordinates.
+        weight:   Scalar coefficient.  0 = disabled.
+                  Recommended: same as routing_diversity_weight (they are summed).
+
+    Returns:
+        Scalar loss value (jnp.float32).
+    """
+    if weight == 0.0:
+        return jnp.float32(0.0)
+
+    R = all_mu_r.shape[0]
+    if R < 2:
+        return jnp.float32(0.0)
+
+    # Per-(batch item, head) variance across the R loop iterations.
+    var_r = jnp.var(all_mu_r.astype(jnp.float32), axis=0)  # (B, H)
+    var_c = jnp.var(all_mu_c.astype(jnp.float32), axis=0)  # (B, H)
+    mean_var = (var_r.mean() + var_c.mean()) * jnp.float32(0.5)
+
+    # Exponential penalty: strong near 0, fades as variance grows.
+    return jnp.float32(weight) * jnp.exp(-mean_var / jnp.float32(0.01))
+
+
+def _boundary_repulsion_loss(
+    all_mu_r: jnp.ndarray,
+    all_mu_c: jnp.ndarray,
+    weight: float,
+    margin: float = 0.15,
+) -> jnp.ndarray:
+    """Exponential repulsion from grid boundaries (mu near 0 or 1).
+
+    Directly targets 4-corner collapse: when tanh saturates, mu reaches exactly
+    0 or 1, making the four corners (0,0), (0,1), (1,0), (1,1) strong gradient
+    attractors.  This loss pushes mu away from boundaries with a force that falls
+    off exponentially beyond `margin` — leaving the interior unaffected.
+
+    Loss per coordinate:
+        exp(-mu / margin) + exp(-(1 - mu) / margin)
+    At mu=0:      1.0 + exp(-1/margin)  ≈ 1.0   (full repulsion)
+    At mu=margin: exp(-1) ≈ 0.37                 (half-strength)
+    At mu=0.5:    ≈ 0                             (negligible)
+
+    Args:
+        all_mu_r:  (R, B, H) — row coordinates in [0, 1].
+        all_mu_c:  (R, B, H) — col coordinates in [0, 1].
+        weight:    Scalar coefficient. 0 = disabled.
+        margin:    Distance from boundary at which repulsion is ~37% strength.
+                   Default 0.05 = 5% of the pool edge (row ~51 on a 1024-grid).
+
+    Returns:
+        Scalar loss value (jnp.float32).
+    """
+    if weight == 0.0:
+        return jnp.float32(0.0)
+
+    mu = jnp.concatenate([
+        all_mu_r.reshape(-1).astype(jnp.float32),
+        all_mu_c.reshape(-1).astype(jnp.float32),
+    ])
+    m = jnp.float32(margin)
+    repulsion = (
+        jnp.exp(-mu / m) + jnp.exp(-(jnp.float32(1.0) - mu) / m)
+    )
+    return jnp.float32(weight) * repulsion.mean()
+
+
 def chunked_lm_loss(hidden, labels, decode_fn, pad_token_id, chunk_size):
     """LM loss chunked along the *sequence* (T) dimension.
 
@@ -608,8 +700,22 @@ def train_step(
         diversity_loss = _routing_diversity_loss(
             all_mu_r, all_mu_c, routing_diversity_weight
         )
+        # Cross-loop diversity: penalise each batch item repeating the same
+        # coordinate across reasoning loop iterations (the collapse mode where
+        # global entropy looks fine but every item picks the same place each loop).
+        cross_loop_loss = _cross_loop_diversity_loss(
+            all_mu_r, all_mu_c, routing_diversity_weight
+        )
+        # Boundary repulsion: directly penalise mu near 0 or 1 to prevent
+        # 4-corner collapse (tanh saturation → indexer locks to grid corners).
+        # Weight 2.0x routing_diversity_weight + wider margin (0.15) gives a
+        # much stronger push away from corners to break the positive-feedback loop.
+        boundary_loss = _boundary_repulsion_loss(
+            all_mu_r, all_mu_c, routing_diversity_weight * 2.0
+        )
         return (
-            lm_loss + effective_precision_weight * jnp.float32(mean_sigma) + diversity_loss,
+            lm_loss + effective_precision_weight * jnp.float32(mean_sigma)
+            + diversity_loss + cross_loop_loss + boundary_loss,
             (indices, mean_sigma, all_mu_r, all_mu_c, all_sigma_h, all_start_2d,
              pf_r_start, pf_c_start),
         )
@@ -817,8 +923,19 @@ def grad_accum_step(
             diversity_loss = _routing_diversity_loss(
                 all_mu_r, all_mu_c, routing_diversity_weight
             )
+            # Cross-loop collapse: penalise each batch item repeating the same
+            # coordinate across reasoning loop iterations.
+            cross_loop_loss = _cross_loop_diversity_loss(
+                all_mu_r, all_mu_c, routing_diversity_weight
+            )
+            # Boundary repulsion: prevent 4-corner collapse (tanh saturation).
+            # Weight 2.0x + wider margin (0.15) for stronger anti-collapse force.
+            boundary_loss = _boundary_repulsion_loss(
+                all_mu_r, all_mu_c, routing_diversity_weight * 2.0
+            )
             return (
-                lm_loss + effective_precision_weight * jnp.float32(mean_sigma) + diversity_loss,
+                lm_loss + effective_precision_weight * jnp.float32(mean_sigma)
+                + diversity_loss + cross_loop_loss + boundary_loss,
                 (indices, mean_sigma, all_mu_r, all_mu_c, all_sigma_h, all_start_2d,
                  pf_r_start, pf_c_start),
             )

@@ -86,32 +86,50 @@ class LearnedIndexer(nn.Module):
         x = nn.gelu(x)
 
         # ── 3. Multi-head coordinate prediction ─────────────────────────────
-        # One Dense produces ALL heads' raw µ values; same for σ.
-        # This shares the trunk while keeping head-specific final projections.
-        mu_raw    = nn.Dense(                       # (B, num_heads)
-            self.num_heads,
-            kernel_init=nn.initializers.normal(stddev=1.0),
+        # Softmax over discrete interior bin positions.
+        #
+        # WHY not tanh:
+        #   tanh saturates at ±1. Once mu_raw grows large (driven by the LM
+        #   loss rewarding a corner location), tanh'≈0 so gradients through
+        #   the indexer vanish — the model can't escape even with a repulsion
+        #   loss fighting it. This causes the observed 4-corner collapse where
+        #   concentration monotonically increases despite strong diversity losses.
+        #
+        # WHY softmax-over-bins:
+        #   1. Bin centres span [0.1, 0.9] → grid corners (row 0, row 1023)
+        #      are physically unreachable, not just penalised.
+        #   2. Softmax gradient is well-behaved everywhere (no saturation),
+        #      so repulsion losses always have a non-zero signal path.
+        #   3. The model can represent any interior position as a mixture of
+        #      neighbouring bins — expressiveness is not sacrificed.
+        _N_POS = 32  # 32 bins over [0.1, 0.9] → ~26-cell spacing on a 1024 grid
+        pos_logits = nn.Dense(
+            self.num_heads * _N_POS,
+            kernel_init=nn.initializers.normal(stddev=0.02),
             bias_init=nn.initializers.zeros,
-        )(x)
+        )(x)  # (B, num_heads * _N_POS)
+        B_dim = pos_logits.shape[0]
+        pos_logits = pos_logits.reshape(B_dim, self.num_heads, _N_POS)
+        pos_probs = jax.nn.softmax(pos_logits, axis=-1)          # (B, H, N_POS)
+        bin_centers = jnp.linspace(
+            jnp.float32(0.1), jnp.float32(0.9), _N_POS
+        )                                                          # (N_POS,)
+        mu_01 = jnp.sum(
+            pos_probs * bin_centers[None, None, :], axis=-1
+        )  # (B, num_heads) in [0.1, 0.9]
+
         sigma_raw = nn.Dense(self.num_heads)(x)   # (B, num_heads)
 
-        # µ: scaled tanh → (0,1), then squeeze into (margin, 1-margin).
-        # tanh(x*0.5) saturates much slower than sigmoid:
-        #   at |mu_raw|=4: tanh grad=0.07 vs sigmoid grad=0.018 (4x more).
-        # This prevents corner-trapping that causes 4-corner collapse.
-        mu_01 = jnp.float32(0.5) + jnp.float32(0.5) * jnp.tanh(
-            mu_raw * jnp.float32(0.5)
-        )  # (B, num_heads) in (0, 1)
-
-        # During training: add coord-space noise to prevent routing collapse.
-        # Added AFTER sigmoid so the model can't compensate with larger mu_raw.
-        # std=0.15 spreads a collapsed coord ~±150 grid cells in each direction.
+        # During training: add small coord-space noise for additional exploration.
+        # Clipped to [0.1, 0.9] to stay within the bin range.
         if not deterministic:
             mu_01 = mu_01 + jax.random.normal(
                 self.make_rng('dropout'), mu_01.shape, dtype=jnp.float32
-            ) * jnp.float32(0.15)
-            mu_01 = jnp.clip(mu_01, jnp.float32(0.0), jnp.float32(1.0))
+            ) * jnp.float32(0.10)
+            mu_01 = jnp.clip(mu_01, jnp.float32(0.1), jnp.float32(0.9))
 
+        # coord_margin is 0.0 here; with mu_01 already in [0.1, 0.9] the mapping
+        # is identity and corners are unreachable.
         mu = self.coord_margin + (1.0 - 2.0 * self.coord_margin) * mu_01
 
         # ── 4. σ with dynamic scale for annealed precision routing ───────────
