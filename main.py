@@ -199,7 +199,7 @@ def main():
     parser.add_argument(
         "--routing_diversity_weight",
         type=float,
-        default=0.05,
+        default=0.50,
         help="Weight for routing diversity loss: penalizes low mu variance to prevent "
              "pool collapse to a single coord. 0 disables. Default: 0.05",
     )

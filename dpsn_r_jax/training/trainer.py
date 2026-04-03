@@ -551,7 +551,7 @@ def train_step(
         _mu_c_f = all_mu_c.reshape(-1).astype(jnp.float32)   # (N,)
         _K = 32
         _bin_centers = jnp.linspace(jnp.float32(0.05), jnp.float32(0.95), _K)
-        _sigma_bin = jnp.float32(0.5 / _K)
+        _sigma_bin = jnp.float32(1.5 / _K)
         # Soft assignment: (N, K) — each coord distributes weight across bins
         _w_r = jnp.exp(jnp.float32(-0.5) * ((_mu_r_f[:, None] - _bin_centers[None, :]) / _sigma_bin) ** 2)
         _w_r = _w_r / (_w_r.sum(axis=-1, keepdims=True) + jnp.float32(1e-8))
@@ -778,7 +778,7 @@ def grad_accum_step(
             _mu_c_f = all_mu_c.reshape(-1).astype(jnp.float32)
             _K = 32
             _bin_centers = jnp.linspace(jnp.float32(0.05), jnp.float32(0.95), _K)
-            _sigma_bin = jnp.float32(0.5 / _K)
+            _sigma_bin = jnp.float32(1.5 / _K)
             _w_r = jnp.exp(jnp.float32(-0.5) * ((_mu_r_f[:, None] - _bin_centers[None, :]) / _sigma_bin) ** 2)
             _w_r = _w_r / (_w_r.sum(axis=-1, keepdims=True) + jnp.float32(1e-8))
             _p_r = jnp.mean(_w_r, axis=0) + jnp.float32(1e-8)
