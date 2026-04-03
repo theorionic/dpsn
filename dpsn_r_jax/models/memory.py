@@ -90,15 +90,18 @@ class LearnedIndexer(nn.Module):
         # This shares the trunk while keeping head-specific final projections.
         mu_raw    = nn.Dense(                       # (B, num_heads)
             self.num_heads,
-            kernel_init=nn.initializers.normal(stddev=2.0),
-            bias_init=nn.initializers.uniform(scale=4.0),
+            kernel_init=nn.initializers.normal(stddev=1.0),
+            bias_init=nn.initializers.uniform(scale=2.0),
         )(x)
         sigma_raw = nn.Dense(self.num_heads)(x)   # (B, num_heads)
 
-        # µ: sigmoid → (0,1), then squeeze into (margin, 1-margin) so grid
-        # corners are physically unreachable.  Prevents sigmoid saturation
-        # from routing everything to (0,0)/(R-1,C-1) corner coordinates.
-        mu_01 = jax.nn.sigmoid(mu_raw)            # (B, num_heads) in (0, 1)
+        # µ: scaled tanh → (0,1), then squeeze into (margin, 1-margin).
+        # tanh(x*0.5) saturates much slower than sigmoid:
+        #   at |mu_raw|=4: tanh grad=0.07 vs sigmoid grad=0.018 (4x more).
+        # This prevents corner-trapping that causes 4-corner collapse.
+        mu_01 = jnp.float32(0.5) + jnp.float32(0.5) * jnp.tanh(
+            mu_raw * jnp.float32(0.5)
+        )  # (B, num_heads) in (0, 1)
 
         # During training: add coord-space noise to prevent routing collapse.
         # Added AFTER sigmoid so the model can't compensate with larger mu_raw.
