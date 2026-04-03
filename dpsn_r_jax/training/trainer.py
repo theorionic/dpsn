@@ -541,20 +541,22 @@ def train_step(
                 mask = (shift_labels != pad_token_id).astype(jnp.float32)
                 lm_loss = (lm_loss * mask).sum() / (mask.sum() + 1e-9)
 
-        # Routing diversity: prevent the indexer from collapsing to one coord.
+        # Routing diversity: pairwise repulsion to prevent indexer collapse.
         #
-        # -log(std + eps): strong non-zero gradient even at collapse (std≈0).
-        # (mean - 0.5)^2 centering: pushes attractor-stuck coords back to pool center
-        #   before spread can help. At collapse at 0.95: grad = 2*(0.95-0.5)/n = 0.9/n.
-        # Both terms are applied jointly for maximum escape force from attractors.
-        _mu_r_f = all_mu_r.reshape(-1).astype(jnp.float32)
-        _mu_c_f = all_mu_c.reshape(-1).astype(jnp.float32)
-        diversity_loss = jnp.float32(routing_diversity_weight) * (
-            -jnp.log(jnp.std(_mu_r_f) + jnp.float32(1e-4))
-            - jnp.log(jnp.std(_mu_c_f) + jnp.float32(1e-4))
-            + (jnp.mean(_mu_r_f) - jnp.float32(0.5)) ** 2
-            + (jnp.mean(_mu_c_f) - jnp.float32(0.5)) ** 2
-        )
+        # -log(dist^2) Coulomb-like repulsion: pushes every pair of coordinates
+        # apart, giving each coordinate a unique escape direction. Unlike the old
+        # -log(std) which only cared about aggregate spread, this creates O(N^2)
+        # pairwise forces that directly fight clustering.
+        # (mean - 0.5)^2 centering: keeps the coordinate cloud near pool center.
+        _mu_r_f = all_mu_r.reshape(-1, 1).astype(jnp.float32)
+        _mu_c_f = all_mu_c.reshape(-1, 1).astype(jnp.float32)
+        coords = jnp.concatenate([_mu_r_f, _mu_c_f], axis=-1)  # (N, 2)
+        diff = coords[:, None, :] - coords[None, :, :]         # (N, N, 2)
+        dist_sq = jnp.sum(diff ** 2, axis=-1) + jnp.float32(1e-6)
+        repulsion = -jnp.mean(jnp.log(dist_sq + jnp.float32(1e-4)))
+        centering = ((jnp.mean(_mu_r_f) - jnp.float32(0.5)) ** 2
+                   + (jnp.mean(_mu_c_f) - jnp.float32(0.5)) ** 2)
+        diversity_loss = jnp.float32(routing_diversity_weight) * (repulsion + centering)
         return (
             lm_loss + effective_precision_weight * jnp.float32(mean_sigma) + diversity_loss,
             (indices, mean_sigma, all_mu_r, all_mu_c, all_sigma_h, all_start_2d,
@@ -760,13 +762,16 @@ def grad_accum_step(
                     mask = (shift_labels != pad_token_id).astype(jnp.float32)
                     lm_loss = (per_token * mask).sum() / (mask.sum() + 1e-9)
 
-            # Routing diversity: -log(std + eps) — strong gradient even at collapse.
-            _mu_r_f = all_mu_r.reshape(-1).astype(jnp.float32)
-            _mu_c_f = all_mu_c.reshape(-1).astype(jnp.float32)
-            diversity_loss = jnp.float32(routing_diversity_weight) * (
-                -jnp.log(jnp.std(_mu_r_f) + jnp.float32(1e-4))
-                - jnp.log(jnp.std(_mu_c_f) + jnp.float32(1e-4))
-            )
+            # Routing diversity: pairwise repulsion + centering (same as train_step).
+            _mu_r_f = all_mu_r.reshape(-1, 1).astype(jnp.float32)
+            _mu_c_f = all_mu_c.reshape(-1, 1).astype(jnp.float32)
+            coords = jnp.concatenate([_mu_r_f, _mu_c_f], axis=-1)  # (N, 2)
+            diff = coords[:, None, :] - coords[None, :, :]         # (N, N, 2)
+            dist_sq = jnp.sum(diff ** 2, axis=-1) + jnp.float32(1e-6)
+            repulsion = -jnp.mean(jnp.log(dist_sq + jnp.float32(1e-4)))
+            centering = ((jnp.mean(_mu_r_f) - jnp.float32(0.5)) ** 2
+                       + (jnp.mean(_mu_c_f) - jnp.float32(0.5)) ** 2)
+            diversity_loss = jnp.float32(routing_diversity_weight) * (repulsion + centering)
             return (
                 lm_loss + effective_precision_weight * jnp.float32(mean_sigma) + diversity_loss,
                 (indices, mean_sigma, all_mu_r, all_mu_c, all_sigma_h, all_start_2d,
