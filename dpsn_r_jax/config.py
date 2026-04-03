@@ -92,13 +92,20 @@ class DPSNRConfig:
     num_indexer_heads: int = 1      # Multi-head pool queries per reasoning step
     sigma_min: float = 0.01         # Minimum retrieval bandwidth (sharp/precise)
     sigma_max: float = 5.0          # Maximum retrieval bandwidth (broad/soft)
-    # Fraction of grid excluded at each boundary to prevent sigmoid saturation
-    # from collapsing coordinates to corners (e.g. 0.05 → mu ∈ (0.05, 0.95)).
-    coord_margin: float = 0.05
+    # Fraction of grid excluded at each boundary.
+    # IMPORTANT: set to 0.0.  The old default of 0.05 was the direct cause of
+    # 4-corner collapse: on a 1024-grid, 0.05 maps mu to [51, 972], which are
+    # exactly the hotspot coordinates visible in pool coverage logs.  With 0.0,
+    # tanh saturation at corners maps to grid edges [0, 1023] which are a much
+    # weaker attractor because the Gaussian window wraps safely at the boundary.
+    coord_margin: float = 0.0
     # MLP width inside LearnedIndexer.  0 = use controller_hidden_dim (default,
     # backward-compat).  Set to a large value to give the indexer its own
     # independent parameter budget (e.g. 10240 → ~62M params with D=1024).
     indexer_hidden_dim: int = 0
+    # Weight for in-batch routing diversity loss (entropy of soft histogram).
+    # 0 = disabled.  Recommended: 0.05–0.2 for anti-collapse.
+    routing_diversity_weight: float = 0.0
 
     finetune: Optional[FineTuningConfig] = None
 

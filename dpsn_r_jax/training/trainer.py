@@ -85,6 +85,69 @@ def create_train_state(rng, config, learning_rate_fn=None):
 import functools
 
 
+def _routing_diversity_loss(
+    all_mu_r: jnp.ndarray,
+    all_mu_c: jnp.ndarray,
+    weight: float,
+    n_bins: int = 32,
+) -> jnp.ndarray:
+    """Soft-histogram entropy loss to discourage indexer collapse.
+
+    Discretises the [0, 1] coordinate space into n_bins bins and computes
+    a soft occupancy via Gaussian kernels.  The loss penalises the gap to
+    maximum entropy (log n_bins), pushing the routing distribution toward
+    uniform coverage of the pool grid.
+
+    Design choices
+    --------------
+    * Bins cover [0.0, 1.0] (not [0.05, 0.95]) because coord_margin=0.0
+      now — matching bin range to the actual mu range is critical for the
+      gradient to have the right sign at the grid edges.
+    * sigma_bin = 3.0 / n_bins (vs old 1.5 / n_bins): wider kernel ensures
+      that a fully-collapsed distribution still generates large entropy
+      gradients for ALL bins, giving a strong push away from corners even
+      at the start of training when routing is maximally degenerate.
+    * Both row and column axes are regularised independently and summed,
+      so 2-D collapse (same row AND same col) is twice as penalised.
+
+    Args:
+        all_mu_r: (R, B, H) or any shape — normalised row coordinates in [0, 1].
+        all_mu_c: (R, B, H) or any shape — normalised col coordinates in [0, 1].
+        weight:   Scalar coefficient.  0 = disabled.
+        n_bins:   Number of histogram bins (default 32).
+
+    Returns:
+        Scalar loss value (jnp.float32).
+    """
+    if weight == 0.0:
+        return jnp.float32(0.0)
+
+    mu_r = all_mu_r.reshape(-1).astype(jnp.float32)   # (N,)
+    mu_c = all_mu_c.reshape(-1).astype(jnp.float32)   # (N,)
+
+    # Bin centres span the FULL [0, 1] to match coord_margin = 0.
+    bin_centers = jnp.linspace(jnp.float32(0.0), jnp.float32(1.0), n_bins)
+    # Wider kernel: 3 / K instead of 1.5 / K.
+    # At K=32, sigma_bin ≈ 0.094, so a coord at 0.0 still deposits ~10% of its
+    # mass on the bin at 0.5 — giving a global gradient even during total collapse.
+    sigma_bin = jnp.float32(3.0 / n_bins)
+
+    def _axis_entropy(mu: jnp.ndarray) -> jnp.ndarray:
+        # Soft assignment: (N, K)
+        w = jnp.exp(
+            jnp.float32(-0.5) * ((mu[:, None] - bin_centers[None, :]) / sigma_bin) ** 2
+        )
+        w = w / (w.sum(axis=-1, keepdims=True) + jnp.float32(1e-8))
+        p = jnp.mean(w, axis=0) + jnp.float32(1e-8)  # (K,) soft histogram
+        p = p / p.sum()
+        return -jnp.sum(p * jnp.log(p))              # scalar entropy
+
+    max_entropy = jnp.log(jnp.float32(n_bins))
+    gap_r = max_entropy - _axis_entropy(mu_r)
+    gap_c = max_entropy - _axis_entropy(mu_c)
+    return jnp.float32(weight) * (gap_r + gap_c)
+
+
 def chunked_lm_loss(hidden, labels, decode_fn, pad_token_id, chunk_size):
     """LM loss chunked along the *sequence* (T) dimension.
 
@@ -542,31 +605,8 @@ def train_step(
                 lm_loss = (lm_loss * mask).sum() / (mask.sum() + 1e-9)
 
         # Routing diversity: soft histogram entropy for uniform coverage.
-        #
-        # Discretize [0,1] into K bins per axis, compute soft occupancy via
-        # Gaussian kernels, and maximize entropy of the bin distribution.
-        # Unlike pairwise repulsion (which packs corners) or -log(std) (which
-        # is too coarse), entropy directly rewards uniform grid coverage.
-        _mu_r_f = all_mu_r.reshape(-1).astype(jnp.float32)   # (N,)
-        _mu_c_f = all_mu_c.reshape(-1).astype(jnp.float32)   # (N,)
-        _K = 32
-        _bin_centers = jnp.linspace(jnp.float32(0.05), jnp.float32(0.95), _K)
-        _sigma_bin = jnp.float32(1.5 / _K)
-        # Soft assignment: (N, K) — each coord distributes weight across bins
-        _w_r = jnp.exp(jnp.float32(-0.5) * ((_mu_r_f[:, None] - _bin_centers[None, :]) / _sigma_bin) ** 2)
-        _w_r = _w_r / (_w_r.sum(axis=-1, keepdims=True) + jnp.float32(1e-8))
-        _p_r = jnp.mean(_w_r, axis=0) + jnp.float32(1e-8)
-        _p_r = _p_r / _p_r.sum()
-        _entropy_r = -jnp.sum(_p_r * jnp.log(_p_r))
-        _w_c = jnp.exp(jnp.float32(-0.5) * ((_mu_c_f[:, None] - _bin_centers[None, :]) / _sigma_bin) ** 2)
-        _w_c = _w_c / (_w_c.sum(axis=-1, keepdims=True) + jnp.float32(1e-8))
-        _p_c = jnp.mean(_w_c, axis=0) + jnp.float32(1e-8)
-        _p_c = _p_c / _p_c.sum()
-        _entropy_c = -jnp.sum(_p_c * jnp.log(_p_c))
-        # Minimize gap to max entropy (log K ≈ 3.47 for K=32)
-        _max_entropy = jnp.log(jnp.float32(_K))
-        diversity_loss = jnp.float32(routing_diversity_weight) * (
-            (_max_entropy - _entropy_r) + (_max_entropy - _entropy_c)
+        diversity_loss = _routing_diversity_loss(
+            all_mu_r, all_mu_c, routing_diversity_weight
         )
         return (
             lm_loss + effective_precision_weight * jnp.float32(mean_sigma) + diversity_loss,
@@ -774,24 +814,8 @@ def grad_accum_step(
                     lm_loss = (per_token * mask).sum() / (mask.sum() + 1e-9)
 
             # Routing diversity: soft histogram entropy (same as train_step).
-            _mu_r_f = all_mu_r.reshape(-1).astype(jnp.float32)
-            _mu_c_f = all_mu_c.reshape(-1).astype(jnp.float32)
-            _K = 32
-            _bin_centers = jnp.linspace(jnp.float32(0.05), jnp.float32(0.95), _K)
-            _sigma_bin = jnp.float32(1.5 / _K)
-            _w_r = jnp.exp(jnp.float32(-0.5) * ((_mu_r_f[:, None] - _bin_centers[None, :]) / _sigma_bin) ** 2)
-            _w_r = _w_r / (_w_r.sum(axis=-1, keepdims=True) + jnp.float32(1e-8))
-            _p_r = jnp.mean(_w_r, axis=0) + jnp.float32(1e-8)
-            _p_r = _p_r / _p_r.sum()
-            _entropy_r = -jnp.sum(_p_r * jnp.log(_p_r))
-            _w_c = jnp.exp(jnp.float32(-0.5) * ((_mu_c_f[:, None] - _bin_centers[None, :]) / _sigma_bin) ** 2)
-            _w_c = _w_c / (_w_c.sum(axis=-1, keepdims=True) + jnp.float32(1e-8))
-            _p_c = jnp.mean(_w_c, axis=0) + jnp.float32(1e-8)
-            _p_c = _p_c / _p_c.sum()
-            _entropy_c = -jnp.sum(_p_c * jnp.log(_p_c))
-            _max_entropy = jnp.log(jnp.float32(_K))
-            diversity_loss = jnp.float32(routing_diversity_weight) * (
-                (_max_entropy - _entropy_r) + (_max_entropy - _entropy_c)
+            diversity_loss = _routing_diversity_loss(
+                all_mu_r, all_mu_c, routing_diversity_weight
             )
             return (
                 lm_loss + effective_precision_weight * jnp.float32(mean_sigma) + diversity_loss,

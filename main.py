@@ -199,9 +199,12 @@ def main():
     parser.add_argument(
         "--routing_diversity_weight",
         type=float,
-        default=0.50,
-        help="Weight for routing diversity loss: penalizes low mu variance to prevent "
-             "pool collapse to a single coord. 0 disables. Default: 0.05",
+        default=None,
+        help="Weight for routing diversity loss: maximises entropy of the per-batch "
+             "routing histogram to prevent indexer collapse to a few pool coordinates. "
+             "0 = disabled. None (default) = use value from config dataclass "
+             "(DPSNRConfig.routing_diversity_weight, default 0.0). "
+             "Recommended when collapse is observed: 0.05–0.2.",
     )
     parser.add_argument(
         "--epochs", type=int, default=1, help="Number of training epochs"
@@ -1000,6 +1003,19 @@ def main():
     # > 1.0 forces broader exploration when coverage is poor.
     _adaptive_sigma_mult = 1.0
 
+    # ── Resolve routing diversity weight ──────────────────────────────────────
+    # CLI default is None → fall back to the per-config value so named configs
+    # (e.g. mini_pool) can set routing_diversity_weight in their dataclass and
+    # have it respected without a CLI flag.  An explicit CLI value always wins.
+    if args.routing_diversity_weight is None:
+        args.routing_diversity_weight = float(
+            getattr(config, 'routing_diversity_weight', 0.0)
+        )
+    print(
+        f"[RoutingDiversity] diversity_loss weight = {args.routing_diversity_weight}"
+        + (" (disabled)" if args.routing_diversity_weight == 0.0 else "")
+    )
+
     # ── PRE-WARM JIT BEFORE CHECKPOINT RESTORE ───────────────────────────────
     # Problem: on resume, checkpoint_manager.restore() temporarily doubles HBM
     # usage (old random params + new checkpoint params = ~6.2 GB on mini_pool).
@@ -1028,6 +1044,7 @@ def main():
             loss_chunk_size=getattr(config, 'loss_chunk_size', 0),
             prefetch_reasoning=getattr(config, 'prefetch_reasoning', False),
             prefetch_size=getattr(config, 'prefetch_size', 0),
+            routing_diversity_weight=0.0,
         )
         del _warmup_batch, _warmup_state
         jax.effects_barrier()
