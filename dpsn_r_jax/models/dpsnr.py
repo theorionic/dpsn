@@ -172,12 +172,18 @@ class DPSNR(nn.Module):
             # the first two slots are meaningful; trainer reads [0, :, 0/1].
             H_dim   = max(1, self.config.num_indexer_heads // 2)
             R       = self.config.max_reasoning_loops
+            # Convert patch start indices (grid coords) → normalized mu (0–1) so
+            # the coverage tracker and tensorboard routing stats see real coordinates
+            # instead of zeros (which collapsed everything to hotspot [0, 0]).
+            mu_r_norm = pf_r_start.astype(jnp.float32) / (self.config.pool_grid_rows - 1)
+            mu_c_norm = pf_c_start.astype(jnp.float32) / (self.config.pool_grid_cols - 1)
+            # Tile to (R, B, H_dim) — same shape as all_mu_r in the non-prefetch path.
+            all_mu_r_pf = jnp.tile(mu_r_norm[None, :, None], (R, 1, H_dim))
+            all_mu_c_pf = jnp.tile(mu_c_norm[None, :, None], (R, 1, H_dim))
             dummy_f = jnp.zeros((R, B, H_dim), dtype=jnp.float32)
             dummy_i = jnp.zeros((R, B, H_dim), dtype=jnp.int32)
-            # pf_r_start / pf_c_start are returned directly; dummy_i is a
-            # placeholder for all_start_2d (trainer reads pf_r/c, not this).
             return (state_hidden, all_indices, mean_sigma,
-                    dummy_f, dummy_f, dummy_f, dummy_i,
+                    all_mu_r_pf, all_mu_c_pf, dummy_f, dummy_i,
                     pf_r_start, pf_c_start)
 
         # ── Original path: per-iteration HBM fetching ─────────────────────────
