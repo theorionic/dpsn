@@ -531,6 +531,33 @@ def main():
         ),
     )
     parser.add_argument(
+        "--pool_cross_attention",
+        action="store_true",
+        help=(
+            "Replace the sequential reasoning loop with a single multi-head "
+            "cross-attention pass over pre-fetched pool vectors. "
+            "ONE HBM fetch of pool_patch_size² vectors → (B, T, N) attention. "
+            "High arithmetic intensity: T×N FLOP/byte vs 1 FLOP/byte for Gaussian window. "
+            "Eliminates all sequential scan dependencies."
+        ),
+    )
+    parser.add_argument(
+        "--pool_patch_size",
+        type=int,
+        default=32,
+        help=(
+            "Per-axis patch size for pool cross-attention (total = pool_patch_size²). "
+            "Default 32 → 1024 candidates, ~8 MB/chip on xxl. "
+            "Larger = richer context but more SRAM. 64 → 4096 candidates ~33 MB/chip."
+        ),
+    )
+    parser.add_argument(
+        "--pool_attn_heads",
+        type=int,
+        default=8,
+        help="Number of attention heads for pool cross-attention block. Default 8.",
+    )
+    parser.add_argument(
         "--profile_model",
         action="store_true",
         help=(
@@ -659,6 +686,30 @@ def main():
                 f"[PREFETCH REASONING] WARNING: {_sram_per_chip_mb:.0f} MB/chip "
                 f"may exceed VMEM (128 MB). Consider --prefetch_size 32 or 48."
             )
+
+    if args.pool_cross_attention:
+        config.use_pool_cross_attention = True
+        config.pool_patch_size          = args.pool_patch_size
+        config.pool_attn_num_heads      = args.pool_attn_heads
+        # Reuse prefetch-path sparse Adam: trainer creates candidates_probe
+        # of shape (B, pool_patch_size², D) and uses pf_r_start/pf_c_start.
+        config.prefetch_reasoning = True
+        config.prefetch_size      = args.pool_patch_size
+        _n_chips      = jax.device_count()
+        _b_per_chip   = max(1, args.batch_size // _n_chips)
+        _sram_mb      = (_b_per_chip * args.pool_patch_size ** 2
+                         * config.controller_hidden_dim * 2) / 1e6
+        _n_candidates = args.pool_patch_size ** 2
+        print(
+            f"[POOL CROSS-ATTENTION] Enabled\n"
+            f"  Candidates  : {args.pool_patch_size}×{args.pool_patch_size} "
+            f"= {_n_candidates:,} pool vectors\n"
+            f"  Attn heads  : {args.pool_attn_heads}\n"
+            f"  SRAM/chip   : ~{_sram_mb:.0f} MB  "
+            f"({'OK' if _sram_mb < 100 else 'WARNING: tight'})\n"
+            f"  Reasoning loops replaced: {config.max_reasoning_loops} serial → 1 parallel\n"
+            f"  Expected MFU: ~60-80% (vs ~23% with sequential scan)"
+        )
 
     if args.loss_chunk_size > 0:
         config.loss_chunk_size = args.loss_chunk_size

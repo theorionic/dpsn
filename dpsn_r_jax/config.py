@@ -151,6 +151,20 @@ class DPSNRConfig:
     prefetch_reasoning: bool = False
     prefetch_size: int = 64   # per-axis size; total candidates = prefetch_size²
 
+    # ── Pool Cross-Attention (replaces sequential reasoning loop) ──────────
+    # When True, the sequential lax.scan reasoning loop is replaced by a
+    # single multi-head cross-attention pass over pre-fetched pool vectors.
+    # ONE HBM fetch (pool_patch_size × pool_patch_size vectors), then a
+    # dense (B, T, N) attention kernel — high arithmetic intensity, fully
+    # parallel, no sequential dependencies.
+    #
+    # Requires prefetch_reasoning=True (set automatically via --pool_cross_attention).
+    # pool_patch_size replaces prefetch_size; pool_attn_num_heads is independent
+    # of the controller's num_heads.
+    use_pool_cross_attention: bool = False
+    pool_patch_size: int = 32     # per-axis patch; total candidates = pool_patch_size²
+    pool_attn_num_heads: int = 8  # heads for the pool cross-attention block
+
     # ── Splash Attention (Pallas TPU kernel) ───────────────────────────────
     # When True, FlashCausalSelfAttention uses splash_attention (Pallas TPU)
     # instead of Flax's nn.dot_product_attention.

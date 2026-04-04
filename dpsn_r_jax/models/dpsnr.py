@@ -16,6 +16,56 @@ from dpsn_r_jax.utils.component_timer import ctimer
 DEBUG_REASONING_LOOPS: bool = False
 
 
+class PoolCrossAttention(nn.Module):
+    """Multi-head cross-attention: full sequence attends to pre-fetched pool vectors.
+
+    Q = hidden_states  (B, T, D)  — the full encoded sequence
+    K = V = pool_vecs  (B, N, D)  — pre-fetched pool candidates (SRAM-resident)
+
+    Arithmetic intensity: T × N × D FLOPs / (N × D bytes) = T FLOP/byte.
+    Compare to old Gaussian window: 1 FLOP/byte.
+    At T=512: ~512× higher intensity → TPU compute-bound instead of memory-bound.
+
+    Every token attends to all N candidates simultaneously. Different attention
+    heads naturally specialise in different pool regions — multi-topic routing
+    emerges without any explicit routing loss.
+    """
+    hidden_dim: int
+    num_heads: int
+
+    @nn.compact
+    def __call__(self, hidden, pool_vecs, deterministic=True):
+        # hidden:    (B, T, D)
+        # pool_vecs: (B, N, D)
+        B, T, D = hidden.shape
+        N = pool_vecs.shape[1]
+        head_dim = D // self.num_heads
+
+        init = nn.initializers.normal(stddev=0.02)
+        Q = nn.Dense(D, use_bias=False, kernel_init=init)(hidden)      # (B, T, D)
+        K = nn.Dense(D, use_bias=False, kernel_init=init)(pool_vecs)   # (B, N, D)
+        V = nn.Dense(D, use_bias=False, kernel_init=init)(pool_vecs)   # (B, N, D)
+
+        # → (B, H, seq, head_dim)
+        Q = Q.reshape(B, T, self.num_heads, head_dim).transpose(0, 2, 1, 3)
+        K = K.reshape(B, N, self.num_heads, head_dim).transpose(0, 2, 1, 3)
+        V = V.reshape(B, N, self.num_heads, head_dim).transpose(0, 2, 1, 3)
+
+        # Scaled dot-product (no causal mask — pool is not sequential)
+        scale = jnp.float32(head_dim ** -0.5)
+        attn = jnp.einsum(
+            'bhqd,bhkd->bhqk',
+            Q.astype(jnp.float32), K.astype(jnp.float32)
+        ) * scale                                              # (B, H, T, N)
+        attn = jax.nn.softmax(attn, axis=-1).astype(hidden.dtype)
+
+        out = jnp.einsum('bhqk,bhkd->bhqd', attn, V)         # (B, H, T, head_dim)
+        out = out.transpose(0, 2, 1, 3).reshape(B, T, D)      # (B, T, D)
+        out = nn.Dense(D, kernel_init=init)(out)               # output projection
+
+        return nn.LayerNorm()(hidden + out)                    # residual + norm
+
+
 class DPSNR(nn.Module):
     config: DPSNRConfig
 
@@ -65,6 +115,12 @@ class DPSNR(nn.Module):
         if self.config.prefetch_reasoning:
             self.prefetch_query_attn = nn.Dense(1, use_bias=False)
             self.prefetch_query_proj = nn.Dense(self.config.controller_hidden_dim)
+
+        if self.config.use_pool_cross_attention:
+            self.pool_cross_attn = PoolCrossAttention(
+                hidden_dim=self.config.controller_hidden_dim,
+                num_heads=self.config.pool_attn_num_heads,
+            )
 
     def __call__(self, input_ids, deterministic=True, sigma_max_scale: float = 1.0,
                  seq_pack_ids=None):
@@ -156,6 +212,15 @@ class DPSNR(nn.Module):
 
         # 2. Reasoning Loop — branch on prefetch_reasoning flag
         B, T, D = hidden.shape
+
+        if self.config.use_pool_cross_attention:
+            # ── Cross-attention path: one HBM fetch, one attention pass ─────
+            # Replaces the sequential lax.scan reasoning loop.
+            # Returns same 9-tuple format as the prefetch and standard paths.
+            with jax.profiler.TraceAnnotation("PoolCrossAttention"):
+                return self._cross_attn_encode(hidden, sigma_max_scale,
+                                               deterministic=deterministic,
+                                               candidates_probe=candidates_probe)
 
         if self.config.prefetch_reasoning:
             # ── Prefetch path: one HBM fetch, all loops read from SRAM ───────
@@ -639,3 +704,90 @@ class DPSNR(nn.Module):
 
         mean_sigma = jnp.mean(sigma_init)
         return state_hidden, all_indices, mean_sigma, patch_r_start, patch_c_start
+
+    def _cross_attn_encode(self, hidden, sigma_max_scale: float = 1.0,
+                           deterministic: bool = False,
+                           candidates_probe=None):
+        """Pool cross-attention encoder: ONE HBM fetch + one attention pass.
+
+        Replaces the sequential lax.scan reasoning loop entirely.
+
+        Steps
+        ─────
+        1. Single indexer forward pass → (mu_r, mu_c) pool coordinates.
+        2. ONE lax.dynamic_slice: fetch pool_patch_size² vectors from HBM.
+        3. Inject candidates_probe (zero tensor) for sparse-Adam gradient path.
+        4. Multi-head cross-attention: Q=hidden(B,T,D), K/V=candidates(B,N,D).
+           All T tokens attend to all N candidates in a single fused kernel.
+        5. Return 9-tuple compatible with the non-prefetch _encode_hidden format.
+
+        Args:
+            hidden:           (B, T, D) — controller output.
+            sigma_max_scale:  Sigma annealing multiplier.
+            deterministic:    False during training (enables dropout).
+            candidates_probe: (B, pool_patch_size², D) zero tensor for sparse Adam.
+
+        Returns:
+            9-tuple identical in structure to the prefetch path:
+            (state_hidden, all_indices, mean_sigma,
+             all_mu_r, all_mu_c, dummy_f, dummy_i,
+             patch_r_start, patch_c_start)
+        """
+        B, T, D = hidden.shape
+        model_dtype = hidden.dtype
+        H = self.config.num_indexer_heads
+        PS = self.config.pool_patch_size
+
+        # ── 1. Single indexer pass ─────────────────────────────────────────────
+        mu, sigma = self.indexer(
+            hidden, sigma_max_scale=sigma_max_scale, deterministic=deterministic
+        )
+        # mu: (B, H), sigma: (B, H)
+        ctimer.mark("04_indexer_done", mu)
+
+        heads_per_dim = max(1, H // 2)
+        mu_r = mu[:, 0]
+        mu_c = mu[:, min(heads_per_dim, H - 1)]
+
+        # ── 2. ONE HBM fetch ───────────────────────────────────────────────────
+        with jax.profiler.TraceAnnotation("PoolCrossAttn_HBM_Fetch"):
+            candidates_2d, patch_r_start, patch_c_start = self.pool.fetch_patch_2d(
+                mu_r, mu_c, PS
+            )
+        # candidates_2d: (B, PS, PS, D) bfloat16
+        K_total = PS * PS
+        candidates = candidates_2d.reshape(B, K_total, D).astype(model_dtype)
+        ctimer.mark("05_pool_retrieval_done", candidates)
+
+        # ── 3. Probe injection for sparse Adam ────────────────────────────────
+        if candidates_probe is not None:
+            candidates = candidates + candidates_probe.astype(model_dtype)
+
+        # ── 4. Multi-head cross-attention (single pass, no loop) ──────────────
+        with jax.profiler.TraceAnnotation("PoolCrossAttn_Attention"):
+            state_hidden = self.pool_cross_attn(hidden, candidates, deterministic=deterministic)
+        ctimer.mark("08_all_reasoning_loops_done", state_hidden)
+
+        # ── 5. Build return tuple (same format as prefetch / non-prefetch paths) ─
+        mean_sigma = jnp.mean(sigma)
+
+        # all_indices: (B, 1) flat patch-start indices for coverage tracking
+        flat_start = patch_r_start * self.config.pool_grid_cols + patch_c_start
+        all_indices = flat_start[:, None]   # (B, 1)
+
+        # all_mu_r / all_mu_c: (1, B, H_dim) — single loop equivalent
+        mu_r_norm = patch_r_start.astype(jnp.float32) / jnp.float32(
+            max(1, self.config.pool_grid_rows - 1)
+        )
+        mu_c_norm = patch_c_start.astype(jnp.float32) / jnp.float32(
+            max(1, self.config.pool_grid_cols - 1)
+        )
+        H_dim = max(1, H // 2)
+        all_mu_r = jnp.tile(mu_r_norm[:, None], (1, H_dim))[None]   # (1, B, H_dim)
+        all_mu_c = jnp.tile(mu_c_norm[:, None], (1, H_dim))[None]   # (1, B, H_dim)
+        dummy_f  = jnp.zeros((1, B, H_dim), dtype=jnp.float32)
+        dummy_i  = jnp.zeros((1, B, H_dim), dtype=jnp.int32)
+
+        return (state_hidden, all_indices, mean_sigma,
+                all_mu_r, all_mu_c, dummy_f, dummy_i,
+                patch_r_start, patch_c_start)
