@@ -411,7 +411,10 @@ class DPSNR(nn.Module):
         else:
             init_carry = (state_hidden, halt_prob, halted_mask)
 
-        _unroll = min(2, self.config.max_reasoning_loops)
+        # Full unroll: XLA sees all iterations simultaneously and can fuse kernels
+        # across loops. Was min(2, ...) which split 6 iterations into 3 batches
+        # with synchronization barriers between them.
+        _unroll = self.config.max_reasoning_loops
         final_carry, (all_indices, sigma_per_loop, all_mu_r, all_mu_c, all_sigma_h, all_start_2d,
                       loop_halt_rates, loop_ret_norms, loop_hid_norms) = jax.lax.scan(
             _scan_fn,
@@ -609,7 +612,7 @@ class DPSNR(nn.Module):
         if self.config.gradient_checkpointing:
             _scan_fn = jax.checkpoint(prefetch_step)
 
-        _unroll = min(2, self.config.max_reasoning_loops)
+        _unroll = self.config.max_reasoning_loops  # full unroll for kernel fusion
         (state_hidden, _, _, _), _ = jax.lax.scan(
             _scan_fn,
             (hidden, halt_prob, halted_mask, candidates),
