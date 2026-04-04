@@ -485,6 +485,14 @@ def get_model_config(name: str) -> DPSNRConfig:
             pool_super_window_factor=2,
             # ── Learning rate ─────────────────────────────────────────────────
             learning_rate=2e-4,
+            # ── Anti-collapse: routing diversity losses ───────────────────────
+            # routing_diversity_weight drives BOTH the per-batch histogram entropy
+            # loss (all items spread across pool) AND the cross-loop diversity loss
+            # (each item explores different coordinates across reasoning iterations).
+            # 0.3 is needed to overcome the positive-feedback loop that causes
+            # corner collapse: once a corner is trained it becomes more attractive,
+            # requiring a strong gradient to push the indexer away.
+            routing_diversity_weight=0.3,
         )
 
     else:
