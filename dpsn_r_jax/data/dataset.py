@@ -4,6 +4,14 @@ import queue
 import time
 import gc
 import multiprocessing as mp
+import os
+import logging
+import warnings
+logging.getLogger("huggingface_hub.utils._http").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore", message=".*unauthenticated requests.*")
+
+if mp.current_process().name != "MainProcess":
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 from itertools import islice
 import numpy as np
 import jax.numpy as jnp
@@ -630,8 +638,12 @@ class ChunkedHFDataset:
 
         if n_workers > 1:
             ctx = mp.get_context("spawn")  # safe with JAX / existing threads
-            with ctx.Pool(processes=n_workers) as pool:
+            pool = ctx.Pool(processes=n_workers)
+            try:
                 results = pool.map(_tokenize_texts_worker, sub_batches)
+            finally:
+                pool.close()
+                pool.join()
         else:
             results = [_tokenize_texts_worker(b) for b in sub_batches]
 
