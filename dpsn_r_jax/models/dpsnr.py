@@ -162,6 +162,7 @@ class DPSNR(nn.Module):
             with jax.profiler.TraceAnnotation("PrefetchReasoning"):
                 state_hidden, all_indices, mean_sigma, pf_r_start, pf_c_start = (
                     self._prefetch_encode(hidden, sigma_max_scale,
+                                         deterministic=deterministic,
                                          candidates_probe=candidates_probe)
                 )
             ctimer.mark("08_all_reasoning_loops_done", state_hidden)
@@ -453,6 +454,7 @@ class DPSNR(nn.Module):
     # ─────────────────────────────────────────────────────────────────────────
 
     def _prefetch_encode(self, hidden, sigma_max_scale: float = 1.0,
+                         deterministic: bool = False,
                          candidates_probe=None):
         """Prefetch-once, reason-in-SRAM encoding path.
 
