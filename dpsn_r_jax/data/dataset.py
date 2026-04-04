@@ -14,7 +14,6 @@ if mp.current_process().name != "MainProcess":
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 from itertools import islice
 import numpy as np
-import jax.numpy as jnp
 from typing import List, Optional
 from datasets import load_dataset
 from .tokenizer import SimpleNumberTokenizer
@@ -601,26 +600,20 @@ class ChunkedHFDataset:
         # ── One call, no Python-level loop — grabs exactly chunk_size rows ──
         raw: List[dict] = list(islice(self._hf_iter, self.chunk_size))
 
-        if not raw:
-            # Iterator exhausted right at a boundary — restart and try once more
-            print(
-                "[ChunkedHFDataset] End of dataset reached; "
-                "restarting stream from the beginning."
-            )
-            self._hf_iter = self._make_iterator()
-            raw = list(islice(self._hf_iter, self.chunk_size))
-            if not raw:
-                return None  # dataset has zero usable rows
-
-        elif len(raw) < self.chunk_size:
-            # Iterator ran out mid-chunk — restart and top up the remainder
+        while len(raw) < self.chunk_size:
             shortage = self.chunk_size - len(raw)
-            print(
-                f"[ChunkedHFDataset] Dataset exhausted after {len(raw):,} rows; "
-                f"restarting to collect {shortage:,} more."
-            )
+            if len(raw) == 0:
+                print("[ChunkedHFDataset] End of dataset reached; restarting stream from the beginning.")
+            else:
+                print(f"[ChunkedHFDataset] Dataset exhausted after {len(raw):,} rows; restarting to collect {shortage:,} more.")
+            
             self._hf_iter = self._make_iterator()
-            raw += list(islice(self._hf_iter, shortage))
+            new_rows = list(islice(self._hf_iter, shortage))
+            if not new_rows:
+                if not raw:
+                    return None
+                break
+            raw.extend(new_rows)
 
         texts: List[str] = list(filter(None, (self._extract_text(item) for item in raw)))
 

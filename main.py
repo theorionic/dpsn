@@ -1425,6 +1425,7 @@ def main():
     tokens_per_sec = 0.0
     tflops = 0.0
     total_data_wait_time_interval = 0.0
+    total_dispatch_time_interval = 0.0
 
     # ── Helper: run training steps on a data pipeline ──────────────────────
     def _run_training_steps(dataset_pipeline, state, global_step, epoch,
@@ -1445,6 +1446,7 @@ def main():
         hit_max_steps = False
         last_batch = None          # saved for component timing
         _timing_compiled = False   # skip first timing call (includes JIT compile)
+        total_dispatch_time_interval = 0.0  # accumulated host-dispatch time per LOG_INTERVAL
 
         for step in range(steps_per_epoch):
             if _stop_requested[0]:
@@ -1593,6 +1595,7 @@ def main():
                 _stop_requested[0] = True
                 break
             dispatch_time = time.time() - dispatch_start_time
+            total_dispatch_time_interval += dispatch_time
 
             # ── Detailed per-step timing breakdown (--profile_detailed) ──────
             # Forces a host/device sync every step — this WILL reduce throughput
@@ -1703,8 +1706,9 @@ def main():
                 elapsed = current_time - start_time
 
                 steps_in_interval = LOG_INTERVAL if step > 0 else 1
-                avg_step_time = elapsed / steps_in_interval
-                avg_data_wait = total_data_wait_time_interval / steps_in_interval
+                avg_step_time   = elapsed / steps_in_interval
+                avg_data_wait   = total_data_wait_time_interval / steps_in_interval
+                avg_dispatch    = total_dispatch_time_interval / steps_in_interval
 
                 active_tpu_time = max(0.0001, avg_step_time - avg_data_wait)
 
@@ -1803,6 +1807,33 @@ def main():
                     f"sigma={sigma_val:.3f} ({precision_tag}) | GradNorm: {grad_norm_val:.2e} | "
                     f"TPS: {tokens_per_sec:.0f} | SPS: {steps_per_sec:.3f} | "
                     f"TFLOPS: {tflops:.4f} | DataWait: {avg_data_wait:.3f}s"
+                )
+
+                # ── Compact phase-timing breakdown (one line per LOG_INTERVAL) ────
+                # Shows where wall-clock time goes: data pipeline, Python dispatch
+                # overhead, and pure TPU execution.  The reasoning_loop count is
+                # shown explicitly so slow-loop vs slow-decode bottlenecks are obvious.
+                _avg_tpu_ms     = max(0.0, avg_step_time - avg_data_wait - avg_dispatch) * 1000.0
+                _avg_data_ms    = avg_data_wait * 1000.0
+                _avg_dispatch_ms = avg_dispatch * 1000.0
+                _avg_step_ms    = avg_step_time * 1000.0
+                _R              = config.max_reasoning_loops
+                _data_pct       = 100.0 * _avg_data_ms    / max(_avg_step_ms, 0.001)
+                _dispatch_pct   = 100.0 * _avg_dispatch_ms / max(_avg_step_ms, 0.001)
+                _tpu_pct        = 100.0 * _avg_tpu_ms     / max(_avg_step_ms, 0.001)
+                _bottleneck     = (
+                    "DATA"     if _data_pct > 20 else
+                    "DISPATCH" if _dispatch_pct > 10 else
+                    "TPU-COMPUTE"
+                )
+                print(
+                    f"[Timing/{steps_in_interval}steps] "
+                    f"step={_avg_step_ms:.0f}ms | "
+                    f"data={_avg_data_ms:.1f}ms({_data_pct:.0f}%) | "
+                    f"dispatch={_avg_dispatch_ms:.1f}ms({_dispatch_pct:.0f}%) | "
+                    f"tpu={_avg_tpu_ms:.0f}ms({_tpu_pct:.0f}%) | "
+                    f"reasoning_loops={_R}/step | "
+                    f"bottleneck={_bottleneck}"
                 )
 
                 # ── Roofline: MXU compute utilisation vs HBM bandwidth pressure ───
@@ -1958,6 +1989,7 @@ def main():
             if step % LOG_INTERVAL == 0:
                 start_time = time.time()
                 total_data_wait_time_interval = 0.0
+                total_dispatch_time_interval = 0.0
 
         return state, global_step, epoch_loss, start_time, total_data_wait_time_interval, hit_max_steps
 

@@ -341,23 +341,13 @@ class DPSNR(nn.Module):
             # ── Mean sigma for logging and precision loss ─────────────────────
             mean_sigma_step = jnp.mean(sigma)
 
-            # ── Per-iteration diagnostic print (always on when ctimer enabled,
-            #    or when DEBUG_REASONING_LOOPS is True).
-            #    jax.debug.print is the ONLY way to print tensor values inside
-            #    jax.jit / jax.lax.scan — normal print() runs at trace time only.
-            if DEBUG_REASONING_LOOPS or ctimer.enabled:
-                halt_rate      = jnp.mean(h_mask)
-                retrieved_norm = jnp.sqrt(jnp.mean(retrieved ** 2))
-                hidden_norm    = jnp.sqrt(jnp.mean(s_hidden ** 2))
-                jax.debug.print(
-                    "[ReasoningLoop] iter={i} | sigma={sigma:.4f} | "
-                    "halt_rate={halt:.3f} | retrieved_l2={ret:.4f} | hidden_l2={hid:.4f}",
-                    i=i,
-                    sigma=mean_sigma_step,
-                    halt=halt_rate,
-                    ret=retrieved_norm,
-                    hid=hidden_norm,
-                )
+            # ── Per-loop stats collected as scan outputs (cheap scalars).
+            #    These replace the old per-iteration jax.debug.print that fired
+            #    once per loop (e.g. 6× per step).  A single summary is printed
+            #    AFTER the scan using the aggregated arrays — see below.
+            loop_halt_rate      = jnp.mean(h_mask.astype(jnp.float32))
+            loop_retrieved_norm = jnp.sqrt(jnp.mean(retrieved.astype(jnp.float32) ** 2))
+            loop_hidden_norm    = jnp.sqrt(jnp.mean(s_hidden.astype(jnp.float32) ** 2))
 
             # ── 3. Integrate retrieved knowledge ───────────────────────────────
             # retrieved_expanded is added DIRECTLY to the update target (not just
@@ -399,7 +389,8 @@ class DPSNR(nn.Module):
             else:
                 new_carry = (s_hidden, h_prob, new_h_mask)
 
-            return new_carry, (start_indices, mean_sigma_step, mu_r, mu_c, sigma_h, start_all)
+            return new_carry, (start_indices, mean_sigma_step, mu_r, mu_c, sigma_h, start_all,
+                               loop_halt_rate, loop_retrieved_norm, loop_hidden_norm)
 
         # ── Optional gradient checkpointing on reasoning_step ─────────────────
         # The old tracer-leak (TracerBoolConversionError) was because the
@@ -421,7 +412,8 @@ class DPSNR(nn.Module):
             init_carry = (state_hidden, halt_prob, halted_mask)
 
         _unroll = min(2, self.config.max_reasoning_loops)
-        final_carry, (all_indices, sigma_per_loop, all_mu_r, all_mu_c, all_sigma_h, all_start_2d) = jax.lax.scan(
+        final_carry, (all_indices, sigma_per_loop, all_mu_r, all_mu_c, all_sigma_h, all_start_2d,
+                      loop_halt_rates, loop_ret_norms, loop_hid_norms) = jax.lax.scan(
             _scan_fn,
             init_carry,
             jnp.arange(self.config.max_reasoning_loops),
@@ -435,6 +427,23 @@ class DPSNR(nn.Module):
 
         # ── Timing mark: all reasoning loop iterations complete ───────────────
         ctimer.mark("08_all_reasoning_loops_done", state_hidden)
+
+        # ── Single compact summary for all N reasoning loops ─────────────────
+        # Replaces the old per-iteration jax.debug.print that fired N times.
+        # Fires once per step: "N loops | sigma avg/min/max | halt | norms"
+        if DEBUG_REASONING_LOOPS or ctimer.enabled:
+            R = self.config.max_reasoning_loops
+            jax.debug.print(
+                "[Reasoning {R} loops] sigma avg={s_avg:.3f} [{s_min:.3f}..{s_max:.3f}] | "
+                "halt_rate avg={h_avg:.3f} | retrieved_l2 avg={r_avg:.4f} | hidden_l2 avg={hid_avg:.4f}",
+                R=R,
+                s_avg=jnp.mean(sigma_per_loop),
+                s_min=jnp.min(sigma_per_loop),
+                s_max=jnp.max(sigma_per_loop),
+                h_avg=jnp.mean(loop_halt_rates),
+                r_avg=jnp.mean(loop_ret_norms),
+                hid_avg=jnp.mean(loop_hid_norms),
+            )
 
         # all_indices: (max_loops, heads*B) → transpose to (B*heads, max_loops)
         all_indices = jnp.transpose(all_indices, (1, 0))
