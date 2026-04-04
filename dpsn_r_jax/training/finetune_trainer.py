@@ -304,7 +304,7 @@ def validation_step(
 
 
 def save_checkpoint(
-    state: FineTuneState, checkpoint_dir: str, step: int, max_to_keep: int = 3
+    state: FineTuneState, checkpoint_dir: str, step: int, max_to_keep: int = 2
 ):
     orbax_save_checkpoint(checkpoint_dir, state, step, max_to_keep=max_to_keep)
 

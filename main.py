@@ -455,8 +455,8 @@ def main():
     parser.add_argument(
         "--max_checkpoints",
         type=int,
-        default=5,
-        help="Max number of checkpoints to keep. Default: 5.",
+        default=2,
+        help="Max number of checkpoints to keep. Default: 2.",
     )
     parser.add_argument(
         "--profile_components",
@@ -838,11 +838,11 @@ def main():
             options,
         )
 
-    # Separate checkpointer for best-val-loss checkpoint
+    # Separate checkpointer for best-val-loss checkpoint (Disabled to save storage)
     _best_val_loss = float('inf')
     _best_val_step = 0
-    _best_ckpt_dir = os.path.join(os.path.abspath(args.checkpoint_dir), "best") if args.checkpoint_dir else None
-    _best_checkpointer = orbax.checkpoint.PyTreeCheckpointer() if _best_ckpt_dir else None
+    _best_ckpt_dir = None
+    _best_checkpointer = None
 
     # Initialize state with sharding constraints
     # We first create the raw variables distributedly
@@ -1575,9 +1575,11 @@ def main():
             # block_until_ready() has already stalled, so there's no extra sync.
             _last_mu_r, _last_mu_c = all_mu_r, all_mu_c
 
-            # ── NaN/Inf guard ─────────────────────────────────────────────────
-            # jnp.isnan/isinf on a future is safe — triggers D2H only when needed.
-            # Checked AFTER appending futures so the TPU pipeline stays full.
+            # Measure dispatch time HERE — after the JIT call returns but before
+            # the NaN check, which calls bool() and forces a D2H sync that would
+            # otherwise inflate dispatch_time to include full TPU execution time.
+            dispatch_time = time.time() - dispatch_start_time
+            total_dispatch_time_interval += dispatch_time
 
             # Bug #1 Fix: append JAX futures — NO float() / .item() here!
             # These are enqueued as async device operations; the TPU keeps running.
@@ -1594,8 +1596,6 @@ def main():
                     checkpoint_manager.wait_until_finished()
                 _stop_requested[0] = True
                 break
-            dispatch_time = time.time() - dispatch_start_time
-            total_dispatch_time_interval += dispatch_time
 
             # ── Detailed per-step timing breakdown (--profile_detailed) ──────
             # Forces a host/device sync every step — this WILL reduce throughput
@@ -1686,15 +1686,15 @@ def main():
                         writer.add_scalar("PPL/val",  _val_ppl,  global_step)
 
                         # Save best checkpoint
-                        if _val_loss < _best_val_loss and _best_checkpointer and _best_ckpt_dir:
-                            _best_val_loss = _val_loss
-                            _best_val_step = global_step
-                            os.makedirs(_best_ckpt_dir, exist_ok=True)
-                            _best_ckpt_path = os.path.join(_best_ckpt_dir, "best")
-                            if os.path.exists(_best_ckpt_path):
-                                shutil.rmtree(_best_ckpt_path)
-                            _best_checkpointer.save(_best_ckpt_path, state)
-                            print(f"[Val] ✓ New best val loss {_val_loss:.4f} — saved best checkpoint to {_best_ckpt_dir}")
+                        # if _val_loss < _best_val_loss and _best_checkpointer and _best_ckpt_dir:
+                        #     _best_val_loss = _val_loss
+                        #     _best_val_step = global_step
+                        #     os.makedirs(_best_ckpt_dir, exist_ok=True)
+                        #     _best_ckpt_path = os.path.join(_best_ckpt_dir, "best")
+                        #     if os.path.exists(_best_ckpt_path):
+                        #         shutil.rmtree(_best_ckpt_path)
+                        #     _best_checkpointer.save(_best_ckpt_path, state)
+                        #     print(f"[Val] ✓ New best val loss {_val_loss:.4f} — saved best checkpoint to {_best_ckpt_dir}")
 
             if step % LOG_INTERVAL == 0:
                 # Bug #1 Fix: ONE blocking sync per LOG_INTERVAL steps.

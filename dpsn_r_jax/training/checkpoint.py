@@ -82,7 +82,7 @@ def get_sharding_spec(
 
 def create_checkpoint_manager(
     checkpoint_dir: str,
-    max_to_keep: int = 3,
+    max_to_keep: int = 2,
     create: bool = True,
 ) -> ocp.CheckpointManager:
     """Create an Orbax checkpoint manager.
@@ -112,7 +112,7 @@ def save_checkpoint(
     checkpoint_dir: str,
     state: train_state.TrainState,
     step: int,
-    max_to_keep: int = 3,
+    max_to_keep: int = 2,
     async_save: bool = False,
 ) -> None:
     """Save a training state checkpoint.

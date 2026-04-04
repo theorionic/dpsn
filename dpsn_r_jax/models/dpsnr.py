@@ -428,22 +428,10 @@ class DPSNR(nn.Module):
         # ── Timing mark: all reasoning loop iterations complete ───────────────
         ctimer.mark("08_all_reasoning_loops_done", state_hidden)
 
-        # ── Single compact summary for all N reasoning loops ─────────────────
-        # Replaces the old per-iteration jax.debug.print that fired N times.
-        # Fires once per step: "N loops | sigma avg/min/max | halt | norms"
-        if DEBUG_REASONING_LOOPS or ctimer.enabled:
-            R = self.config.max_reasoning_loops
-            jax.debug.print(
-                "[Reasoning {R} loops] sigma avg={s_avg:.3f} [{s_min:.3f}..{s_max:.3f}] | "
-                "halt_rate avg={h_avg:.3f} | retrieved_l2 avg={r_avg:.4f} | hidden_l2 avg={hid_avg:.4f}",
-                R=R,
-                s_avg=jnp.mean(sigma_per_loop),
-                s_min=jnp.min(sigma_per_loop),
-                s_max=jnp.max(sigma_per_loop),
-                h_avg=jnp.mean(loop_halt_rates),
-                r_avg=jnp.mean(loop_ret_norms),
-                hid_avg=jnp.mean(loop_hid_norms),
-            )
+        # Reasoning loop stats (sigma_per_loop, loop_halt_rates, loop_ret_norms,
+        # loop_hid_norms) are computed above as scan outputs.  mean_sigma is
+        # returned from this function and printed on the host at LOG_INTERVAL.
+        # No jax.debug.print here — host callbacks inside JIT serialize dispatch.
 
         # all_indices: (max_loops, heads*B) → transpose to (B*heads, max_loops)
         all_indices = jnp.transpose(all_indices, (1, 0))
