@@ -79,10 +79,18 @@ def load_yaml_config(path):
         flat["config"] = model["config"]
     if "num_kv_heads" in model:
         flat["num_kv_heads"] = model["num_kv_heads"]
+    if "sigma_anneal_steps" in model:
+        flat["sigma_anneal_steps"] = model["sigma_anneal_steps"]
+    if "routing_diversity_weight" in model:
+        flat["routing_diversity_weight"] = model["routing_diversity_weight"]
+    if "gradient_checkpointing" in model:
+        flat["gradient_checkpointing"] = model["gradient_checkpointing"]
     training = cfg.get("training", {})
     for key in ("max_steps", "batch_size", "grad_accum_steps", "loss_chunk_size",
                 "bf16", "log_interval", "save_interval", "max_checkpoints",
-                "generation_steps", "generation_max_tokens", "custom_prompts"):
+                "generation_steps", "generation_max_tokens", "custom_prompts",
+                "warmup_steps", "lr_scheduler_type", "pack_sequences",
+                "max_duration_minutes"):
         if key in training:
             flat[key] = training[key]
     data = cfg.get("data", {})
@@ -113,10 +121,23 @@ def load_yaml_config(path):
         "tp_size": "tp_size",
         "coverage_threshold": "coverage_threshold",
         "resume": "resume",
+        "timing_interval": "timing_interval",
     }
     for src, dst in _infra_map.items():
         if src in infra:
             flat[dst] = infra[src]
+    # ── Pool section: prefetch-reasoning and pool cross-attention settings ────
+    pool = cfg.get("pool", {})
+    _pool_map = {
+        "cross_attention":    "pool_cross_attention",
+        "patch_size":         "pool_patch_size",
+        "attn_heads":         "pool_attn_heads",
+        "prefetch_reasoning": "prefetch_reasoning",
+        "prefetch_size":      "prefetch_size",
+    }
+    for src, dst in _pool_map.items():
+        if src in pool:
+            flat[dst] = pool[src]
     return flat
 
 
