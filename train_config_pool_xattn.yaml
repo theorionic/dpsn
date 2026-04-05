@@ -22,12 +22,13 @@ model:
   routing_diversity_weight: 0.05  # entropy loss to prevent pool collapse
 
 training:
+  max_steps: 500000
   batch_size: 32
   grad_accum_steps: 1
-  loss_chunk_size: 16             # chunked LM head to avoid (B,T,V) materialisation
+  loss_chunk_size: 64             # chunked LM head to avoid (B,T,V) materialisation
   bf16: true
   log_interval: 50
-  save_interval: 2000
+  save_interval: 1000
   max_checkpoints: 3
   warmup_steps: 500
   generation_steps: 2000
@@ -42,6 +43,7 @@ data:
   chunk_size: 50000
   num_workers: 4
   epochs: 1
+  dataset_size: 1290261453
   datasets:
     - name: "openbmb/Ultra-FineWeb"
       subset: "default"
