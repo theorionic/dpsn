@@ -15,7 +15,7 @@
 # CLI args always override YAML values.
 
 model:
-  config: 8k-ds                  # 1024×1024 pool, D=1024, 6 controller layers
+  config: pool_xattn             # 1024×1024 pool + cross-attention, D=1024, 6 layers
   num_kv_heads: 4                 # GQA: 4 KV heads shared across query heads
   gradient_checkpointing: false   # set true if OOM on backward pass
   sigma_anneal_steps: 50000       # broad→precise routing over first 50k steps

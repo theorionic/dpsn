@@ -509,6 +509,65 @@ def get_model_config(name: str) -> DPSNRConfig:
             routing_diversity_weight=0.3,
         )
 
+    elif name == "pool_xattn":
+        # ── Pool Cross-Attention config ────────────────────────────────────────
+        #
+        # Based on mini_pool but replaces the 6-iteration sequential reasoning
+        # scan with a single multi-head cross-attention pass over a pre-fetched
+        # pool patch.  This eliminates 5 of the 6 HBM round-trips and raises
+        # arithmetic intensity from ~1 FLOP/byte to ~T FLOP/byte (~512× at T=512).
+        #
+        # Key differences from mini_pool:
+        #   - use_pool_cross_attention=True  → _cross_attn_encode path
+        #   - prefetch_reasoning=True        → triggers sparse Adam probe
+        #   - pool_patch_size=32             → fetch 32×32=1024 vectors per step
+        #   - pool_attn_num_heads=8          → head_dim = 1024/8 = 128 (MXU-aligned)
+        #   - gradient_checkpointing=False   → cross-attn path is compute-bound,
+        #                                      remat would hurt more than help
+        #   - routing_diversity_weight=0.05  → lighter than mini_pool's 0.3;
+        #                                      cross-attn attends softly so hard
+        #                                      collapse is structurally prevented
+        return DPSNRConfig(
+            vocab_size=8192,
+            controller_hidden_dim=1024,
+            controller_num_layers=6,
+            controller_num_heads=8,
+            controller_ff_multiplier=4.0,
+            max_seq_len=4096,
+            attn_window_size=512,
+            dropout=0.0,
+            # ── Indexer ───────────────────────────────────────────────────────
+            indexer_hidden_dim=10240,
+            num_indexer_heads=8,
+            sigma_min=0.005,
+            sigma_max=5.0,
+            sigma_anneal_steps=50_000,
+            sigma_target=0.5,
+            precision_loss_weight=0.0,
+            # ── Pool ──────────────────────────────────────────────────────────
+            pool_grid_rows=1024,
+            pool_grid_cols=1024,
+            pool_hidden_dim=1024,
+            pool_total_vectors=1024 * 1024,
+            max_k=64,
+            max_reasoning_loops=6,
+            min_reasoning_loops=2,
+            # ── Pool Cross-Attention (the key change) ─────────────────────────
+            use_pool_cross_attention=True,
+            prefetch_reasoning=True,      # enables sparse Adam probe in trainer
+            pool_patch_size=32,           # 32×32=1024 candidates per step
+            pool_attn_num_heads=8,        # head_dim=128, MXU-aligned
+            # ── Memory & compute ──────────────────────────────────────────────
+            gradient_checkpointing=False,
+            use_bf16=True,
+            use_flash_attention=True,
+            loss_chunk_size=64,
+            pool_super_window_factor=2,
+            # ── Optimiser ─────────────────────────────────────────────────────
+            learning_rate=2e-4,
+            routing_diversity_weight=0.05,
+        )
+
     else:
         raise ValueError(f"Unknown config name: {name}")
 
