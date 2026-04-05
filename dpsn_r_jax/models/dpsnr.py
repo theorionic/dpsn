@@ -46,21 +46,20 @@ class PoolCrossAttention(nn.Module):
         K = nn.Dense(D, use_bias=False, kernel_init=init)(pool_vecs)   # (B, N, D)
         V = nn.Dense(D, use_bias=False, kernel_init=init)(pool_vecs)   # (B, N, D)
 
-        # → (B, H, seq, head_dim)
-        Q = Q.reshape(B, T, self.num_heads, head_dim).transpose(0, 2, 1, 3)
-        K = K.reshape(B, N, self.num_heads, head_dim).transpose(0, 2, 1, 3)
-        V = V.reshape(B, N, self.num_heads, head_dim).transpose(0, 2, 1, 3)
+        # → (B, seq, H, head_dim) — layout expected by dot_product_attention
+        Q = Q.reshape(B, T, self.num_heads, head_dim)
+        K = K.reshape(B, N, self.num_heads, head_dim)
+        V = V.reshape(B, N, self.num_heads, head_dim)
 
-        # Scaled dot-product (no causal mask — pool is not sequential)
-        scale = jnp.float32(head_dim ** -0.5)
-        attn = jnp.einsum(
-            'bhqd,bhkd->bhqk',
-            Q.astype(jnp.float32), K.astype(jnp.float32)
-        ) * scale                                              # (B, H, T, N)
-        attn = jax.nn.softmax(attn, axis=-1).astype(hidden.dtype)
-
-        out = jnp.einsum('bhqk,bhkd->bhqd', attn, V)         # (B, H, T, head_dim)
-        out = out.transpose(0, 2, 1, 3).reshape(B, T, D)      # (B, T, D)
+        # Flash-style tiled attention: never materialises the full (B,H,T,N)
+        # matrix in HBM.  jax.nn.dot_product_attention tiles over T and N in
+        # SRAM — arithmetic intensity stays high regardless of T or N size.
+        # No causal mask: pool vectors are unordered candidates, not a sequence.
+        scale = float(head_dim ** -0.5)
+        out = jax.nn.dot_product_attention(
+            Q, K, V, scale=scale, is_causal=False,
+        )                                                      # (B, T, H, head_dim)
+        out = out.reshape(B, T, D)                             # (B, T, D)
         out = nn.Dense(D, kernel_init=init)(out)               # output projection
 
         return nn.LayerNorm()(hidden + out)                    # residual + norm
