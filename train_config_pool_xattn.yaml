@@ -1,0 +1,82 @@
+# DPSN Pool Cross-Attention Training Configuration
+#
+# Architecture: replaces the 6-iteration sequential reasoning scan with a
+# single multi-head cross-attention pass over pre-fetched pool vectors.
+#
+#   Old path:  6 × [HBM fetch → weighted-avg → single vector → add to hidden]
+#              Arithmetic intensity: ~1 FLOP/byte → memory-bound, 23% MFU
+#
+#   New path:  1 × HBM fetch (patch_size² vectors) → cross-attn (B, T, N)
+#              Arithmetic intensity: ~T FLOP/byte → compute-bound, ~60-80% MFU
+#
+# Usage:
+#   python main.py --train_config train_config_pool_xattn.yaml
+#
+# CLI args always override YAML values.
+
+model:
+  config: 8k-ds                  # 1024×1024 pool, D=1024, 6 controller layers
+  num_kv_heads: 4                 # GQA: 4 KV heads shared across query heads
+  gradient_checkpointing: false   # set true if OOM on backward pass
+  sigma_anneal_steps: 50000       # broad→precise routing over first 50k steps
+  routing_diversity_weight: 0.05  # entropy loss to prevent pool collapse
+
+training:
+  batch_size: 32
+  grad_accum_steps: 1
+  loss_chunk_size: 16             # chunked LM head to avoid (B,T,V) materialisation
+  bf16: true
+  log_interval: 50
+  save_interval: 2000
+  max_checkpoints: 3
+  warmup_steps: 500
+  generation_steps: 2000
+  generation_max_tokens: 100
+  custom_prompts:
+    - "The relationship between"
+    - "In order to implement"
+    - "The key difference between"
+
+data:
+  tokenizer: "EleutherAI/gpt-neo-125m"
+  chunk_size: 50000
+  num_workers: 4
+  epochs: 1
+  datasets:
+    - name: "openbmb/Ultra-FineWeb"
+      subset: "default"
+      text_column: "content"
+      split: "train"
+      ratio: 1
+
+validation:
+  dataset: "wikitext"
+  subset: "wikitext-103-raw-v1"
+  split: "validation"
+  text_column: "text"
+  steps: 200
+  interval: 2000
+  chunk_size: 50000
+
+infra:
+  checkpoint_dir: "/kaggle/working/dpsn/checkpoints_xattn/"
+  xla_cache_dir: "/kaggle/working/jax_cache/"
+  tp_size: 1
+  coverage_threshold: 5.0
+  resume: true
+  timing_interval: 0              # 0 = disabled; set to LOG_INTERVAL to profile fwd/bwd split
+
+# ── Pool cross-attention settings ────────────────────────────────────────────
+# cross_attention: true   → replaces sequential reasoning scan entirely
+# patch_size: 32          → fetches 32×32=1024 pool vectors in one HBM access
+#                           SRAM cost: B/chip × 1024 × D × 2 bytes
+#                           e.g. B/chip=4, D=1024: 4 × 1024 × 1024 × 2 = 8 MB/chip ✓
+# attn_heads: 8           → 8-head cross-attention; head_dim = D/8 = 128
+#
+# To use larger candidate set (more context, more SRAM):
+#   patch_size: 64        → 4096 vectors, ~33 MB/chip  (safe on v5e with 128 MB VMEM)
+#   patch_size: 128       → 16384 vectors, ~134 MB/chip (tight — profile first)
+pool:
+  cross_attention: true
+  patch_size: 32
+  attn_heads: 8
