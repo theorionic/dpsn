@@ -2223,16 +2223,79 @@ def main():
             if hasattr(_inner, 'stop'):
                 _inner.stop()
 
-    # ── Interrupted: save checkpoint and exit cleanly ─────────────────────────
+    # ── Timeout / Interrupt: final generation + validation + checkpoint ───────
     if _stop_requested[0]:
+        print(f"\n[Timeout] Step {global_step} — running final generation & validation before exit...")
+
+        # Final pool coverage report
+        print_coverage_report(coverage_tracker, global_step, title="Final Pool Coverage")
+        if args.checkpoint_dir:
+            save_coverage_report(coverage_tracker, args.checkpoint_dir, global_step)
+
+        # Final generation
+        print(f"\n--- Final Generation at step {global_step} ---")
+        if args.custom_prompts:
+            _final_prompts = args.custom_prompts
+        elif config.generation_prompts:
+            _final_prompts = config.generation_prompts
+        elif args.hf_dataset:
+            _final_prompts = ["The quick brown fox", "Once upon a time"]
+        else:
+            _final_prompts = test_samples[:3]
+
+        for _prompt in _final_prompts:
+            print(f"Input: {_prompt}")
+            try:
+                _gen_out = generate(
+                    state, _prompt, tokenizer,
+                    max_len=config.generation_max_tokens,
+                    temperature=0.7,
+                    repetition_penalty=1.2,
+                )
+                print(f"Output: {_gen_out}")
+            except Exception as _gen_e:
+                print(f"[Generation skipped: {_gen_e}]")
+        print("-------------------------------------------")
+
+        # Final validation
+        if _val_dataset is not None:
+            print(f"[Val] Running final validation over {args.val_steps} batches...")
+            _final_val_losses = []
+            _final_sigma = float(sigma_anneal_fn(global_step))
+            for _vi in range(args.val_steps):
+                try:
+                    _val_batch = _val_dataset.get_batch(args.batch_size)
+                except (StopIteration, Exception):
+                    break
+                _val_batch = jax.device_put(_val_batch, batch_sharding)
+                try:
+                    _val_out = eval_step(
+                        state, _val_batch,
+                        sigma_scale=jnp.float32(_final_sigma),
+                        pad_token_id=getattr(config, 'pad_token_id', 0),
+                        use_bf16=getattr(config, 'use_bf16', False),
+                        loss_chunk_size=getattr(config, 'loss_chunk_size', 0),
+                    )
+                    jax.block_until_ready(_val_out)
+                    _final_val_losses.append(float(_val_out))
+                except Exception:
+                    break
+            if _final_val_losses:
+                _final_val_loss = sum(_final_val_losses) / len(_final_val_losses)
+                _final_val_ppl = float(jnp.exp(jnp.float32(_final_val_loss)))
+                print(f"[Val] Final | Val Loss: {_final_val_loss:.4f} | Val PPL: {_final_val_ppl:.4f}")
+                writer.add_scalar("Loss/val", _final_val_loss, global_step)
+                writer.add_scalar("PPL/val",  _final_val_ppl,  global_step)
+
+        # Save final checkpoint
         if checkpoint_manager:
-            print(f"[Interrupted] Saving checkpoint at step {global_step}...")
+            print(f"[Timeout] Saving final checkpoint at step {global_step}...")
             checkpoint_manager.save(global_step, state)
             checkpoint_manager.wait_until_finished()
             _save_grain_state(_grain_state_file, global_step, dataset)
-            print(f"[Interrupted] Checkpoint saved. Exiting.")
+            print(f"[Timeout] Checkpoint saved. Exiting.")
         else:
-            print("[Interrupted] No checkpoint_dir configured — checkpoint not saved. Exiting.")
+            print("[Timeout] No checkpoint_dir configured — checkpoint not saved. Exiting.")
         writer.close()
         sys.exit(0)
 

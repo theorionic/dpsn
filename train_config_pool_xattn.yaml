@@ -29,10 +29,11 @@ training:
   bf16: true
   log_interval: 50
   save_interval: 1000
-  max_checkpoints: 3
+  max_checkpoints: 2
   warmup_steps: 500
   generation_steps: 2000
   generation_max_tokens: 100
+  max_duration_minutes: 660    # 11 hours — saves checkpoint+generation+validation before Kaggle's 12-hr cutoff
   custom_prompts:
     - "The relationship between"
     - "In order to implement"
@@ -65,7 +66,7 @@ infra:
   xla_cache_dir: "/kaggle/working/jax_cache/"
   tp_size: 1
   coverage_threshold: 5.0
-  resume: true
+  resume: false
   timing_interval: 0              # 0 = disabled; set to LOG_INTERVAL to profile fwd/bwd split
 
 # ── Pool cross-attention settings ────────────────────────────────────────────
