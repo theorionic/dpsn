@@ -1318,9 +1318,13 @@ def main():
         "TinyController (CEO)": count_params(p["controller"]),
         "LearnedIndexer (Archivist)": count_params(p["indexer"]),
         "CoordinateMassivePool (Library)": count_params(p["pool"]),
-        "ReasoningEngine": count_params(p["acc"])
-        + count_params(p["retrieval_integrator"]),
     }
+    if "pool_cross_attn" in p:
+        breakdown["PoolCrossAttention"] = count_params(p["pool_cross_attn"])
+    else:
+        breakdown["ReasoningEngine"] = (
+            count_params(p["acc"]) + count_params(p["retrieval_integrator"])
+        )
     total_params = count_params(p)
 
     print("\n" + "=" * 50)
