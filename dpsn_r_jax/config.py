@@ -541,7 +541,7 @@ def get_model_config(name: str) -> DPSNRConfig:
             num_indexer_heads=8,
             sigma_min=0.005,
             sigma_max=5.0,
-            sigma_anneal_steps=50_000,
+            sigma_anneal_steps=300_000,
             sigma_target=0.5,
             precision_loss_weight=0.0,
             # ── Pool ──────────────────────────────────────────────────────────
