@@ -165,19 +165,52 @@ def _grain_state_path(args) -> str:
     return os.path.abspath(args.resume_data_path)
 
 
+def _json_safe(obj):
+    """Recursively convert non-JSON-serializable values (bytes, sets, etc.) to safe types."""
+    if isinstance(obj, bytes):
+        return obj.hex()
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, set):
+        return [_json_safe(v) for v in sorted(obj)]
+    try:
+        json.dumps(obj)
+        return obj
+    except (TypeError, ValueError):
+        return str(obj)
+
+
 def _save_grain_state(path: str, step: int, dataset) -> None:
-    """Save data loader position to grain_state.json."""
-    # Unwrap DevicePrefetchIterator → ChunkedHFDataset
-    inner = getattr(dataset, 'data_source', dataset)
-    if hasattr(inner, 'get_state'):
-        state = inner.get_state()
-    else:
-        rows_consumed = getattr(inner, '_rows_consumed', 0)
-        state = {"dataset_idx": 0, "sample_idx": int(rows_consumed), "rows_consumed": int(rows_consumed)}
-    state["step"] = int(step)
-    with open(path, "w") as f:
-        json.dump(state, f, indent=2)
-    print(f"[grain_state] Saved: step={int(step)}, rows_consumed={state.get('rows_consumed', '?')}")
+    """Save data loader position to grain_state.json.
+
+    Never raises — a failed grain_state save must not crash the training loop.
+    """
+    try:
+        # Unwrap DevicePrefetchIterator → BackgroundGenerator → ChunkedHFDataset
+        inner = dataset
+        for _ in range(3):  # unwrap up to 3 wrapper layers
+            src = getattr(inner, 'data_source', None) or getattr(inner, 'dataset', None)
+            if src is None:
+                break
+            inner = src
+
+        if hasattr(inner, 'get_state'):
+            state = inner.get_state()
+        else:
+            rows_consumed = getattr(inner, '_rows_consumed', 0)
+            state = {"dataset_idx": 0, "sample_idx": int(rows_consumed), "rows_consumed": int(rows_consumed)}
+
+        state["step"] = int(step)
+        state = _json_safe(state)   # sanitise hf_state bytes / non-serialisable objects
+
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(state, f, indent=2)
+        print(f"[grain_state] Saved: step={int(step)}, rows_consumed={state.get('rows_consumed', '?')}")
+    except Exception as _e:
+        print(f"[grain_state] WARNING: could not save grain_state.json — {_e}")
 
 
 def _load_grain_state(path: str) -> dict:
@@ -1223,24 +1256,16 @@ def main():
 
         # ── Multi-dataset YAML mode ──────────────────────────────────────────────
         if hasattr(args, 'yaml_datasets') and args.yaml_datasets:
-            from dpsn_r_jax.data.mixed_dataset import MixedDataset
-            _ds_list = []
-            _ratio_list = []
-            for _ds_cfg in args.yaml_datasets:
-                _ds = ChunkedHFDataset(
-                    dataset_name=_ds_cfg["name"],
-                    tokenizer_name=tokenizer_name,
-                    chunk_size=args.chunk_size,
-                    subset=_ds_cfg.get("subset"),
-                    split=_ds_cfg.get("split", "train"),
-                    seq_len=config.max_seq_len,
-                    batch_size=args.batch_size,
-                    num_tokenizer_workers=args.num_workers,
-                    text_columns=[_ds_cfg.get("text_column", "text")],
-                )
-                _ds_list.append(_ds)
-                _ratio_list.append(float(_ds_cfg.get("ratio", 1.0)))
-            dataset = MixedDataset(_ds_list, _ratio_list)
+            from dpsn_r_jax.data.preprocessor import build_mixed_dataset
+            dataset = build_mixed_dataset(
+                yaml_datasets=args.yaml_datasets,
+                tokenizer_name=tokenizer_name,
+                seq_len=config.max_seq_len,
+                batch_size=args.batch_size,
+                chunk_size=args.chunk_size,
+                num_workers=args.num_workers,
+                hf_state=hf_state if getattr(args, "resume", False) else None,
+            )
         elif getattr(args, "chunk_size", 0) > 0 and primary_hf:
             # ── Chunk-based mode (recommended for TPU): ──────────────────────
             # Downloads `chunk_size` rows at once via the HF streaming iterator,

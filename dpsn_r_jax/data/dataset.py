@@ -437,6 +437,7 @@ class ChunkedHFDataset:
         text_columns: Optional[List[str]] = None,
         skip_rows: int = 0,
         hf_state: Optional[dict] = None,
+        text_fn=None,
     ):
         self.dataset_name = dataset_name
         self.tokenizer_name = tokenizer_name
@@ -447,6 +448,7 @@ class ChunkedHFDataset:
         self.batch_size = batch_size
         self.num_tokenizer_workers = max(1, num_tokenizer_workers)
         self.text_columns = text_columns or ["text", "content", "sentence"]
+        self.text_fn = text_fn  # optional type-aware formatter from preprocessor
 
         # Queue holds at most 1 pre-downloaded chunk so BG thread stays 1 chunk ahead.
         self._next_chunk_q: queue.Queue = queue.Queue(maxsize=1)
@@ -581,6 +583,8 @@ class ChunkedHFDataset:
         return state
 
     def _extract_text(self, item: dict) -> str:
+        if self.text_fn is not None:
+            return self.text_fn(item)
         for col in self.text_columns:
             val = item.get(col)
             if val:
