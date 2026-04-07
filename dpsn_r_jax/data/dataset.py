@@ -602,7 +602,12 @@ class ChunkedHFDataset:
         and fills the remainder so training never stalls.
         """
         # ── One call, no Python-level loop — grabs exactly chunk_size rows ──
-        raw: List[dict] = list(islice(self._hf_iter, self.chunk_size))
+        try:
+            raw: List[dict] = list(islice(self._hf_iter, self.chunk_size))
+        except (SystemError, Exception) as e:
+            print(f"[ChunkedHFDataset] Iterator error ({type(e).__name__}: {e}); reinitializing stream.")
+            self._hf_iter = self._make_iterator()
+            raw = []
 
         while len(raw) < self.chunk_size:
             shortage = self.chunk_size - len(raw)
@@ -610,9 +615,14 @@ class ChunkedHFDataset:
                 print("[ChunkedHFDataset] End of dataset reached; restarting stream from the beginning.")
             else:
                 print(f"[ChunkedHFDataset] Dataset exhausted after {len(raw):,} rows; restarting to collect {shortage:,} more.")
-            
+
             self._hf_iter = self._make_iterator()
-            new_rows = list(islice(self._hf_iter, shortage))
+            try:
+                new_rows = list(islice(self._hf_iter, shortage))
+            except (SystemError, Exception) as e:
+                print(f"[ChunkedHFDataset] Iterator error on retry ({type(e).__name__}: {e}); reinitializing.")
+                self._hf_iter = self._make_iterator()
+                new_rows = []
             if not new_rows:
                 if not raw:
                     return None
