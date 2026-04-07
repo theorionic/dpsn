@@ -121,6 +121,7 @@ def load_yaml_config(path):
         "tp_size": "tp_size",
         "coverage_threshold": "coverage_threshold",
         "resume": "resume",
+        "resume_data": "resume_data",
         "timing_interval": "timing_interval",
     }
     for src, dst in _infra_map.items():
@@ -1264,7 +1265,7 @@ def main():
                 batch_size=args.batch_size,
                 chunk_size=args.chunk_size,
                 num_workers=args.num_workers,
-                hf_state=hf_state if getattr(args, "resume", False) else None,
+                hf_state=_grain_hf_state,
             )
         elif getattr(args, "chunk_size", 0) > 0 and primary_hf:
             # ── Chunk-based mode (recommended for TPU): ──────────────────────
