@@ -229,6 +229,7 @@ def build_mixed_dataset(
     chunk_size: int = 10_000,
     num_workers: int = 4,
     hf_state: Optional[dict] = None,
+    rows_consumed: int = 0,
     seed: int = 42,
 ):
     """Build a MixedDataset (or single ChunkedHFDataset) from YAML dataset configs.
@@ -296,6 +297,7 @@ def build_mixed_dataset(
             text_columns=tc,
             text_fn=text_fn,
             hf_state=hf_state if i == 0 else None,
+            skip_rows=rows_consumed if i == 0 else 0,
         )
         ds_list.append(ds)
         ratio_list.append(ratio)

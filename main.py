@@ -1266,6 +1266,7 @@ def main():
                 chunk_size=args.chunk_size,
                 num_workers=args.num_workers,
                 hf_state=_grain_hf_state,
+                rows_consumed=_grain_skip_rows,
             )
         elif getattr(args, "chunk_size", 0) > 0 and primary_hf:
             # ── Chunk-based mode (recommended for TPU): ──────────────────────
