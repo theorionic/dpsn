@@ -167,9 +167,13 @@ def _grain_state_path(args) -> str:
 
 
 def _json_safe(obj):
-    """Recursively convert non-JSON-serializable values (bytes, sets, etc.) to safe types."""
+    """Recursively convert non-JSON-serializable values (bytes, sets, etc.) to safe types.
+
+    bytes are tagged as {"__bytes_hex__": "<hex>"} so they can be restored exactly
+    by _restore_bytes() when loading back into load_state_dict().
+    """
     if isinstance(obj, bytes):
-        return obj.hex()
+        return {"__bytes_hex__": obj.hex()}
     if isinstance(obj, dict):
         return {k: _json_safe(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):

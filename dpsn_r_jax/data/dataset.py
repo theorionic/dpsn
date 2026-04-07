@@ -389,6 +389,21 @@ class BackgroundGenerator:
             pass
 
 
+def _restore_bytes(obj):
+    """Recursively convert {"__bytes_hex__": "..."} tags back to bytes.
+
+    Reverses the _json_safe() encoding used when saving grain_state.json,
+    so hf_state can be passed to load_state_dict() with correct bytes types.
+    """
+    if isinstance(obj, dict):
+        if list(obj.keys()) == ["__bytes_hex__"]:
+            return bytes.fromhex(obj["__bytes_hex__"])
+        return {k: _restore_bytes(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_restore_bytes(v) for v in obj]
+    return obj
+
+
 # ─── Chunk-based HuggingFace dataset ──────────────────────────────────────────
 
 class ChunkedHFDataset:
@@ -556,8 +571,20 @@ class ChunkedHFDataset:
 
         if hf_state is not None:
             try:
-                ds.load_state_dict(hf_state)
+                ds.load_state_dict(_restore_bytes(hf_state))
                 print("[ChunkedHFDataset] Restored HF iterator position from state_dict (O(1) seek).")
+                # Peek at first 2 rows to confirm we're at the right position
+                try:
+                    _it = iter(ds)
+                    _peek = [next(_it) for _ in range(2)]
+                    for _i, _row in enumerate(_peek):
+                        _text = next((str(_row[c])[:120] for c in ("text", "content", "sentence") if c in _row), str(_row)[:120])
+                        print(f"[ChunkedHFDataset] Resume peek row {_i+1}: {_text!r}")
+                    # Re-create iterator (can't rewind; reload state)
+                    ds.load_state_dict(_restore_bytes(hf_state))
+                except Exception as _pe:
+                    print(f"[ChunkedHFDataset] Peek failed ({_pe}); continuing.")
+                    ds.load_state_dict(_restore_bytes(hf_state))
             except Exception as e:
                 print(f"[ChunkedHFDataset] Warning: could not load hf_state ({e}); starting from beginning.")
 
