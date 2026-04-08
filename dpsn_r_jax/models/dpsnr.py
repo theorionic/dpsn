@@ -51,37 +51,16 @@ class PoolCrossAttention(nn.Module):
         K = K.reshape(B, N, self.num_heads, head_dim)
         V = V.reshape(B, N, self.num_heads, head_dim)
 
-        # Pallas Splash Attention on TPU: fused SRAM-resident kernel, ~2x faster
-        # than XLA's generic SDPA for cross-attention.
-        # Falls back to jax.nn.dot_product_attention on CPU/GPU.
+        # Flash-style tiled attention: never materialises the full (B,H,T,N)
+        # matrix in HBM.  jax.nn.dot_product_attention tiles over T and N in
+        # SRAM — arithmetic intensity stays high regardless of T or N size.
+        # No causal mask: pool vectors are unordered candidates, not a sequence.
+        # NOTE: Pallas Splash Attention is a future upgrade (needs head_shards to
+        # match tp_size, and block-size validation for T and N before enabling).
         scale = float(head_dim ** -0.5)
-        _backend = jax.default_backend()
-        if _backend == "tpu":
-            try:
-                from jax.experimental.pallas.ops.tpu.splash_attention import (
-                    splash_attention_kernel as _sak,
-                    splash_attention_mask  as _sam,
-                )
-                # Splash expects (B, H, seq, head_dim)
-                _q = Q.transpose(0, 2, 1, 3)          # (B, H, T, hd)
-                _k = K.transpose(0, 2, 1, 3)          # (B, H, N, hd)
-                _v = V.transpose(0, 2, 1, 3)          # (B, H, N, hd)
-                _mask = _sam.FullMask(T, N)
-                _mha  = _sak.make_splash_mha(
-                    _mask,
-                    head_shards=1,
-                    q_seq_shards=1,
-                )
-                out = _mha(_q, _k, _v).transpose(0, 2, 1, 3)  # (B, T, H, hd)
-            except Exception:
-                # Fallback if shapes don't satisfy block-size constraints
-                out = jax.nn.dot_product_attention(
-                    Q, K, V, scale=scale, is_causal=False,
-                )
-        else:
-            out = jax.nn.dot_product_attention(
-                Q, K, V, scale=scale, is_causal=False,
-            )
+        out = jax.nn.dot_product_attention(
+            Q, K, V, scale=scale, is_causal=False,
+        )                                                      # (B, T, H, head_dim)
         out = out.reshape(B, T, D)                             # (B, T, D)
         out = nn.Dense(D, kernel_init=init)(out)               # output projection
 
