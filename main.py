@@ -1512,7 +1512,7 @@ def main():
 
         # ChunkedHFDataset serves batches from RAM; use a deeper on-device prefetch
         # buffer so XLA always has the next batch staged on TPU HBM.
-        _prefetch_depth = 4 if _dataset_is_chunked else 2
+        _prefetch_depth = 8 if _dataset_is_chunked else 4
         dataset = DevicePrefetchIterator(
             data_source=dataset,
             batch_size=args.batch_size,

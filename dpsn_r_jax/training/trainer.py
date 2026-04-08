@@ -288,8 +288,13 @@ def chunked_lm_loss(hidden, labels, decode_fn, pad_token_id, chunk_size):
         mask   = (chunk_tgt != pad_token_id).astype(jnp.float32)
         return carry, (loss * mask, mask)
 
+    # dots_with_no_batch_dims_saveable: keeps Dense matmul output in memory,
+    # only recomputes softmax/CE — avoids re-running the expensive LM head matmul.
     _, (weighted_losses, masks) = jax.lax.scan(
-        jax.checkpoint(scan_body),
+        jax.checkpoint(
+            scan_body,
+            policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable,
+        ),
         None,
         (h_chunks, tgt_chunks),
     )
@@ -479,11 +484,10 @@ def _apply_optimizer_update(state, grads, indices, new_rng, current_lr):
         ).reshape(-1)
 
         pool_size        = pool_params.reshape(-1, pool_params.shape[-1]).shape[0]
-        safe_indices_raw = jnp.clip(flat_touched, 0, pool_size - 1)
-
-        # Sort for coalesced HBM reads (Bug #3 fix)
-        sort_order   = jnp.argsort(safe_indices_raw)
-        safe_indices = safe_indices_raw[sort_order]
+        safe_indices     = jnp.clip(flat_touched, 0, pool_size - 1)
+        # argsort removed: TPU gather/scatter do not benefit from sorted indices
+        # (HBM access is burst-coalesced by XLA, not index-order dependent),
+        # and argsort is O(N log N) — pure overhead on every step.
 
         pool_flat       = pool_params.reshape(-1, pool_params.shape[-1])
         pool_m_flat     = state.pool_m.reshape(-1, state.pool_m.shape[-1])

@@ -388,7 +388,8 @@ class CoordinateMassivePool2D(nn.Module):
         Returns:
             (B, D) bilinearly interpolated pool vectors in float32
         """
-        storage = self.params_storage.astype(jnp.float32)  # (R, C, D)
+        # Do NOT cast the entire pool to fp32 first — that reads R*C*D values.
+        # Instead gather only the 4 corner vectors (4*B*D values) and cast those.
         R, C = self.rows, self.cols
 
         r_f = mu_row.astype(jnp.float32) * (R - 1)  # (B,)
@@ -401,12 +402,12 @@ class CoordinateMassivePool2D(nn.Module):
         wr = (r_f - r_lo.astype(jnp.float32))[:, None]  # (B, 1)
         wc = (c_f - c_lo.astype(jnp.float32))[:, None]  # (B, 1)
 
-        # Gather 4 corner vectors with advanced indexing (B, D each)
-        # d/d(storage) = 0 (stopped by trainer); d/d(wr), d/d(wc) ≠ 0
-        v00 = storage[r_lo,     c_lo    ]
-        v10 = storage[r_lo + 1, c_lo    ]
-        v01 = storage[r_lo,     c_lo + 1]
-        v11 = storage[r_lo + 1, c_lo + 1]
+        # Gather 4 corner vectors with advanced indexing, cast to fp32 after
+        # (touches 4*B*D values, not R*C*D — avoids ~1.2 GB fp32 materialisation)
+        v00 = self.params_storage[r_lo,     c_lo    ].astype(jnp.float32)
+        v10 = self.params_storage[r_lo + 1, c_lo    ].astype(jnp.float32)
+        v01 = self.params_storage[r_lo,     c_lo + 1].astype(jnp.float32)
+        v11 = self.params_storage[r_lo + 1, c_lo + 1].astype(jnp.float32)
 
         return ((1 - wr) * (1 - wc) * v00 + wr * (1 - wc) * v10
                 + (1 - wr) * wc * v01 + wr * wc * v11)  # (B, D)
