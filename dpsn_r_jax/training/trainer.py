@@ -21,6 +21,79 @@ class TrainState(train_state.TrainState):
     heads_per_dim: int = struct.field(pytree_node=False)
 
 
+def get_training_phase(global_step: int, config) -> int:
+    """Return the current training phase (0–3) based on step count and config.
+
+    Phase 0  (joint)        : all components train — default when steps are 0.
+    Phase 1  (controller)   : steps [0, phase1_steps)
+    Phase 2  (direct pool)  : steps [phase1_steps, phase1_steps+phase2_steps)
+    Phase 3  (spatial pool) : steps >= phase1_steps+phase2_steps
+
+    If phase1_steps == phase2_steps == 0, always returns 0 (joint training).
+    If config.training_phase is set to a non-zero value, that value is returned
+    as a manual override (ignoring step-based thresholds entirely).
+    """
+    if config.training_phase != 0:
+        return config.training_phase  # manual pin via yaml
+
+    if config.phase1_steps == 0 and config.phase2_steps == 0:
+        return 0  # no schedule configured → joint training
+
+    if global_step < config.phase1_steps:
+        return 1
+    if global_step < config.phase1_steps + config.phase2_steps:
+        return 2
+    return 3
+
+
+# Component groups used by _phase_stop_gradient.
+# Keys match the top-level parameter subtree names in the Flax params dict.
+_CONTROLLER_KEYS = frozenset({
+    "controller", "indexer", "retrieval_integrator", "acc",
+    "pool_cross_attn", "prefetch_query_attn", "prefetch_query_proj",
+})
+_DIRECT_POOL_KEYS = frozenset({"direct_pool"})
+
+
+def _phase_stop_gradient(dense_params: dict, phase: int) -> dict:
+    """Apply stop_gradient to parameter subtrees that should not train.
+
+    Called inside loss_fn so it runs at XLA trace time.  Because
+    ``phase`` is a static Python int (captured in the closure from
+    train_step's static_argnames), the if-branches are resolved at
+    trace time — zero runtime overhead.
+
+    Phase 0: no-op (all dense params train).
+    Phase 1 (controller only): freeze direct_pool.
+    Phase 2 (direct pool only): freeze everything except direct_pool.
+    Phase 3 (spatial pool only): freeze controller group AND direct_pool;
+             the spatial pool is handled separately via sparse Adam.
+    """
+    if phase == 0:
+        return dense_params
+
+    flat = traverse_util.flatten_dict(dense_params)
+
+    if phase == 1:
+        # Controller + indexer train; direct pool is frozen.
+        flat = {k: (jax.lax.stop_gradient(v) if k[0] in _DIRECT_POOL_KEYS else v)
+                for k, v in flat.items()}
+
+    elif phase == 2:
+        # Only direct_pool trains; everything else is frozen.
+        flat = {k: (v if k[0] in _DIRECT_POOL_KEYS else jax.lax.stop_gradient(v))
+                for k, v in flat.items()}
+
+    elif phase == 3:
+        # Spatial pool trains (via sparse Adam); dense params are frozen.
+        frozen = _CONTROLLER_KEYS | _DIRECT_POOL_KEYS
+        flat = {k: (jax.lax.stop_gradient(v) if k[0] in frozen else jax.lax.stop_gradient(v))
+                for k, v in flat.items()}
+        # All dense params frozen in phase 3 — spatial pool is the only learner.
+
+    return traverse_util.unflatten_dict(flat)
+
+
 def _make_sigma_anneal_fn(sigma_anneal_steps: int, sigma_target_ratio: float):
     """Build a cosine decay schedule for sigma_max_scale."""
     if sigma_anneal_steps <= 0:
@@ -586,6 +659,7 @@ def _apply_optimizer_update_sparse(state, dense_grads, dense_params, pool_params
         "pad_token_id", "precision_loss_weight",
         "sigma_anneal_steps", "use_bf16", "loss_chunk_size",
         "prefetch_reasoning", "prefetch_size", "routing_diversity_weight",
+        "training_phase",
     ],
     donate_argnums=(0,),
 )
@@ -595,6 +669,7 @@ def train_step(
     use_bf16=False, loss_chunk_size=0,
     prefetch_reasoning=False, prefetch_size=0,
     seq_pack_ids=None, routing_diversity_weight=0.0,
+    training_phase=0,
 ):
     """Single training step with sparse pool gradient updates."""
     print("Compiling train_step for XLA...", flush=True)
@@ -633,6 +708,9 @@ def train_step(
 
     def loss_fn(dense_p_and_probe):
         dense_p, probe_ = dense_p_and_probe
+        # Phase-aware freeze: stop_gradient on components that shouldn't train.
+        # training_phase is a static int (resolved at XLA trace time, zero overhead).
+        dense_p = _phase_stop_gradient(dense_p, training_phase)
         new_flat = dict(traverse_util.flatten_dict(dense_p))
         new_flat[pool_key] = pool_params_stopped
         full_params = traverse_util.unflatten_dict(new_flat)
@@ -753,6 +831,12 @@ def train_step(
             W=axis_W, R_pool=R_pool, C_pool=C_pool,
         )
 
+    # Phase 1 and 2: spatial pool should NOT be updated.
+    # Zero out grad_slices so sparse Adam writes nothing (training_phase is
+    # a static int so this branch is resolved at XLA trace time).
+    if training_phase in (1, 2):
+        grad_slices = jnp.zeros_like(grad_slices)
+
     new_state, pool_grad_norm = _apply_optimizer_update_sparse(
         state, dense_grads, dense_params, pool_params,
         r_starts, c_starts, grad_slices,
@@ -778,6 +862,7 @@ def train_step(
         "pad_token_id", "precision_loss_weight",
         "sigma_anneal_steps", "use_bf16", "loss_chunk_size", "grad_accum_steps",
         "prefetch_reasoning", "prefetch_size", "routing_diversity_weight",
+        "training_phase",
     ],
     donate_argnums=(0,),
 )
@@ -796,6 +881,7 @@ def grad_accum_step(
     prefetch_size=0,
     seq_pack_ids=None,
     routing_diversity_weight=0.0,
+    training_phase=0,
 ):
     """Gradient accumulation with sparse pool gradient updates.
 
@@ -853,6 +939,8 @@ def grad_accum_step(
 
         def loss_fn_sparse(dense_p_and_probe):
             dense_p, probe_ = dense_p_and_probe
+            # Phase-aware freeze (static int → resolved at trace time)
+            dense_p = _phase_stop_gradient(dense_p, training_phase)
             # Rebuild full params with stopped pool
             new_flat = dict(traverse_util.flatten_dict(dense_p))
             new_flat[pool_key] = pool_params_stopped
@@ -1006,6 +1094,10 @@ def grad_accum_step(
     # ── Apply updates ───────────────────────────────────────────────────────
     # Flatten all_indices for logging compatibility: (accum, R, B*H) → (B*H, R) equiv
     flat_all_indices = all_indices.reshape(-1, all_indices.shape[-1])
+
+    # Phase 1 and 2: spatial pool should NOT be updated.
+    if training_phase in (1, 2):
+        grad_slices = jnp.zeros_like(grad_slices)
 
     new_state, pool_grad_norm = _apply_optimizer_update_sparse(
         state, avg_dense_grads, dense_params, pool_params,

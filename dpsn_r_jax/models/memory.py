@@ -145,6 +145,74 @@ class LearnedIndexer(nn.Module):
         return mu, sigma  # (B, num_heads), (B, num_heads)
 
 
+class DirectIndexPool(nn.Module):
+    """Exact-recall memory for DPSN-R — one slot per unique fact type.
+
+    The core property: each fact routes to one dedicated slot via
+    content-based lookup, so gradients from different facts NEVER
+    interfere with each other.  With temperature→0 (hard argmax), a
+    slot trained on "requests.get() → Response" cannot be degraded by
+    any other fact type.
+
+    Design (mirrors the validated experiment_hybrid_pool.py):
+      storage  : (n_slots, D)   — the actual stored vectors
+      keys     : (n_slots, D)   — per-slot addressing keys
+      proj     : Dense(D)       — small MLP for retrieved content
+
+    Retrieval:
+      scores  = query @ keys.T / sqrt(D)          # (B, ..., n_slots)
+      weights = softmax(scores / temperature)
+      out     = weights @ storage                  # (B, ..., D)
+      return  gelu(proj(out))                      # (B, ..., D)
+
+    Temperature:
+      0.1  (default) → near-argmax, one slot per query → no bleed
+      1.0            → soft mixture → generalisation at cost of sharpness
+
+    Phase roles (phase_stop_gradient in trainer.py enforces this):
+      Phase 1 (controller)    : params are stop_gradient'd
+      Phase 2 (direct pool)   : ONLY this module trains; rest frozen
+      Phase 3 (spatial pool)  : params are stop_gradient'd again
+      Phase 0 (joint)         : trains alongside everything else
+
+    Returns corrections in the same shape as the input hidden states so
+    callers can do: ``state_hidden = state_hidden + direct_pool(state_hidden)``
+    """
+
+    n_slots:     int
+    hidden_dim:  int
+    temperature: float = 0.1
+
+    def setup(self):
+        init = nn.initializers.normal(stddev=0.02)
+        # Per-slot addressing keys (matched against controller hidden states)
+        self.keys    = self.param("keys",    init, (self.n_slots, self.hidden_dim))
+        # Per-slot stored content vectors (retrieved and added to state_hidden)
+        self.storage = self.param("storage", init, (self.n_slots, self.hidden_dim))
+        # Small linear projection (same role as direct_proj in the experiment)
+        self.proj    = nn.Dense(self.hidden_dim, use_bias=False, kernel_init=init)
+
+    def __call__(self, hidden: jnp.ndarray) -> jnp.ndarray:
+        """Retrieve from the direct pool and return additive corrections.
+
+        Uses ``...`` in einsum so the same call works for both the
+        full-sequence (B, T, D) case and the single-position (B, D) case.
+
+        Args:
+            hidden: (B, T, D) or (B, D) — controller / state hidden states.
+
+        Returns:
+            corrections: same shape as hidden — add to state_hidden.
+        """
+        scale   = jnp.float32(self.hidden_dim) ** -0.5
+        scores  = jnp.einsum("...d,sd->...s", hidden.astype(jnp.float32),
+                              self.keys.astype(jnp.float32)) * scale  # (..., n_slots)
+        weights = jax.nn.softmax(scores / self.temperature, axis=-1)  # (..., n_slots)
+        out     = jnp.einsum("...s,sd->...d", weights,
+                              self.storage.astype(jnp.float32))        # (..., D)
+        return nn.gelu(self.proj(out))                                 # (..., D)
+
+
 class CoordinateMassivePool(nn.Module):
     """1D pool — original implementation. Still used when use_2d_pool=False.
 

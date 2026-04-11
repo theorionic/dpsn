@@ -193,6 +193,51 @@ class DPSNRConfig:
     # Set to 1 to disable. Recommended: 2 (since 2x means 2x2 = 4x the total vectors).
     pool_super_window_factor: int = 2
 
+    # ── Direct Index Pool (exact-recall, Phase 2 training) ────────────────
+    # A DirectIndexPool is added alongside the spatial pool when enabled.
+    # It is trained in isolation during Phase 2 so each slot captures one
+    # fact (API doc, function signature, etc.) with zero gradient interference
+    # from other facts.  At inference it provides an additive correction to
+    # state_hidden before the LM head.
+    #
+    # n_slots recommendation:
+    #   Set to the number of unique (entity, property) pairs in your factual
+    #   dataset.  E.g. 512 APIs × 8 properties = 4 096 → round up to 8 192.
+    #   Unused slots stay at their random initialisation and add negligible noise.
+    #
+    # temperature:
+    #   0.01–0.1  → near-argmax  → dedicated slot per fact, no bleed (recommended)
+    #   0.5–1.0   → soft mixture → slight generalization but more gradient bleed
+    use_direct_pool: bool = False
+    direct_pool_n_slots: int = 65536
+    direct_pool_temperature: float = 0.1
+
+    # ── Phase-based training schedule ─────────────────────────────────────
+    # Mirrors the 3-phase design proven in experiment_hybrid_pool.py.
+    #
+    # Phase 0  (default): all components train jointly (existing behaviour).
+    # Phase 1  (controller): controller + indexer train; both pools frozen.
+    #          Use with language / code data so the controller learns structure.
+    # Phase 2  (direct pool): direct pool trains on factual QA pairs;
+    #          controller, indexer, and spatial pool are frozen.
+    # Phase 3  (spatial pool): spatial pool trains on pattern data;
+    #          controller, indexer, and direct pool are frozen.
+    #
+    # Automatic phase advancement:
+    #   main.py calls get_training_phase(global_step, config) which returns
+    #   the current phase based on step thresholds:
+    #     steps < phase1_steps              → phase 1
+    #     steps < phase1_steps+phase2_steps → phase 2
+    #     steps >= phase1_steps+phase2_steps → phase 3
+    #   Set all to 0 to keep phase=0 (joint training, no auto-advancement).
+    #
+    # Manual override: set training_phase directly in the yaml config to
+    # pin a specific phase regardless of step count.
+    training_phase: int = 0
+    phase1_steps: int   = 0
+    phase2_steps: int   = 0
+    phase3_steps: int   = 0
+
     @classmethod
     def from_yaml(cls, path: str) -> "DPSNRConfig":
         import yaml

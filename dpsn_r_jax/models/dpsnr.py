@@ -5,6 +5,7 @@ from dpsn_r_jax.config import DPSNRConfig
 from dpsn_r_jax.models.controller import TinyController
 from dpsn_r_jax.models.memory import (
     CoordinateMassivePool2D,
+    DirectIndexPool,
     LearnedIndexer,
 )
 import jax.profiler
@@ -123,6 +124,17 @@ class DPSNR(nn.Module):
                 num_heads=self.config.pool_attn_num_heads,
             )
 
+        # DirectIndexPool: exact-recall memory for facts / API docs.
+        # Trained in isolation during Phase 2 (controller + spatial pool frozen)
+        # so each slot captures one fact with zero gradient interference.
+        # At inference: additive correction to state_hidden before LM head.
+        if self.config.use_direct_pool:
+            self.direct_pool = DirectIndexPool(
+                n_slots=self.config.direct_pool_n_slots,
+                hidden_dim=self.config.controller_hidden_dim,
+                temperature=self.config.direct_pool_temperature,
+            )
+
     def __call__(self, input_ids, deterministic=True, sigma_max_scale: float = 1.0,
                  seq_pack_ids=None):
         """
@@ -148,6 +160,11 @@ class DPSNR(nn.Module):
         state_hidden, all_indices, mean_sigma, _, _, _, _, _, _ = self._encode_hidden(
             input_ids, deterministic, sigma_max_scale, seq_pack_ids=seq_pack_ids
         )
+
+        # Direct pool correction: additive exact-recall signal before LM head.
+        # Phase trainer stop_gradients this module's params during phases 1 & 3.
+        if self.config.use_direct_pool:
+            state_hidden = state_hidden + self.direct_pool(state_hidden)
 
         # 3. Decode — the expensive (B, T, V) step
         logits = self.controller.decode(state_hidden)
@@ -185,6 +202,11 @@ class DPSNR(nn.Module):
             candidates_probe=candidates_probe,
             seq_pack_ids=seq_pack_ids,
         )
+
+        # Direct pool correction (mirrors __call__ path so chunked loss sees it too)
+        if self.config.use_direct_pool:
+            state_hidden = state_hidden + self.direct_pool(state_hidden)
+
         return state_hidden, (
             self.config.max_reasoning_loops, all_indices, mean_sigma,
             all_mu_r, all_mu_c, all_sigma_h, all_start_2d,
