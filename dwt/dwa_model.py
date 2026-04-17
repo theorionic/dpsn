@@ -214,9 +214,12 @@ def utilization_loss(alpha_ema: jax.Array, beta: float = 0.1) -> jax.Array:
 
     alpha_ema : [N]
     """
-    eps = 1e-8
-    ema = jnp.clip(alpha_ema, eps, None)
-    return -jnp.mean(jnp.log(1.0 - jnp.exp(-beta * ema) + eps))
+    # Use expm1 to avoid catastrophic cancellation: 1-exp(-x) rounds to 0.0
+    # in float32 when x < ~1e-7, making log(0) = -inf.
+    # -expm1(-x) = 1-exp(-x) but is accurate to ~ulp for tiny x.
+    ema = jnp.clip(alpha_ema, 1e-6, None)
+    stable = -jnp.expm1(-beta * ema)          # [N], always > 0
+    return -jnp.mean(jnp.log(jnp.maximum(stable, 1e-8)))
 
 
 def diversity_loss(alpha: jax.Array, keys: jax.Array) -> jax.Array:

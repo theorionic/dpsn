@@ -1,11 +1,10 @@
 """DWA (Dynamic Weight Assembly) training runner.
 
-Bridges dwt/dwa_model.py + dwt/dwa_train.py into the main.py harness.
-Invoked when --model_type dwa is passed. Uses the same --checkpoint_dir,
---resume, --max_steps, --batch_size, --hf_dataset, --log_interval,
---save_interval, and TensorBoard writer as the DPSN-R path.
+Uses DPSN-R's ChunkedHFDataset streaming pipeline instead of load_and_chunk,
+so training starts in seconds (no dump-to-disk). Model code in dwt/dwa_model.py
+is untouched — only the training mechanism mirrors DPSN-R's approach.
 
-Architecture recap (dwt/ARCHITECTURE.md):
+Architecture recap:
   tokens → embed → Transformer Part A
          → DWA Middle  (multi-aspect retrieval → factorised weight assembly)
          → Transformer Part B → LM head → logits
@@ -45,18 +44,15 @@ def _ensure_dwt_importable() -> None:
 # ---------------------------------------------------------------------------
 
 def run_dwa_training(args, writer) -> None:
-    """Train a DWA model using settings from main.py's parsed args.
+    """Train a DWA model using DPSN-R's streaming data pipeline.
 
     Args:
-        args:   argparse.Namespace from main.py (uses batch_size, max_steps,
-                hf_dataset, hf_text_column, checkpoint_dir, resume,
-                log_interval, save_interval, val_interval, bf16,
-                dwa_config).
+        args:   argparse.Namespace from main.py.
         writer: TensorBoard SummaryWriter (shared with main.py caller).
     """
     _ensure_dwt_importable()
 
-    # ── dwt imports (flax.nnx based, independent of linen DPSN-R) ──────────
+    # ── dwt imports (flax.nnx, untouched) ───────────────────────────────────
     import flax.nnx as nnx
     from dwa_model import (
         LMConfig,
@@ -68,15 +64,12 @@ def run_dwa_training(args, writer) -> None:
         to_bf16,
         get_lambda_sharp,
         get_aux_scale,
-        update_ema,
         small_config,
         medium_config,
         large_config,
-        cross_entropy,
     )
+    # Only checkpoint / device utilities from dwa_train — no data loading
     from dwa_train import (
-        load_and_chunk,
-        get_batch,
         shard_batch,
         replicate,
         save_checkpoint,
@@ -84,8 +77,12 @@ def run_dwa_training(args, writer) -> None:
         latest_checkpoint,
         N_DEVICES,
         _replicated,
-        evaluate_ppl,
+        _data_sharding,
     )
+
+    # ── DPSN-R streaming data pipeline ──────────────────────────────────────
+    from dpsn_r_jax.data.dataset import ChunkedHFDataset
+    from dpsn_r_jax.data.tokenizer import get_tokenizer
 
     print(f"\n{'=' * 64}")
     print("  DWA (Dynamic Weight Assembly) Training")
@@ -98,20 +95,20 @@ def run_dwa_training(args, writer) -> None:
     _preset = {"small": small_config, "medium": medium_config, "large": large_config}
     cfg: LMConfig = _preset.get(dwa_config_name, small_config)()
 
-    # Apply overrides from main.py args
     if args.batch_size:
-        cfg.batch_size = args.batch_size          # total across all devices
+        cfg.batch_size = args.batch_size
     if args.max_steps:
         cfg.max_steps = args.max_steps
 
-    print(
-        f"  Config      : {dwa_config_name}  "
-        f"d={cfg.d_model} layers={cfg.n_layers_A}+{cfg.n_layers_B} "
-        f"N={cfg.N} D={cfg.D} r={cfg.r} k_max={cfg.k_max}"
-    )
+    # ── Tokenizer — same 50257-vocab as tiktoken GPT-2 ──────────────────────
+    tokenizer_name = getattr(args, "tokenizer", None) or "EleutherAI/gpt-neo-125m"
+    tok = get_tokenizer(tokenizer_name)
+    cfg.vocab_size = tok.vocab_size
+    print(f"  Config      : {dwa_config_name}  "
+          f"d={cfg.d_model} N={cfg.N} seq_len={cfg.seq_len} vocab={cfg.vocab_size}")
     print(f"  Steps       : {cfg.max_steps}  batch={cfg.batch_size}")
 
-    # ── Data ─────────────────────────────────────────────────────────────────
+    # ── Data — streaming chunks, background prefetch (DPSN-R style) ─────────
     dataset_name = args.hf_dataset or "roneneldan/TinyStories"
     if hasattr(args, "hf_text_column"):
         text_field = (
@@ -122,17 +119,40 @@ def run_dwa_training(args, writer) -> None:
     else:
         text_field = "text"
 
-    print(f"\n  Loading data: {dataset_name}  field='{text_field}'")
-    train_data, val_data, vocab_size = load_and_chunk(
+    chunk_size  = getattr(args, "chunk_size", 10_000)
+    num_workers = getattr(args, "num_workers", 4)
+
+    # seq_len+1 so we can split batch → x=[B,T], y=[B,T] (next-token targets)
+    seq_len_fetch = cfg.seq_len + 1
+
+    print(f"\n  Dataset     : {dataset_name}  field='{text_field}'")
+    print(f"  chunk_size  : {chunk_size:,}  workers={num_workers}")
+
+    train_dataset = ChunkedHFDataset(
         dataset_name=dataset_name,
-        text_field=text_field,
-        seq_len=cfg.seq_len,
+        tokenizer_name=tokenizer_name,
+        chunk_size=chunk_size,
+        split="train",
+        seq_len=seq_len_fetch,
+        batch_size=cfg.batch_size,
+        num_tokenizer_workers=num_workers,
+        text_columns=[text_field],
     )
-    cfg.vocab_size = vocab_size
-    print(f"  Vocab size  : {vocab_size}")
+
+    # Validation dataset — use the dataset's own val split when available
+    val_dataset = ChunkedHFDataset(
+        dataset_name=dataset_name,
+        tokenizer_name=tokenizer_name,
+        chunk_size=min(chunk_size, 2_000),
+        split="validation",
+        seq_len=seq_len_fetch,
+        batch_size=cfg.batch_size,
+        num_tokenizer_workers=num_workers,
+        text_columns=[text_field],
+    )
 
     # ── Model + Optimizer ────────────────────────────────────────────────────
-    seed = 0
+    seed  = 0
     model = DWALanguageModel(cfg, nnx.Rngs(params=jax.random.key(seed)))
 
     use_bf16 = getattr(args, "bf16", False)
@@ -168,13 +188,13 @@ def run_dwa_training(args, writer) -> None:
             start += 1
             print(f"  Resumed from step {start}  (ckpt: {ckpt_path})")
         else:
-            print(f"  --resume set but no checkpoint found in {ckpt_dir} — starting fresh.")
+            print(f"  --resume set but no checkpoint in {ckpt_dir} — starting fresh.")
 
     # ── Training loop ────────────────────────────────────────────────────────
-    np_rng       = np.random.default_rng(start)
     log_interval  = getattr(args, "log_interval", 50)
     save_interval = getattr(args, "save_interval", 1000)
     val_interval  = getattr(args, "val_interval", None) or save_interval
+    val_steps     = getattr(args, "val_steps", 50)
 
     print(f"\n  Training {cfg.max_steps - start} steps  "
           f"(log={log_interval}, save={save_interval}, val={val_interval})\n")
@@ -182,9 +202,9 @@ def run_dwa_training(args, writer) -> None:
     t0 = time.perf_counter()
 
     for s in range(start, cfg.max_steps):
-        # ── Batch ─────────────────────────────────────────────────────────
-        x, y   = get_batch(train_data, cfg.seq_len, cfg.batch_size, np_rng)
-        x_s, y_s = shard_batch(x, y)
+        # ── Batch (streaming, no blocking disk reads) ──────────────────────
+        batch  = train_dataset.get_batch(cfg.batch_size)   # numpy [B, T+1]
+        x_s, y_s = shard_batch(batch[:, :-1], batch[:, 1:])
 
         # ── Phase scalars ─────────────────────────────────────────────────
         ls  = jnp.array(get_lambda_sharp(s, cfg))
@@ -198,9 +218,9 @@ def run_dwa_training(args, writer) -> None:
 
         # ── Logging ───────────────────────────────────────────────────────
         if s % log_interval == 0 or s == cfg.max_steps - 1:
-            phase = _phase_name(s, cfg)
+            phase   = _phase_name(s, cfg)
             elapsed = time.perf_counter() - t0
-            ce_val = float(bd["ce"])
+            ce_val  = float(bd["ce"])
             print(
                 f"  step {s:6d} [{phase:8s}]  "
                 f"ce={ce_val:.3f}  "
@@ -209,17 +229,17 @@ def run_dwa_training(args, writer) -> None:
                 f"lambda={float(ls):.2f}  "
                 f"({elapsed:.0f}s)"
             )
-            writer.add_scalar("dwa/train_ce",      ce_val,                   s)
-            writer.add_scalar("dwa/lambda_sharp",  float(ls),                s)
-            writer.add_scalar("dwa/aux_util",      float(bd.get("util", 0)), s)
-            writer.add_scalar("dwa/aux_div",       float(bd.get("div", 0)),  s)
-            writer.add_scalar("dwa/aux_norm",      float(bd.get("norm", 0)), s)
-            writer.add_scalar("dwa/aux_sparse",    float(bd.get("sparse", 0)), s)
-            writer.add_scalar("dwa/phase_idx",     _phase_idx(s, cfg),       s)
+            writer.add_scalar("dwa/train_ce",     ce_val,                   s)
+            writer.add_scalar("dwa/lambda_sharp", float(ls),                s)
+            writer.add_scalar("dwa/aux_util",     float(bd.get("util", 0)), s)
+            writer.add_scalar("dwa/aux_div",      float(bd.get("div", 0)),  s)
+            writer.add_scalar("dwa/aux_norm",     float(bd.get("norm", 0)), s)
+            writer.add_scalar("dwa/aux_sparse",   float(bd.get("sparse", 0)), s)
+            writer.add_scalar("dwa/phase_idx",    _phase_idx(s, cfg),       s)
 
         # ── Validation ────────────────────────────────────────────────────
         if s > 0 and s % val_interval == 0:
-            ppl = evaluate_ppl(model, val_data, cfg, np_rng, is_dwa=True)
+            ppl = _evaluate_ppl(model, val_dataset, cfg, val_steps)
             print(f"  step {s:6d}  val_ppl={ppl:.2f}")
             writer.add_scalar("dwa/val_ppl", ppl, s)
 
@@ -233,11 +253,37 @@ def run_dwa_training(args, writer) -> None:
             print(f"  Checkpoint → {step_ckpt}")
 
     # ── Final eval ───────────────────────────────────────────────────────────
-    final_ppl = evaluate_ppl(model, val_data, cfg, np_rng, is_dwa=True)
+    final_ppl = _evaluate_ppl(model, val_dataset, cfg, val_steps)
     elapsed   = time.perf_counter() - t0
     print(f"\n  Final val_ppl = {final_ppl:.2f}  total_time = {elapsed:.0f}s")
     writer.add_scalar("dwa/final_val_ppl", final_ppl, cfg.max_steps)
     print(f"{'=' * 64}\n")
+
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+def _evaluate_ppl(model, val_dataset, cfg, n_batches: int = 50) -> float:
+    """Compute validation perplexity over n_batches streaming batches."""
+    from dwa_model import _eval_dwa_batch
+    from dwa_train import shard_batch
+
+    total_ce = 0.0
+    counted  = 0
+    for _ in range(n_batches):
+        try:
+            batch = val_dataset.get_batch(cfg.batch_size)
+        except (StopIteration, Exception):
+            break
+        x_s, y_s = shard_batch(batch[:, :-1], batch[:, 1:])
+        ce = _eval_dwa_batch(model, x_s, y_s)
+        total_ce += float(ce)
+        counted  += 1
+
+    if counted == 0:
+        return float("inf")
+    return float(jnp.exp(total_ce / counted))
 
 
 # ---------------------------------------------------------------------------

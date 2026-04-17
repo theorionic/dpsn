@@ -150,6 +150,8 @@ def load_yaml_config(path):
         flat["hf_dataset"] = dwa["dataset"]
     if "text_column" in dwa:
         flat["hf_text_column"] = dwa["text_column"]
+    if "max_docs" in dwa:
+        flat["dwa_max_docs"] = int(dwa["max_docs"])
     return flat
 
 
