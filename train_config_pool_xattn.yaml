@@ -53,8 +53,8 @@ data:
       ratio: 1
 
 validation:
-  dataset: "wikitext"
-  subset: "wikitext-103-raw-v1"
+  dataset: "allenai/c4"
+  subset: "en"
   split: "validation"
   text_column: "text"
   steps: 200

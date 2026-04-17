@@ -1,0 +1,74 @@
+# DWA (Dynamic Weight Assembly) — Small Config Training
+#
+# Architecture
+# ─────────────────────────────────────────────────────────────────────────────
+#   tokens → embed → Transformer Part A (4 blocks)
+#          → DWA Middle:
+#              query z  →  MultiAspectRetrieval  →  alpha [B*T, N]
+#              alpha, pool  →  assemble()  →  W [B*T, d, d],  b [B*T, d]
+#              h_mid = LayerNorm( h_A + gamma * (h_A @ W.T + b) )
+#          → Transformer Part B (4 blocks) → LM head → logits
+#
+# Pool vector layout  (D = 4096 elements per vector)
+#   [ U_i : d*r | V_i : r*d | b_i : d | ... key projection space ... ]
+#   W_assembled = W_base + Σ_i alpha_i * (U_i @ V_i)   (rank-r per vector)
+#
+# Three-phase sharpness schedule
+#   Phase 1  (0 – 1 000)    : lambda=0  → pure softmax over top-k, no aux losses
+#   Phase 2  (1 000 – 10 000): lambda 0→5 → sigmoid gate sharpens, aux losses on
+#   Phase 3  (10 000+)      : lambda 5→10 → cosine LR decay, sharpest selection
+#
+# Auxiliary losses (active from phase 2)
+#   util   — prevent dead pool vectors (EMA-based utilisation penalty)
+#   div    — prevent key collapse (cosine similarity between retrieved keys)
+#   norm   — prevent weight explosion (||W_delta||²_F)
+#   sparse — encourage sparse alpha (negative entropy)
+#
+# Param count (small preset)
+#   Pool    : 256 × 4096  = ~1M  params
+#   Part A  : 4 × standard transformer blocks at d=256
+#   Part B  : 4 × standard transformer blocks at d=256
+#   Total   : ~30M params
+#
+# Usage
+#   python main.py --train_config train_config_dwa_small.yaml
+#   python main.py --train_config train_config_dwa_small.yaml --max_steps 5000   # quick test
+#   python main.py --train_config train_config_dwa_small.yaml --resume           # resume
+
+# ── DWA model settings ────────────────────────────────────────────────────────
+dwa:
+  model_type: dwa           # routes main.py → DWA training path (flax.nnx)
+  config: small             # small (~30M) | medium (~120M) | large (~1B)
+  dataset: "roneneldan/TinyStories"
+  text_column: "text"
+
+# ── Training schedule ─────────────────────────────────────────────────────────
+training:
+  max_steps: 20000
+  batch_size: 64            # total across all devices; DWA shards via data-parallel mesh
+  bf16: false               # set true on TPU v5e for ~2x throughput
+  log_interval: 100
+  save_interval: 2000
+  max_checkpoints: 3
+  # warmup_steps / lr_scheduler_type not used by DWA — it has its own
+  # warmup_cosine_decay schedule baked into make_optimizer() in dwa_model.py.
+
+# ── Validation ────────────────────────────────────────────────────────────────
+validation:
+  # interval maps to --val_interval: run val_ppl every N steps
+  # DWA evaluate_ppl uses cfg.eval_steps (50) batches internally.
+  interval: 2000
+
+# ── Checkpoints & infra ───────────────────────────────────────────────────────
+infra:
+  checkpoint_dir: "checkpoints/dwa_small"
+  resume: false
+  # xla_cache_dir: "/tmp/jax_cache"   # uncomment to persist JIT cache across runs
+
+# ── Notes ─────────────────────────────────────────────────────────────────────
+# DPSN-R keys (model.config, pool.*, infra.tp_size, etc.) are ignored when
+# model_type = dwa — only dwa:, training:, validation:, and infra: are used.
+#
+# To scale up, switch dwa.config to medium or large and adjust batch/steps:
+#   medium: d=512, N=1024, D=16384  → batch=32, max_steps=100000, bf16=true
+#   large:  d=1024, N=65536, D=65536 → pool stored on disk via VectorPoolStore

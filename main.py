@@ -139,6 +139,17 @@ def load_yaml_config(path):
     for src, dst in _pool_map.items():
         if src in pool:
             flat[dst] = pool[src]
+    # ── DWA section: Dynamic Weight Assembly model settings ───────────────────
+    dwa = cfg.get("dwa", {})
+    if "model_type" in dwa:
+        flat["model_type"] = dwa["model_type"]
+    if "config" in dwa:
+        flat["dwa_config"] = dwa["config"]
+    # dataset / text_column inside dwa: section map to top-level hf_dataset args
+    if "dataset" in dwa:
+        flat["hf_dataset"] = dwa["dataset"]
+    if "text_column" in dwa:
+        flat["hf_text_column"] = dwa["text_column"]
     return flat
 
 
@@ -242,6 +253,24 @@ def main():
         default="base",
         choices=["tiny", "base", "large", "xl", "precise_tiny", "precise_large", "xxl", "mini_pool"],
         help="Model configuration size (precise_* variants enable 2D pool + sigma annealing)",
+    )
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        default="dpsn",
+        choices=["dpsn", "dwa"],
+        help="Model architecture to train: dpsn (DPSN-R, default) or dwa (Dynamic Weight Assembly). "
+             "DWA uses a factorised weight-matrix pool assembled per token; "
+             "DPSN-R uses coordinate-based 2D spatial pool retrieval with a reasoning loop.",
+    )
+    parser.add_argument(
+        "--dwa_config",
+        type=str,
+        default="small",
+        choices=["small", "medium", "large"],
+        help="DWA model size preset (only used with --model_type dwa). "
+             "small ~30M params, medium ~120M, large ~1B. "
+             "Override max_steps/batch_size with the standard --max_steps/--batch_size flags.",
     )
     parser.add_argument(
         "--sigma_anneal_steps",
@@ -707,6 +736,15 @@ def main():
     if args.checkpoint_dir:
         log_dir = os.path.join(args.checkpoint_dir, "runs")
     writer = SummaryWriter(log_dir=log_dir)
+
+    # ── Model type dispatch ──────────────────────────────────────────────────
+    # DWA has its own model, optimizer, and training loop (flax.nnx based).
+    # Branch here so none of the DPSN-R linen init code runs for DWA.
+    if args.model_type == "dwa":
+        from dpsn_r_jax.training.dwa_runner import run_dwa_training
+        run_dwa_training(args, writer)
+        writer.close()
+        return
 
     if args.tiny:
         print("Using TINY config (via flag)...")
@@ -1677,9 +1715,10 @@ def main():
                     seq_pack_ids=_seq_pack_ids,
                     routing_diversity_weight=args.routing_diversity_weight,
                 )
-            # Keep latest mu arrays as JAX futures — no D2H transfer here.
-            # record_access() is called inside the LOG_INTERVAL block after
-            # block_until_ready() has already stalled, so there's no extra sync.
+            # Accumulate coverage every step. record_access() is cheap (numpy ops)
+            # and accumulating over all LOG_INTERVAL steps gives accurate collision/
+            # freshness rates instead of measuring just one batch.
+            coverage_tracker.record_access(all_mu_r, all_mu_c)
             _last_mu_r, _last_mu_c = all_mu_r, all_mu_c
 
             # Measure dispatch time HERE — after the JIT call returns but before
@@ -1842,11 +1881,10 @@ def main():
                 writer.add_scalar("Perf/DataWaitTime_s", avg_data_wait, global_step)
                 writer.add_scalar("GradNorm/pool", grad_norm_val, global_step)
 
-                # Pool coverage — record here after block_until_ready so
-                # the D2H transfer is folded into the existing sync stall.
-                coverage_tracker.reset_window()
-                coverage_tracker.record_access(_last_mu_r, _last_mu_c)
+                # Pool coverage — window accumulated every step above;
+                # read stats now then reset for the next interval.
                 print(coverage_tracker.get_summary_string())
+                coverage_tracker.reset_window()
 
                 # ── Adaptive sigma control ────────────────────────────────────
                 _cov_stats = coverage_tracker.get_coverage()
