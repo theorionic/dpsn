@@ -119,8 +119,8 @@ def run_dwa_training(args, writer) -> None:
     else:
         text_field = "text"
 
-    chunk_size  = getattr(args, "chunk_size", 10_000)
-    num_workers = getattr(args, "num_workers", 4)
+    chunk_size  = getattr(args, "chunk_size", None) or 10_000
+    num_workers = getattr(args, "num_workers", None) or 4
 
     # seq_len+1 so we can split batch → x=[B,T], y=[B,T] (next-token targets)
     seq_len_fetch = cfg.seq_len + 1
