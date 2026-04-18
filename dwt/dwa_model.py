@@ -1135,3 +1135,28 @@ def large_config(vocab_size: int = 50257) -> LMConfig:
         batch_size=8, lr=1e-4, warmup_steps=2_000, max_steps=500_000,
         phase1_end=5_000, phase2_end=200_000,
     )
+
+
+def tpu_large_config(vocab_size: int = 50257) -> LMConfig:
+    """~300M params. Optimised for TPU v5e-8 data-parallel training.
+
+    Memory profile (bf16, 8 devices):
+      Transformer params : ~230M  →  ~460 MB bf16
+      Pool (N=4096, D=32768) : 134M  →  ~268 MB bf16   (fits in HBM, no disk)
+      Adam m1/m2 states  : ~1.4 GB per device
+      Activations (B=16, T=2048, d=768) : ~800 MB peak per device
+      Total per device   : ~3 GB  — well within 16 GB HBM on v5e-8
+
+    Recommended launch:
+      batch_size=128  (16 per chip)  seq_len=2048  bf16=true
+      grad_accum_steps=1  (effective batch = 128)
+      or grad_accum_steps=4 + batch_size=32 for effective batch 128
+    """
+    return LMConfig(
+        vocab_size=vocab_size,
+        d_model=768, n_heads=12, n_layers_A=8, n_layers_B=8, seq_len=2048,
+        N=4096, D=32768, r=8, S=4, d_k=64, k_max=32,
+        batch_size=128, lr=2e-4, warmup_steps=2_000, max_steps=200_000,
+        phase1_end=5_000, phase2_end=100_000,
+        grad_clip=1.0, weight_decay=0.1,
+    )

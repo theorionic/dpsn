@@ -1,26 +1,31 @@
 """DWA training step — jax.jit + optax + nnx.split/merge.
 
-Model architecture (dwt/dwa_model.py) is UNTOUCHED.
-Only training mechanism: nnx.Optimizer → optax + jax.jit, same as DPSN-R.
+Matches DPSN-R's training infrastructure:
+  - donate_argnums=(0,) for buffer donation (TPU memory reuse)
+  - jax.profiler.TraceAnnotation for XLA profiling sections
+  - jax.lax.scan-based gradient accumulation (all on-device, no host dispatch)
+  - grad_norm, gamma, alpha_ema stats logged each step
 
 Pattern:
     graphdef, nnx_state = nnx.split(model)      # once, at creation
     state = DWATrainState(graphdef, nnx_state, opt_state, alpha_ema)
-    train_step = jax.jit(make_dwa_train_step(cfg, graphdef))
+    train_step = make_dwa_train_step(cfg, graphdef)
     ...
     # inside step:
-    model = nnx.merge(graphdef, nnx_state)      # reconstruct
+    model = nnx.merge(graphdef, nnx_state)      # reconstruct (trace-time)
     logits, alpha, keys, w_norm = model(x, lambda_sharp, temp)
 """
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 from typing import Any, Tuple
 
 import jax
 import jax.numpy as jnp
+import jax.profiler
 import numpy as np
 import optax
 from flax import struct
@@ -168,7 +173,7 @@ def _diversity_loss(alpha: jax.Array, keys: jax.Array) -> jax.Array:
     keys  : [N, S, d_k]
     """
     N, S, d_k = keys.shape
-    alpha_mean = jnp.mean(alpha, axis=0)                              # [N]
+    alpha_mean = jnp.mean(alpha, axis=0)
     keys_flat = keys.reshape(N, S * d_k)
     k_norm = keys_flat / (jnp.linalg.norm(keys_flat, axis=-1, keepdims=True) + 1e-8)
     sim = jnp.einsum("id,jd->ij", k_norm, k_norm)
@@ -186,6 +191,13 @@ def _sparsity_loss(alpha: jax.Array) -> jax.Array:
     return jnp.mean(-jnp.sum(alpha * jnp.log(alpha + eps), axis=-1))
 
 
+def _global_grad_norm(grads) -> jax.Array:
+    """Global L2 norm across all parameter leaves (pre-clip)."""
+    leaves = jax.tree_util.tree_leaves(grads)
+    sq_sum = sum(jnp.sum(g.astype(jnp.float32) ** 2) for g in leaves)
+    return jnp.sqrt(sq_sum + jnp.float32(1e-9))
+
+
 # ===========================================================================
 # 5. Training / eval step factories
 # ===========================================================================
@@ -194,9 +206,14 @@ def make_dwa_train_step(cfg, graphdef):
     """Return a jax.jit compiled training step closed over cfg + graphdef.
 
     Signature:
-        (state, batch, lambda_sharp, aux_scale) -> (new_state, total_loss, breakdown)
+        (state, batch, lambda_sharp, aux_scale)
+            -> (new_state, total_loss, breakdown, grad_norm)
 
     batch: [B, T+1]  — integer token ids; x = batch[:, :-1], y = batch[:, 1:].
+
+    donate_argnums=(0,): donates the input state buffer so TPU/GPU reuses it
+    for the output new_state — halves peak state memory, eliminates one HBM
+    copy per step. Matches DPSN-R's train_step behaviour.
     """
     import flax.nnx as nnx
 
@@ -209,54 +226,63 @@ def make_dwa_train_step(cfg, graphdef):
     lambda_norm = float(cfg.lambda_norm)
     lambda_sparse = float(cfg.lambda_sparse)
 
-    @jax.jit
+    @functools.partial(jax.jit, donate_argnums=(0,))
     def train_step(
         state: DWATrainState,
         batch: jax.Array,
         lambda_sharp: jax.Array,
         aux_scale: jax.Array,
     ):
+        print("Compiling DWA train_step for XLA...", flush=True)
         x = batch[:, :-1]
         y = batch[:, 1:]
 
         def loss_fn(nnx_state):
-            model = nnx.merge(graphdef, nnx_state)
-            logits, alpha, keys, w_norm = model(x, lambda_sharp, jnp.array(1.0))
+            with jax.profiler.TraceAnnotation("DWA_Forward"):
+                model = nnx.merge(graphdef, nnx_state)
+                logits, alpha, keys, w_norm = model(x, lambda_sharp, jnp.array(1.0))
+                gamma = model.middle.gamma.value          # scalar assembly residual scale
 
-            ce = _cross_entropy(logits, y)
-            l_u = _utilization_loss(state.alpha_ema, beta_util)
-            l_d = _diversity_loss(alpha, keys)
-            l_s = _sparsity_loss(alpha)
-
-            aux = (
-                lambda_util * l_u
-                + lambda_div * l_d
-                + lambda_norm * w_norm
-                + lambda_sparse * l_s
-            )
-            total = ce + aux_scale * aux
-
-            breakdown = {
-                "ce":     ce,
-                "util":   l_u,
-                "div":    l_d,
-                "sparse": l_s,
-                "norm":   w_norm,
-                "aux":    aux,
-                "total":  total,
-            }
+                ce = _cross_entropy(logits, y)
+                l_u = _utilization_loss(state.alpha_ema, beta_util)
+                l_d = _diversity_loss(alpha, keys)
+                l_s = _sparsity_loss(alpha)
+                aux = (
+                    lambda_util   * l_u
+                    + lambda_div  * l_d
+                    + lambda_norm * w_norm
+                    + lambda_sparse * l_s
+                )
+                total = ce + aux_scale * aux
+                breakdown = {
+                    "ce":     ce,
+                    "util":   l_u,
+                    "div":    l_d,
+                    "sparse": l_s,
+                    "norm":   w_norm,
+                    "aux":    aux,
+                    "total":  total,
+                    "gamma":  gamma,
+                }
             return total, (breakdown, alpha)
 
-        (total, (breakdown, alpha)), grads = jax.value_and_grad(
-            loss_fn, has_aux=True
-        )(state.nnx_state)
+        with jax.profiler.TraceAnnotation("DWA_Backward"):
+            (total, (breakdown, alpha)), grads = jax.value_and_grad(
+                loss_fn, has_aux=True
+            )(state.nnx_state)
 
-        updates, new_opt_state = tx.update(grads, state.opt_state, state.nnx_state)
-        new_nnx_state = optax.apply_updates(state.nnx_state, updates)
+        with jax.profiler.TraceAnnotation("DWA_Optimizer"):
+            grad_norm = _global_grad_norm(grads)          # pre-clip L2 norm
+            updates, new_opt_state = tx.update(grads, state.opt_state, state.nnx_state)
+            new_nnx_state = optax.apply_updates(state.nnx_state, updates)
 
         # EMA update of per-vector utilisation.
         batch_mean = jnp.mean(alpha.reshape(-1, N), axis=0)
         new_alpha_ema = ema_decay * state.alpha_ema + (1.0 - ema_decay) * batch_mean
+
+        breakdown["ema_mean"] = jnp.mean(new_alpha_ema)
+        breakdown["ema_min"]  = jnp.min(new_alpha_ema)
+        breakdown["ema_max"]  = jnp.max(new_alpha_ema)
 
         new_state = state.replace(
             step=state.step + 1,
@@ -264,9 +290,118 @@ def make_dwa_train_step(cfg, graphdef):
             opt_state=new_opt_state,
             alpha_ema=new_alpha_ema,
         )
-        return new_state, total, breakdown
+        return new_state, total, breakdown, grad_norm
 
     return train_step
+
+
+def make_dwa_grad_accum_step(cfg, graphdef, grad_accum_steps: int):
+    """Return a jax.jit compiled gradient-accumulation step.
+
+    Uses jax.lax.scan so all micro-batch forward/backward passes execute
+    entirely on-device — no host dispatch per micro-batch (matches DPSN-R's
+    grad_accum_step design). Dense grads are accumulated on-device; optimizer
+    update fires once after all micro-batches.
+
+    Signature:
+        (state, micro_batches, lambda_sharp, aux_scale)
+            -> (new_state, avg_loss, avg_breakdown, grad_norm)
+
+    micro_batches : [grad_accum_steps, B, T+1]  — stacked on the host before
+                    the JIT call; sharded along axis-1 (batch) on TPU.
+    """
+    import flax.nnx as nnx
+
+    tx = make_tx(cfg)
+    N = int(cfg.N)
+    ema_decay = float(cfg.ema_decay)
+    beta_util = float(cfg.beta_util)
+    lambda_util = float(cfg.lambda_util)
+    lambda_div = float(cfg.lambda_div)
+    lambda_norm = float(cfg.lambda_norm)
+    lambda_sparse = float(cfg.lambda_sparse)
+    scale = jnp.float32(1.0 / grad_accum_steps)
+
+    @functools.partial(jax.jit, donate_argnums=(0,))
+    def grad_accum_step(
+        state: DWATrainState,
+        micro_batches: jax.Array,
+        lambda_sharp: jax.Array,
+        aux_scale: jax.Array,
+    ):
+        print("Compiling DWA grad_accum_step for XLA...", flush=True)
+
+        zero_grads = jax.tree_util.tree_map(jnp.zeros_like, state.nnx_state)
+
+        def scan_body(carry, micro_batch):
+            acc_grads, acc_loss = carry
+            x = micro_batch[:, :-1]
+            y = micro_batch[:, 1:]
+
+            def loss_fn(nnx_state):
+                with jax.profiler.TraceAnnotation("DWA_Micro_Forward"):
+                    model = nnx.merge(graphdef, nnx_state)
+                    logits, alpha, keys, w_norm = model(x, lambda_sharp, jnp.array(1.0))
+                    gamma = model.middle.gamma.value
+                    ce = _cross_entropy(logits, y)
+                    l_u = _utilization_loss(state.alpha_ema, beta_util)
+                    l_d = _diversity_loss(alpha, keys)
+                    l_s = _sparsity_loss(alpha)
+                    aux = (
+                        lambda_util   * l_u
+                        + lambda_div  * l_d
+                        + lambda_norm * w_norm
+                        + lambda_sparse * l_s
+                    )
+                    total = ce + aux_scale * aux
+                    bd = {
+                        "ce": ce, "util": l_u, "div": l_d,
+                        "sparse": l_s, "norm": w_norm, "aux": aux, "gamma": gamma,
+                    }
+                return total, (bd, alpha)
+
+            with jax.profiler.TraceAnnotation("DWA_Micro_Backward"):
+                (loss, (bd, alpha)), grads = jax.value_and_grad(
+                    loss_fn, has_aux=True
+                )(state.nnx_state)
+
+            new_acc = jax.tree_util.tree_map(jnp.add, acc_grads, grads)
+            return (new_acc, acc_loss + loss), (bd, alpha)
+
+        with jax.profiler.TraceAnnotation("DWA_GradAccum_Scan"):
+            (acc_grads, total_loss), (all_bd, all_alpha) = jax.lax.scan(
+                scan_body,
+                (zero_grads, jnp.float32(0.0)),
+                micro_batches,
+            )
+
+        with jax.profiler.TraceAnnotation("DWA_Optimizer"):
+            avg_grads = jax.tree_util.tree_map(lambda g: g * scale, acc_grads)
+            avg_loss  = total_loss * scale
+            avg_bd    = {k: jnp.mean(v) for k, v in all_bd.items()}
+
+            grad_norm = _global_grad_norm(avg_grads)
+            updates, new_opt_state = tx.update(avg_grads, state.opt_state, state.nnx_state)
+            new_nnx_state = optax.apply_updates(state.nnx_state, updates)
+
+        # EMA over all micro-batch alphas for better utilisation tracking.
+        batch_mean = jnp.mean(all_alpha.reshape(-1, N), axis=0)
+        new_alpha_ema = ema_decay * state.alpha_ema + (1.0 - ema_decay) * batch_mean
+
+        avg_bd["total"]    = avg_loss
+        avg_bd["ema_mean"] = jnp.mean(new_alpha_ema)
+        avg_bd["ema_min"]  = jnp.min(new_alpha_ema)
+        avg_bd["ema_max"]  = jnp.max(new_alpha_ema)
+
+        new_state = state.replace(
+            step=state.step + 1,
+            nnx_state=new_nnx_state,
+            opt_state=new_opt_state,
+            alpha_ema=new_alpha_ema,
+        )
+        return new_state, avg_loss, avg_bd, grad_norm
+
+    return grad_accum_step
 
 
 def make_dwa_eval_step(graphdef):
@@ -327,7 +462,7 @@ def load_dwa_checkpoint(path: str, state: DWATrainState) -> Tuple[DWATrainState,
     have been created with the same model architecture and optimizer as the
     one that was saved.
     """
-    npz_path = os.path.join(path, "state.npz")
+    npz_path  = os.path.join(path, "state.npz")
     meta_path = os.path.join(path, "meta.json")
 
     with open(meta_path) as f:
@@ -350,8 +485,8 @@ def load_dwa_checkpoint(path: str, state: DWATrainState) -> Tuple[DWATrainState,
 
     new_nnx_state = jax.tree_util.tree_unflatten(m_def, new_m_leaves)
     new_opt_state = jax.tree_util.tree_unflatten(o_def, new_o_leaves)
-    alpha_ema = jnp.asarray(data["alpha_ema"])
-    step = int(meta["step"])
+    alpha_ema     = jnp.asarray(data["alpha_ema"])
+    step          = int(meta["step"])
 
     new_state = state.replace(
         step=jnp.array(step, dtype=jnp.int32),

@@ -269,9 +269,9 @@ def main():
         "--dwa_config",
         type=str,
         default="small",
-        choices=["small", "medium", "large"],
+        choices=["small", "medium", "large", "tpu_large"],
         help="DWA model size preset (only used with --model_type dwa). "
-             "small ~30M params, medium ~120M, large ~1B. "
+             "small ~30M, medium ~120M, tpu_large ~300M (TPU v5e-8 optimised), large ~1B. "
              "Override max_steps/batch_size with the standard --max_steps/--batch_size flags.",
     )
     parser.add_argument(

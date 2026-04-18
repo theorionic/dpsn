@@ -1,0 +1,38 @@
+# DWA tpu_large Config (~300M params) — optimised for TPU v5e-8
+#
+# Memory per chip (bf16, batch 16, seq 2048):
+#   Params       ~460 MB   Pool (N=4096,D=32768) ~268 MB
+#   Adam states  ~1.4 GB   Activations           ~800 MB
+#   Total        ~3 GB  — well within 16 GB HBM per chip
+#
+# Effective batch = batch_size * grad_accum_steps = 128 * 1 = 128
+# (set grad_accum_steps: 4 + batch_size: 32 for same effective batch at lower peak memory)
+#
+# Launch:
+#   python main.py --train_config train_config_dwa_tpu_large.yaml
+dwa:
+  model_type: dwa
+  config: tpu_large
+  dataset: "roneneldan/TinyStories"
+  text_column: "text"
+
+training:
+  max_steps: 200000
+  batch_size: 128          # 16 per chip on 8-chip v5e-8
+  grad_accum_steps: 1      # increase to 4+ for larger effective batch with less peak memory
+  bf16: true
+  log_interval: 100
+  save_interval: 5000
+
+data:
+  tokenizer: "EleutherAI/gpt-neo-125m"
+  chunk_size: 20000        # larger chunk → less I/O stalls for big batches
+  num_workers: 8
+
+validation:
+  interval: 5000
+  steps: 200
+
+infra:
+  checkpoint_dir: "checkpoints/dwa_tpu_large"
+  resume: false
