@@ -1,16 +1,16 @@
-# DWA Small Config (~30M params)
+# DWA Medium Config (~120M params)
 dwa:
   model_type: dwa
-  config: small
+  config: medium
   dataset: "roneneldan/TinyStories"
   text_column: "text"
 
 training:
-  max_steps: 20000
-  batch_size: 64
-  bf16: false
+  max_steps: 100000
+  batch_size: 32
+  bf16: true
   log_interval: 100
-  save_interval: 2000
+  save_interval: 5000
 
 data:
   tokenizer: "EleutherAI/gpt-neo-125m"
@@ -18,9 +18,9 @@ data:
   num_workers: 4
 
 validation:
-  interval: 2000
-  steps: 50
+  interval: 5000
+  steps: 100
 
 infra:
-  checkpoint_dir: "checkpoints/dwa_small"
+  checkpoint_dir: "checkpoints/dwa_medium"
   resume: false
